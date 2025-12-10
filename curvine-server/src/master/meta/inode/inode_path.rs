@@ -56,7 +56,7 @@ impl InodePath {
                         Some(full_inode) => InodePtr::from_owned(full_inode),
                         None => return err_box!("Failed to load inode {} from store", id),
                     };
-                    tt
+                    tt.clone()
                 }
                 _ => cur_inode.clone(),
             };
@@ -111,32 +111,53 @@ impl InodePath {
         let mut path_state: Vec<InodePtr> = vec![root.clone(); components_length];
         
         queue.push_back((0, root));  // Start BFS
-        
-        while let Some((curr_index, curr_node)) = queue.pop_front() {
+        // let mut path_prefix: Vec<InodePtr> = path_state[0..components_length].to_vec();
+        while let Some((curr_index, base_curr_node)) = queue.pop_front() {
+            println!("base_curr_node: {:?}", base_curr_node);
+            println!("base_curr_node as ref: {:?}", base_curr_node.as_ref());
+            let curr_node = base_curr_node.clone();
             // Copy current path prefix 0..curr_index from global state
-            let mut path_prefix: Vec<InodePtr> = path_state[0..curr_index].to_vec();
+            // path_prefix = path_state[0..curr_index].to_vec();
             
             // Resolve current node
             let resolved_node = match &curr_node.as_ref() {
                 FileEntry(name, id) => {
-                    match store.get_inode(*id, Some(name))? {
-                        Some(full_inode) => InodePtr::from_owned(full_inode.clone()),
+                    println!("name: {:?}, id: {:?}", name, id);
+                    let tt = match store.get_inode(*id, Some(name))? {
+                        Some(full_inode) => InodePtr::from_owned(full_inode),
                         None => return err_box!("Failed to load inode {} from store", id),
-                    }
+                    };
+                    println!("debug tt: {:?}", tt.as_ref());
+                    tt
                 }
                 _ => curr_node,
             };
             
-            path_prefix.push(resolved_node.clone());  // Add current
+            println!("resolved_node: {:?}", resolved_node);
+            println!("resolved_node: {:?}", resolved_node.as_ref());
+            // path_prefix.push(resolved_node.clone());  // Add current
+            path_state[curr_index] = resolved_node.clone(); // Add current
+            // println!("path_prefix: {:?}", path_prefix);
             
             if curr_index == components_length - 1 {
+                let snapshot = path_state.clone();  // FREEZE before next overwrite
                 // Complete path - produce result
-                let components_result: Vec<String> = path_prefix.iter()
+                let mut final_path_state: Vec<InodePtr> = Vec::with_capacity(components_length);
+                
+                let components_result: Vec<String> = snapshot.iter()
                     .map(|node| node.as_ref().name().to_string()).collect();
                 let path_str = components_result.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("/");
+                for path in snapshot.iter() {
+                    println!("collect result path: {:?}", path);
+                    println!("collect result path: {:?}", path.as_ref());
+                    let path_clone = path.clone();
+                    final_path_state.push(path_clone);  
+
+                }
+                println!("final_path_state: {:?}", final_path_state);
                 results.push(Self {
                     path: path_str, name: components_result.last().cloned().unwrap_or_default(),
-                    components: components_result, inodes: path_prefix,
+                    components: components_result, inodes: final_path_state,
                 });
                 continue;
             }

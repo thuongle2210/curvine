@@ -465,6 +465,8 @@ impl InodeStore {
     //TODO refactor: remove seq name from store_inode
     pub fn get_inode(&self, id: i64, name: Option<&str>) -> CommonResult<Option<InodeView>> {
         let mut inode_view = self.store.get_inode(id)?;
+        println!("inode_view: {:?}", inode_view);
+        println!("id={:?}, name= {:?}", id, name);
         if let Some(name) = name {
             if let Some(ref mut inode) = inode_view {
                 inode.change_name(name.to_string());

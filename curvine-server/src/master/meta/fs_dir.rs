@@ -369,10 +369,14 @@ impl FsDir {
     }
 
     pub fn list_status(&self, inp: &InodePath) -> FsResult<Vec<FileStatus>> {
+        println!("inp: {:?}", inp);
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_box!("File {} not exists", inp.path()),
         };
+        println!("inode: {:?}", inode);
+        println!("inode: {:?}", inode.as_ref());
+        
         assert!(!inode.is_file_entry());
 
         let mut res = Vec::with_capacity(1.max(inode.child_len()));

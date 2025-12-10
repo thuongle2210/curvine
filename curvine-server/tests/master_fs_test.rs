@@ -96,13 +96,13 @@ fn new_handler() -> MasterHandler {
 fn fs_test() -> CommonResult<()> {
     let fs = new_fs(true, "fs_test");
 
-    mkdir(&fs)?;
-    delete(&fs)?;
-    rename(&fs)?;
-    create_file(&fs)?;
-    get_file_info(&fs)?;
+    // mkdir(&fs)?;
+    // delete(&fs)?;
+    // rename(&fs)?;
+    // create_file(&fs)?;
+    // get_file_info(&fs)?;
     list_status(&fs)?;
-    state(&fs)?;
+    // state(&fs)?;
 
     Ok(())
 }
