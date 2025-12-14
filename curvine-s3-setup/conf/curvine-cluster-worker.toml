@@ -35,7 +35,7 @@ data_dir = [
     "[DISK]testing/data",
 ]
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
-enable_s3_gateway = false
+enable_s3_gateway = true
 
 
 # Customer service configuration.
@@ -69,3 +69,11 @@ put_max_memory_buffer = 16777216
 # GET Performance Optimization Settings
 # GET read/write chunk size in MB (default: 1.0, options: 0.5/1/2)
 get_chunk_size_mb = 1.0
+
+
+[storage]
+ufs_type = "opendal-s3"
+s3_endpoint = "http://curvine-minio:9000"
+s3_access_key = "minioadmin"
+s3_secret_key = "minioadmin"
+s3_bucket = "thuongld"  # Add this line

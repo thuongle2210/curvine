@@ -35,7 +35,7 @@ data_dir = [
     "[DISK]testing/data",
 ]
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
-enable_s3_gateway = false
+enable_s3_gateway = true
 
 
 # Customer service configuration.
@@ -76,3 +76,4 @@ ufs_type = "opendal-s3"
 s3_endpoint = "http://curvine-minio:9000"
 s3_access_key = "minioadmin"
 s3_secret_key = "minioadmin"
+s3_bucket = "thuongld"  # Add this line
