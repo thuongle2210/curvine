@@ -23,44 +23,46 @@ services:
   
   curvine-master:  
     image: curvine:latest
-    container_name: curvine-master  
+    container_name: curvine-master
     ports:  
       - "8995:8995"  # Master RPC  
       - "8996:8996"  # Raft  
       - "9000:9000"  # Master Web  
     environment:  
-      - CURVINE_MASTER_HOSTNAME=localhost  
-      - CURVINE_CONF_FILE=/curvine/conf/curvine-cluster-master.toml  
+      - CURVINE_MASTER_HOSTNAME=curvine-master
+      - CURVINE_WORKER_HOSTNAME=curvine-worker
+      - CURVINE_CONF_FILE=/curvine/conf/curvine-cluster-master.toml
     volumes:  
       - ./conf:/curvine/conf:ro
-      - ./testing:/curvine/testing  
-      - master_meta:/curvine/meta  
-      - journal_data:/curvine/journal  
-    networks:  
-      - curvine-network  
-    command: ["master", "start"]  
-    depends_on:  
-      - minio  
+      - ./testing:/curvine/testing
+      - master_meta:/curvine/meta 
+      - journal_data:/curvine/journal
+    networks:
+      - curvine-network
+    command: ["master", "start"]
+    depends_on:
+      - minio
   
   curvine-worker:  
     image: curvine:latest
-    container_name: curvine-worker  
-    ports:  
+    container_name: curvine-worker
+    ports:
       - "8997:8997"  # Worker RPC  
       - "9001:9001"  # Worker Web  
       - "9900:9900"  # S3 Gateway  
     environment:  
-      - CURVINE_MASTER_HOSTNAME=curvine-master  
-      - CURVINE_CONF_FILE=/curvine/conf/curvine-cluster-worker.toml  
-    volumes:  
+      - CURVINE_MASTER_HOSTNAME=curvine-master
+      - CURVINE_WORKER_HOSTNAME=curvine-worker
+      - CURVINE_CONF_FILE=/curvine/conf/curvine-cluster-worker.toml
+    volumes:
       - ./conf:/curvine/conf:ro
-      - worker_data:/curvine/data  
-    networks:  
-      - curvine-network  
+      - worker_data:/curvine/data
+    networks:
+      - curvine-network
     command: ["worker", "start"]  
-    depends_on:  
-      - curvine-master  
-      - minio  
+    depends_on:
+      - curvine-master
+      - minio
   
 volumes:  
   minio_data:  
@@ -68,6 +70,6 @@ volumes:
   journal_data:  
   worker_data:  
   
-networks:  
+networks:
   curvine-network:  
     driver: bridge

@@ -1,1 +1,8 @@
 mount command: ./curvine/bin/cv mount s3://thuongld/a /a --mnt-type orch --config s3.endpoint_url=http://curvine-minio:9000 --config s3.credentials.access=minioadmin --config s3.credentials.secret=minioadmin --config s3.region_name=us-east-1
+
+
+
+./curvine/bin/cv mount s3://thuongld/b /b --mnt-type orch --config s3.endpoint_url=http://curvine-minio:9000 --config s3.credentials.access=minioadmin --config s3.credentials.secret=minioadmin --config s3.region_name=us-east-1
+
+
+[root@2ae9b37b3871 app]# ./curvine/bin/cv mount list s3://thuongld/a /a
