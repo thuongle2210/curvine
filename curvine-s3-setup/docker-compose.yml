@@ -1,0 +1,73 @@
+version: '3.8'  
+  
+services:  
+  minio:  
+    image: quay.io/minio/minio:latest  
+    container_name: curvine-minio  
+    ports:  
+      - "9002:9000"  # S3 API  
+      - "9003:9001"  # Console  
+    environment:  
+      - MINIO_ROOT_USER=minioadmin  
+      - MINIO_ROOT_PASSWORD=minioadmin  
+    command: server /data --console-address ":9001"  
+    volumes:  
+      - minio_data:/data  
+    networks:  
+      - curvine-network  
+    healthcheck:  
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]  
+      interval: 30s  
+      timeout: 20s  
+      retries: 3  
+  
+  curvine-master:  
+    image: curvine:latest
+    container_name: curvine-master  
+    ports:  
+      - "8995:8995"  # Master RPC  
+      - "8996:8996"  # Raft  
+      - "9000:9000"  # Master Web  
+    environment:  
+      - CURVINE_MASTER_HOSTNAME=localhost  
+      - CURVINE_CONF_FILE=/curvine/conf/curvine-cluster-master.toml  
+    volumes:  
+      - ./conf:/curvine/conf:ro
+      - ./testing:/curvine/testing  
+      - master_meta:/curvine/meta  
+      - journal_data:/curvine/journal  
+    networks:  
+      - curvine-network  
+    command: ["master", "start"]  
+    depends_on:  
+      - minio  
+  
+  curvine-worker:  
+    image: curvine:latest
+    container_name: curvine-worker  
+    ports:  
+      - "8997:8997"  # Worker RPC  
+      - "9001:9001"  # Worker Web  
+      - "9900:9900"  # S3 Gateway  
+    environment:  
+      - CURVINE_MASTER_HOSTNAME=curvine-master  
+      - CURVINE_CONF_FILE=/curvine/conf/curvine-cluster-worker.toml  
+    volumes:  
+      - ./conf:/curvine/conf:ro
+      - worker_data:/curvine/data  
+    networks:  
+      - curvine-network  
+    command: ["worker", "start"]  
+    depends_on:  
+      - curvine-master  
+      - minio  
+  
+volumes:  
+  minio_data:  
+  master_meta:  
+  journal_data:  
+  worker_data:  
+  
+networks:  
+  curvine-network:  
+    driver: bridge
