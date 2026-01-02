@@ -306,10 +306,18 @@ impl InodeFile {
             let meta = self.search_block_mut_check(block.block_id)?;
             meta.commit(block);
         }
-
+        println!("DEBUG: at InodeFile, complete, len: {:?}", len);
         self.len = self.len.max(len);
+        println!("DEBUG: at InodeFile, complete, self.len: {:?}", self.len);
         let complete_len = self.compute_len();
+        println!("DEBUG: self.blocks = {:?}", self.blocks);
+        println!("DEBUG: complete_len = {:?}", complete_len);
+        println!("DEBUG: self.len = {:?}", self.len);
         if complete_len != self.len {
+            println!(
+                "ERROR: at InodeFile, complete, complete_len != self.len, complete_len: {:?}, self.len: {:?}",
+                complete_len, self.len
+            );
             return err_box!(
                 "Complete len is not equal to file len, complete_len = {}, file_len = {}",
                 complete_len,

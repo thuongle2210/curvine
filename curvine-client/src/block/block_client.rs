@@ -14,12 +14,14 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::block::{BlockReadContext, CreateBlockContext};
+use crate::block::{self, BlockReadContext, CreateBatchBlockContext, CreateBlockContext};
 use crate::file::FsContext;
 use curvine_common::conf::ClientConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse, DataHeaderProto,
+    WriteCommitRequest,WriteCommitsBatchRequest, BlocksBatchWriteRequest,BlocksBatchWriteResponse,
+    BlocksBatchCommitRequest, BlocksBatchCommitResponse
 };
 use curvine_common::state::{ExtendedBlock, StorageType};
 use curvine_common::utils::ProtoUtils;
@@ -47,6 +49,7 @@ impl BlockClient {
 
     pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
         let rep_msg = self.client.timeout_rpc(self.timeout, msg).await?;
+        println!("DEBUG rep_msg: {:?}", rep_msg);
         if !rep_msg.is_success() {
             err_box!(rep_msg.to_error_msg())
         } else {
@@ -237,7 +240,7 @@ impl BlockClient {
         seq_id: i32,
         header: Option<DataHeaderProto>,
     ) -> FsResult<DataSlice> {
-        let builder = Builder::new()
+        let builder: orpc::message::MessageBuilder = Builder::new()
             .code(RpcCode::ReadBlock)
             .request(RequestStatus::Running)
             .req_id(req_id)
@@ -251,5 +254,107 @@ impl BlockClient {
 
         let rep = self.rpc(msg).await?;
         Ok(rep.data)
+    }
+    pub async fn write_blocks_batch(  
+        &self,  
+        blocks: &[ExtendedBlock],  
+        off: i64,  
+        block_size: i64,  
+        req_id: i64,  
+        seq_id: i32,
+        chunk_size: i32,  
+        short_circuit: bool,  
+    ) -> FsResult<CreateBatchBlockContext> {  
+        println!("DEBUG: at Block_client, write_blocks_batch, blocks = {:?}", blocks);
+        // Convert blocks to protobuf  
+        let blocks_pb: Vec<_> = blocks  
+            .iter()  
+            .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))  
+            .collect();  
+  
+        let header = BlocksBatchWriteRequest {  
+            blocks: blocks_pb,  
+            off,  
+            block_size,  
+            req_id,  
+            seq_id,  
+            chunk_size,  
+            short_circuit,  
+            client_name: self.client_name.to_string(),  
+        };  
+        println!("at BlockClient, write_blocks_batch, header= {:?}", header);
+        let msg = Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::OpenBatch)
+            .req_id(req_id)
+            .seq_id(seq_id)
+            .proto_header(header)
+            .build();
+
+        println!("at BlockClient, write_blocks_batch, msg= {:?}", msg);
+        let rep = self.rpc(msg).await?;
+        println!("at BlockClient, write_blocks_batch, receive response message, rep= {:?}", rep);
+        let rep_header: BlocksBatchWriteResponse = rep.parse_header()?; 
+
+        let mut batch_context = CreateBatchBlockContext::new(req_id);  
+        
+        for response in rep_header.responses {  
+            let context = CreateBlockContext {  
+                id: response.id,  
+                off: response.off,  
+                block_size: response.block_size,  
+                storage_type: StorageType::from(response.storage_type),  
+                path: response.path,  
+            };  
+            batch_context.push(context);  
+        }  
+        Ok(batch_context)
+    }  
+      
+    pub async fn write_commit_batch(    
+        &self,    
+        blocks: &[ExtendedBlock],    
+        off: i64,  
+        block_size: i64,  
+        req_id: i64,  
+        seq_id: i32,  
+        cancel: bool,  
+    ) -> FsResult<()> {    
+        // Convert blocks to protobuf   
+        let blocks_pb: Vec<_> = blocks    
+            .iter()    
+            .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))    
+            .collect();    
+        println!("DEBUG, at BlockClient, at write_commit_batch, {:?}", blocks_pb);
+        println!("DEBUG, at BlockClient, at write_commit_batch, off= {:?}", off);
+        println!("DEBUG, at BlockClient, at write_commit_batch, block_size= {:?}", block_size);
+        println!("DEBUG, at BlockClient, at write_commit_batch, req_id= {:?}", req_id);
+        let header = BlocksBatchCommitRequest {    
+            blocks: blocks_pb,    
+            off,    
+            block_size,    
+            req_id,    
+            seq_id,    
+            cancel,  
+        };    
+        
+        let status = if cancel {  
+            RequestStatus::CancelBatch  
+        } else {  
+            RequestStatus::CompleteBatch  
+        };  
+        
+        let msg = Builder::new()  
+            .code(RpcCode::WriteBlocksBatch)  
+            .request(status)  
+            .req_id(req_id)  
+            .seq_id(seq_id)  
+            .proto_header(header)  
+            .build();  
+        
+        println!("DEBUG, at BlockClient, at write_commit_batch, wait rpc starting signal");
+        let _ = self.rpc(msg).await?;
+        println!("DEBUG, at BlockClient, at write_commit_batch, wait rpc ending signal");
+        Ok(())  
     }
 }

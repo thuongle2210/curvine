@@ -417,17 +417,24 @@ impl FsDir {
         choose_workers: &[WorkerAddress],
         file_len: i64,
     ) -> FsResult<ExtendedBlock> {
+        println!("DEBUG: at FsDir, acquire_new_block, commit_blocks = {:?}", commit_blocks);
         let op_ms = LocalTime::mills();
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
 
         let new_block_id = file.next_block_id()?;
 
+        println!("DEBUG: at FsDir, file: {:?}, new_block_id: {:?}", file, new_block_id);
+        println!("DEUBG: at FsDir, blocks before add new block: {:?}", file.blocks);
+        println!("DEUBG: at FsDir, file_len: {:?}", file_len);
         // flush file and commit block
         file.complete(file_len, &commit_blocks, "", true)?;
 
+        println!("DEUBG: at FsDir, at acquire_new_block after complete: {:?}", file.blocks);
+        
         // create block.
         file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
+        println!("DEUBG: at FsDir, blocks after add new block: {:?}", file.blocks);
 
         let block = ExtendedBlock {
             id: new_block_id,
@@ -437,6 +444,7 @@ impl FsDir {
             alloc_opts: None,
         };
 
+        println!("DEUBG: at FsDir, inode: {:?}", inode);
         // state add block.
         self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
         self.journal_writer.log_add_block(
@@ -445,6 +453,7 @@ impl FsDir {
             inode.as_file_ref()?,
             commit_blocks,
         )?;
+
         Ok(block)
     }
 

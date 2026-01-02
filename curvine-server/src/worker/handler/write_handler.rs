@@ -16,7 +16,7 @@ use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
-use curvine_common::proto::{BlockWriteResponse, DataHeaderProto};
+use curvine_common::proto::{BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto, WriteBlocksBatchRequest, WriteBlocksBatchResponse, WriteCommitsBatchRequest, WriteCommitsBatchResponse, WriteCommitRequest, BlocksBatchCommitResponse};
 use curvine_common::state::ExtendedBlock;
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -26,6 +26,7 @@ use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::{err_box, ternary, try_option_mut};
 use std::mem;
+use orpc::sys::{DataSlice, RawVec};
 
 pub struct WriteHandler {
     pub(crate) store: BlockStore,
@@ -214,13 +215,16 @@ impl WriteHandler {
         }
         let context = WriteContext::from_req(msg)?;
 
+        println!("DEBUG: at WriteHandler of worker, context= {:?}", context);
         // flush and close the file.
         let file = self.file.take();
         if let Some(mut file) = file {
             file.flush()?;
             drop(file);
         }
-
+        println!("DEBUG: context.block.len = {:?}", context.block.len);
+        println!("DEBUG: context.block_size = {:?}", context.block_size);
+        println!("DEBUG: context.block = {:?}", context.block);
         if context.block.len > context.block_size {
             return err_box!(
                 "Invalid write offset: {}, block size: {}",
@@ -243,6 +247,196 @@ impl WriteHandler {
 
         Ok(msg.success())
     }
+
+    pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {    
+        let header: BlocksBatchWriteRequest = msg.parse_header()?;  
+        println!("DEBUG at open_batch: {:?}", header);  
+        let mut responses = Vec::new();    
+
+        for (i, block_proto) in header.blocks.into_iter().enumerate() {    
+            let unique_req_id = msg.req_id() + i as i64;    
+            
+            // Create a single BlockWriteRequest from the block  
+            let single_request = BlockWriteRequest {  
+                block: block_proto,  
+                off: header.off,  
+                block_size: header.block_size,  
+                short_circuit: header.short_circuit,  
+                client_name: header.client_name.clone(),  
+                chunk_size: header.chunk_size,  
+            };
+
+            // Create single request message for each block    
+            let single_msg = Builder::new()    
+                .code(msg.code())  
+                .request(RequestStatus::Open)  
+                .req_id(unique_req_id)    
+                .seq_id(msg.seq_id())  
+                .proto_header(single_request)    
+                .build();    
+                
+            let response = self.open(&single_msg)?;    
+            let block_response: BlockWriteResponse = response.parse_header()?;    
+            responses.push(block_response);    
+        }    
+        
+        let batch_response = BlocksBatchWriteResponse {    
+            responses,    
+        };    
+        
+    Ok(Builder::success(msg)    
+        .proto_header(batch_response)    
+        .build())    
+}
+      
+
+    /// Handle batch write requests for multiple files  
+    pub fn write_batch(&mut self, msg: &Message) -> FsResult<Message> {  
+        let file = try_option_mut!(self.file);  
+        let context = try_option_mut!(self.context);  
+        Self::check_context(context, msg)?;  
+    
+        // Parse batch data header  
+        if msg.header_len() > 0 {  
+            let header: DataHeaderProto = msg.parse_header()?;  
+            if !header.flush {  
+                if header.offset < 0 || header.offset >= context.block_size {  
+                    return err_box!(  
+                        "Invalid seek offset: {}, block length: {}",  
+                        header.offset,  
+                        context.block_size  
+                    );  
+                }  
+                file.seek(header.offset)?;  
+            }  
+        }  
+    
+        // Deserialize and write multiple files  
+        let data = msg.data.clone();  
+        let slice = data.as_slice();  
+
+        let mut offset = 0;  
+        
+        // Read file count  
+        if data.len() < 4 {  
+            return err_box!("Invalid batch data: missing file count");  
+        }  
+        let file_count = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;  
+        offset += 4;  
+        
+        let mut total_written = 0;  
+        
+        for i in 0..file_count {  
+            // Read path length  
+            if offset + 4 > data.len() {  
+                return err_box!("Invalid batch data: missing path length for file {}", i);  
+            }  
+            let path_len = u32::from_le_bytes([  
+                slice[offset], slice[offset+1], slice[offset+2], slice[offset+3]  
+            ]) as usize;  
+            offset += 4;  
+            
+            // Read path  
+            if offset + path_len > data.len() {  
+                return err_box!("Invalid batch data: missing path for file {}", i);  
+            }  
+            let path = std::str::from_utf8(&slice[offset..offset+path_len])  
+            .map_err(|e| curvine_common::error::FsError::common(format!("Invalid path encoding: {}", e)))?;
+            offset += path_len;  
+            
+            // Read content length  
+            if offset + 4 > data.len() {  
+                return err_box!("Invalid batch data: missing content length for file {}", i);  
+            }  
+            let content_len = u32::from_le_bytes([  
+                slice[offset], slice[offset+1], slice[offset+2], slice[offset+3]  
+            ]) as usize;  
+            offset += 4;  
+            
+            // Read content  
+            if offset + content_len > data.len() {  
+                return err_box!("Invalid batch data: missing content for file {}", i);  
+            }  
+            let content = &slice[offset..offset+content_len];  
+            offset += content_len;  
+            
+            // Write content to file  
+            if file.pos() + content.len() as i64 > context.block_size {  
+                return err_box!(  
+                    "Batch write exceeds block size: pos={}, len={}, block_size={}",  
+                    file.pos(),  
+                    content.len(),  
+                    context.block_size  
+                );  
+            }  
+            
+            let spend = TimeSpent::new();  
+            let raw_vec = RawVec::from_slice(content);  
+            let content_slice = DataSlice::MemSlice(raw_vec);
+            file.write_region(&content_slice)?;  
+            let used = spend.used_us();  
+            
+            if used >= self.io_slow_us {  
+                warn!(  
+                    "Slow batch write from disk cost: {}us (threshold={}us), path: {} ",  
+                    used,  
+                    self.io_slow_us,  
+                    path  
+                );  
+            }  
+            
+            self.metrics.write_bytes.inc_by(content.len() as i64);  
+            self.metrics.write_time_us.inc_by(used as i64);  
+            self.metrics.write_count.inc();  
+            total_written += content.len();  
+            
+            info!(  
+                "Batch wrote file {}: {} bytes, path: {}",  
+                i, content.len(), path  
+            );  
+        }  
+        
+        info!(  
+            "Batch write completed: {} files, {} total bytes",  
+            file_count, total_written  
+        );  
+    
+        Ok(msg.success())  
+    }
+    pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {      
+        // Parse the flattened batch request  
+        let header: BlocksBatchCommitRequest = msg.parse_header()?;      
+        let mut results = Vec::new();      
+        
+        println!("DEBUG: at WriteHandler,complete_batch, header {:?}", header);
+        // Iterate over blocks directly, not nested requests  
+        for (i, block_proto) in header.blocks.into_iter().enumerate() {      
+            let unique_req_id = msg.req_id() + i as i64;      
+            
+            // Create single request message for each block  
+            let single_msg = Builder::new()      
+                .code(msg.code())  
+                .request(if commit { RequestStatus::Complete } else { RequestStatus::Cancel })  
+                .req_id(unique_req_id)      
+                .seq_id(msg.seq_id())  
+                .proto_header(WriteCommitRequest {  
+                    block: block_proto,  
+                    pos: header.off,  
+                    block_size: header.block_size, 
+                    cancel: !commit,  
+                })  
+                .build();      
+                
+            let _response = self.complete(&single_msg, commit)?;      
+            results.push(true);      
+        }      
+        
+        let batch_response = BlocksBatchCommitResponse {      
+            results,      
+        };      
+        
+        Ok(Builder::success(msg).proto_header(batch_response).build())  
+    }
 }
 
 impl MessageHandler for WriteHandler {
@@ -259,6 +453,13 @@ impl MessageHandler for WriteHandler {
             RequestStatus::Complete => self.complete(msg, true),
 
             RequestStatus::Cancel => self.complete(msg, false),
+
+
+            // batch operations
+            RequestStatus::OpenBatch => self.open_batch(msg),  
+            RequestStatus::RunningBatch => self.write_batch(msg),  
+            RequestStatus::CompleteBatch => self.complete_batch(msg, true),  
+            RequestStatus::CancelBatch => self.complete_batch(msg, false),  
 
             _ => err_box!("Unsupported request type"),
         }

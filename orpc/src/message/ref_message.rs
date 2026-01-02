@@ -19,6 +19,8 @@ use bytes::BytesMut;
 /// This is to solve the rust ownership problem.
 /// For example, when the exception is retrying, Message has moved, Message cannot be used, and Message needs to be wrapped in Arc or Rc to solve the problem.
 /// This trait defines the message unified access interface.
+
+
 pub trait RefMessage {
     fn as_ref(&self) -> &Message;
 

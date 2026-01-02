@@ -246,6 +246,7 @@ impl MasterHandler {
     // The add block internally determines whether it is a retry request.
     pub fn add_block(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: AddBlockRequest = ctx.parse_header()?;
+        println!("DEBUG: at MasterHandler add_block, req = {:?}", req);
         ctx.set_audit(Some(req.path.to_string()), None);
 
         let path = req.path;
@@ -319,6 +320,7 @@ impl MasterHandler {
 
     pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: AddBlocksBatchRequest = ctx.parse_header()?;
+        println!("DEBUG: at MasterHandler header, header = {:?}", header);
         let mut results = Vec::new();
         for req in header.requests {
             let path = req.path;

@@ -169,6 +169,7 @@ impl Dataset for VfsDataset {
     }
 
     fn open_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        println!("DEBUG, at Dataset, open_block for block: {:?}", block);
         match self.block_map.get(&block.id) {
             Some(meta) => {
                 if meta.is_active() {
@@ -204,6 +205,7 @@ impl Dataset for VfsDataset {
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let meta = self.get_block_check(block.id)?;
+        println!("DEBUG: at DataSet, meta = {:?}", meta);
         if meta.state() != &BlockState::Writing {
             return err_box!(
                 "block {} status incorrect, expected {:?}, actual: {:?}",
@@ -214,7 +216,9 @@ impl Dataset for VfsDataset {
         }
 
         let dir = self.find_dir(meta.dir_id())?;
+        println!("DEBUG: at DataSet, dir = {:?}", dir);
         let final_meta = dir.finalize_block(meta)?;
+        println!("DEBUG: at DataSet, final_meta = {:?}", final_meta);
         if block.len != final_meta.len() {
             return err_box!(
                 "Block {} length mismatch, expected: {}, actual: {}",

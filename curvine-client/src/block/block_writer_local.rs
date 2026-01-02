@@ -22,16 +22,20 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::{DataSlice, RawPtr};
 use orpc::{err_box, try_option};
 use std::sync::Arc;
+use std::io::{BufWriter, Write};  
+
 
 pub struct BlockWriterLocal {
     rt: Arc<Runtime>,
     fs_context: Arc<FsContext>,
     block: ExtendedBlock,
     worker_address: WorkerAddress,
-    file: RawPtr<LocalFile>,
+    file: Option<RawPtr<LocalFile>>,
+    buffered_file: Option<RawPtr<BufWriter<LocalFile>>>,
     block_size: i64,
     seq_id: i32,
     req_id: i64,
+    is_buffered: bool,
 }
 
 impl BlockWriterLocal {
@@ -66,14 +70,73 @@ impl BlockWriterLocal {
             fs_context,
             block,
             worker_address,
-            file: RawPtr::from_owned(file),
+            file: Some(RawPtr::from_owned(file)),
+            buffered_file: None,
             block_size,
             seq_id,
             req_id,
+            is_buffered: false
         };
 
         Ok(writer)
     }
+
+    pub async fn new_buffered(  
+        fs_context: Arc<FsContext>,  
+        block: ExtendedBlock,  
+        worker_address: WorkerAddress,  
+        pos: i64,  
+    ) -> FsResult<Self> {  
+        let req_id = Utils::req_id();  
+        let seq_id = 0;  
+  
+        let block_size = fs_context.block_size();  
+        let client = fs_context.block_client(&worker_address).await?;  
+        let write_context = client  
+            .write_block(  
+                &block,  
+                pos,  
+                block_size,  
+                req_id,  
+                seq_id,  
+                fs_context.write_chunk_size() as i32,  
+                true,  
+            )  
+            .await?;  
+  
+        let path = try_option!(write_context.path);  
+        let file: LocalFile = LocalFile::with_write_offset(path, false, pos)?;  
+        let buffered_file = BufWriter::new(file);  
+  
+        let writer = Self {  
+            rt: fs_context.clone_runtime(),  
+            fs_context,  
+            block,  
+            worker_address,  
+            file: None,  
+            buffered_file: Some(RawPtr::from_owned(buffered_file)),  
+            block_size,  
+            seq_id,  
+            req_id,  
+            is_buffered: true,  
+        };  
+  
+        Ok(writer)  
+    }  
+
+    pub async fn sync_all(&mut self) -> FsResult<()> {  
+        if self.is_buffered {  
+            let buffered_file = self.buffered_file.clone();  
+            self.rt  
+                .spawn_blocking(move || {  
+                    buffered_file.unwrap().as_mut().flush()?;  
+                    Ok(())  
+                })  
+                .await?  
+        } else {  
+            self.flush().await  
+        }  
+    }  
 
     fn next_seq_id(&mut self) -> i32 {
         self.seq_id += 1;
@@ -81,23 +144,42 @@ impl BlockWriterLocal {
     }
 
     pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
-        let file = self.file.clone();
-        self.rt
-            .spawn_blocking(move || {
-                file.as_mut().write_all(chunk.as_slice())?;
-                Ok::<(), FsError>(())
-            })
-            .await??;
+        // let file = self.file.clone();
+        // self.rt
+        //     .spawn_blocking(move || {
+        //         file.unwrap().as_mut().write_all(chunk.as_slice())?;
+        //         Ok::<(), FsError>(())
+        //     })
+        //     .await??;
+        
+        if self.is_buffered {  
+            let buffered_file = self.buffered_file.clone();  
+            self.rt  
+                .spawn_blocking(move || {  
+                    buffered_file.unwrap().as_mut().write_all(chunk.as_slice())?;  
+                    Ok::<(), FsError>(())  
+                })  
+                .await??;  
+        } else {  
+            let file = self.file.clone();  
+            self.rt  
+                .spawn_blocking(move || {  
+                    file.unwrap().as_mut().write_all(chunk.as_slice())?;  
+                    Ok::<(), FsError>(())  
+                })  
+                .await??;  
+                if self.pos() > self.block.len {
+                    self.block.len = self.pos();
+                }
+        }  
 
-        if self.pos() > self.block.len {
-            self.block.len = self.pos();
-        }
+        
         Ok(())
     }
 
     // Block write data.
     pub fn blocking_write(&mut self, chunk: DataSlice) -> FsResult<()> {
-        self.file.as_mut().write_all(chunk.as_slice())?;
+        self.file.as_mut().unwrap().write_all(chunk.as_slice())?;
         if self.pos() > self.block.len {
             self.block.len = self.pos();
         }
@@ -108,26 +190,44 @@ impl BlockWriterLocal {
         let file = self.file.clone();
         self.rt
             .spawn_blocking(move || {
-                file.as_mut().flush()?;
+                file.unwrap().as_mut().flush()?;
                 Ok(())
             })
             .await?
     }
 
     pub async fn complete(&mut self) -> FsResult<()> {
-        self.flush().await?;
-        let next_seq_id = self.next_seq_id();
-        let client = self.fs_context.block_client(&self.worker_address).await?;
-        client
-            .write_commit(
-                &self.block,
-                self.pos(),
-                self.block_size,
-                self.req_id,
-                next_seq_id,
-                false,
-            )
-            .await
+        // self.flush().await?;
+        // let next_seq_id = self.next_seq_id();
+        // let client = self.fs_context.block_client(&self.worker_address).await?;
+        // client
+        //     .write_commit(
+        //         &self.block,
+        //         self.pos(),
+        //         self.block_size,
+        //         self.req_id,
+        //         next_seq_id,
+        //         false,
+        //     )
+        //     .await
+        if self.is_buffered {  
+            self.sync_all().await?;  
+        } else {  
+            self.flush().await?;  
+        }  
+          
+        let next_seq_id = self.next_seq_id();  
+        let client = self.fs_context.block_client(&self.worker_address).await?;  
+        client  
+            .write_commit(  
+                &self.block,  
+                self.pos(),  
+                self.block_size,  
+                self.req_id,  
+                next_seq_id,  
+                false,  
+            )  
+            .await  
     }
 
     pub async fn cancel(&mut self) -> FsResult<()> {
@@ -150,7 +250,7 @@ impl BlockWriterLocal {
     }
 
     pub fn pos(&self) -> i64 {
-        self.file.pos()
+        self.file.clone().unwrap().pos()
     }
 
     pub fn len(&self) -> i64 {
@@ -179,7 +279,7 @@ impl BlockWriterLocal {
         let file = self.file.clone();
         self.rt
             .spawn_blocking(move || {
-                file.as_mut().seek(pos)?;
+                file.unwrap().as_mut().seek(pos)?;
                 Ok(())
             })
             .await?

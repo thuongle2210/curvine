@@ -211,7 +211,7 @@ impl FsWriterBase {
                                 } else {
                                     lb
                                 };
-                                BlockWriter::new(self.fs_context.clone(), lb, off).await?
+                                BlockWriter::new(self.fs_context.clone(), lb, off, false).await?
                             }
                         };
 
@@ -229,9 +229,10 @@ impl FsWriterBase {
                             .add_block(&self.path, commit_blocks, self.len, last_block)
                             .await?;
                         self.file_blocks.add_block(lb.clone())?;
-
+                        
+                        println!("DEBUG: at FsWriterBase::get_writer, after add_block, file_blocks: {:?}", self.file_blocks);
                         let writer =
-                            BlockWriter::new(self.fs_context.clone(), lb.clone(), 0).await?;
+                            BlockWriter::new(self.fs_context.clone(), lb.clone(), 0, false).await?;
                         self.cur_writer.replace(writer);
                     }
                 };
@@ -322,7 +323,7 @@ impl FsWriterBase {
         // At most one such block exists.
         for lb in &mut file_blocks.block_locs {
             if lb.should_resize() {
-                let mut writer = BlockWriter::new(self.fs_context.clone(), lb.clone(), 0).await?;
+                let mut writer = BlockWriter::new(self.fs_context.clone(), lb.clone(), 0, false).await?;
                 let commit_block = writer.complete().await?;
                 self.file_blocks.add_commit(commit_block)?;
             }

@@ -26,7 +26,7 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, RawFd};
-
+#[derive(Debug)]
 pub struct LocalFile {
     inner: fs::File,
     path: String,

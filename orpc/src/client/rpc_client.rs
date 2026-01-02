@@ -89,6 +89,9 @@ impl RpcClient {
     }
 
     pub async fn rpc(&self, msg: impl RefMessage) -> IOResult<Message> {
+        println!("at RPC client, rpc function with msg:");
+        println!("req_id={:?}", msg.req_id());
+        println!("seq_id={:?}", msg.seq_id());
         let req_id = msg.req_id();
         let seq_id = msg.seq_id();
 
@@ -110,7 +113,7 @@ impl RpcClient {
                 try_err!(rx.await)?
             }
         };
-
+        println!("rep_msg: {:?}", rep_msg);
         RawClient::check_response(req_id, seq_id, &rep_msg)?;
         Ok(rep_msg)
     }

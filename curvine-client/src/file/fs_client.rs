@@ -25,6 +25,7 @@ use orpc::client::ClusterConnector;
 use orpc::err_box;
 use orpc::message::MessageBuilder;
 use orpc::runtime::RpcRuntime;
+use orpc::test::file;
 use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
@@ -247,6 +248,8 @@ impl FsClient {
             last_block: last_block.map(ProtoUtils::extend_block_to_pb),
         };
 
+        println!("at add_block, header: {:?}", header);
+
         let rep_header = self.rpc(RpcCode::AddBlock, header).await?;
         let locate_block = ProtoUtils::located_block_from_pb(rep_header);
         Ok(locate_block)
@@ -270,17 +273,20 @@ impl FsClient {
                     exclude_workers: self.context.exclude_workers(),
                     located: true,
                     client_address: self.context.client_addr_pb(),
-                    file_len,
+                    file_len: 0, //file_len
                     last_block: last_block.map(ProtoUtils::extend_block_to_pb),
                 }
             })
             .collect();
 
+        println!("at add_blocks_batch, pb_requests: {:?}", pb_requests);
         let header = AddBlocksBatchRequest {
             requests: pb_requests,
         };
 
+        println!("DEBUG at, Fs_client, add_blocks_batch, header: {:?}", header);
         let rep: AddBlocksBatchResponse = self.rpc(RpcCode::AddBlocksBatch, header).await?;
+        println!("reponse from add_blocks_batch: {:?}", rep);
         Ok(rep
             .blocks
             .into_iter()
@@ -316,6 +322,7 @@ impl FsClient {
         &self,
         requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)>,
     ) -> FsResult<Vec<bool>> {
+        println!("enter: complete_files_batch function");
         let pb_requests: Vec<CompleteFileRequest> = requests
             .into_iter()
             .map(|(path, len, commit_blocks, client_name, only_flush)| {
