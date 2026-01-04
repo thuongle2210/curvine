@@ -261,7 +261,7 @@ impl FsClient {
     ) -> FsResult<Vec<LocatedBlock>> {
         let pb_requests: Vec<AddBlockRequest> = requests
             .into_iter()
-            .map(|(path, commit_blocks, file_len, last_block)| {
+            .map(|(path, commit_blocks, _file_len, last_block)| {
                 let commit_blocks = commit_blocks
                     .into_iter()
                     .map(ProtoUtils::commit_block_to_pb)

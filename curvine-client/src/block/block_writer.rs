@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::block_writer::WriterAdapter::{Local, Remote, BatchLocal};
-use crate::block::{BatchBlockWriterLocal, BlockWriterLocal, BlockWriterRemote};
+use crate::block::block_writer::WriterAdapter::{Local, Remote, BatchLocal, BatchRemote};
+use crate::block::{BatchBlockWriterLocal,BatchBlockWriterRemote, BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
+use bytes::buf::Writer;
 use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress, ExtendedBlock};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
@@ -31,6 +32,7 @@ enum WriterAdapter {
     Local(BlockWriterLocal),
     Remote(BlockWriterRemote),
     BatchLocal(BatchBlockWriterLocal),
+    BatchRemote(BatchBlockWriterRemote)
 }
 
 impl std::fmt::Debug for WriterAdapter {
@@ -45,6 +47,9 @@ impl std::fmt::Debug for WriterAdapter {
             WriterAdapter::BatchLocal(writer) => {
                 write!(f, "WriterAdapter::BatchLocal({writer:?})")
             }
+            WriterAdapter::BatchRemote(writer) => {
+                write!(f, "WriterAdapter::BatchRemote()")
+            }
         }
     }
 }
@@ -54,6 +59,7 @@ impl WriterAdapter {
             Local(f) => f.worker_address(),
             Remote(f) => f.worker_address(),
             BatchLocal(f) => f.worker_address(),
+            BatchRemote(f) =>   f.worker_address(),
         }
     }
 
@@ -61,7 +67,27 @@ impl WriterAdapter {
         match self {
             Local(f) => f.write(buf).await,
             Remote(f) => f.write(buf).await,
-            BatchLocal(f) =>  f.write(buf).await,
+            BatchLocal(f) =>  Ok(()),
+            BatchRemote(f) =>  Ok(()),
+
+        }
+    }
+
+    async fn write_batch_local(&mut self, buf: DataSlice, index: i32) -> FsResult<()> {
+        match self {
+            Local(f) => Ok(()),
+            Remote(f) => Ok(()),
+            BatchLocal(f) =>  f.write(buf, index).await,
+            BatchRemote(f) =>  Ok(()),
+        }
+    }
+
+    async fn write_batch(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
+        match self {
+            Local(f) => Ok(()),
+            Remote(f) => Ok(()),
+            BatchLocal(f) =>  Ok(()),
+            BatchRemote(f) => f.write(files).await,
         }
     }
     // async fn write_batch(&mut self, buf: Option<RawPtr<BufWriter<LocalFile>>>) -> FsResult<()> {
@@ -76,7 +102,8 @@ impl WriterAdapter {
         match self {
             Local(f) => f.blocking_write(buf.clone()),
             Remote(f) => rt.block_on(f.write(buf.clone())),
-            BatchLocal(f) => Ok(())
+            BatchLocal(f) => Ok(()),
+            BatchRemote(f) => Ok(())
         }
     }
 
@@ -85,6 +112,7 @@ impl WriterAdapter {
             Local(f) => f.flush().await,
             Remote(f) => f.flush().await,
             BatchLocal(f) => f.flush().await,
+            BatchRemote(f) => f.flush().await,
         }
     }
 
@@ -93,6 +121,7 @@ impl WriterAdapter {
             Local(f) => f.complete().await,
             Remote(f) => f.complete().await,
             BatchLocal(f) => f.complete().await,
+            BatchRemote(f) => f.complete().await,
         }
     }
 
@@ -101,6 +130,7 @@ impl WriterAdapter {
             Local(f) => f.cancel().await,
             Remote(f) => f.cancel().await,
             BatchLocal(f) => Ok(()),
+            BatchRemote(f) => Ok(()),
         }
     }
 
@@ -109,6 +139,7 @@ impl WriterAdapter {
             Local(f) => f.remaining(),
             Remote(f) => f.remaining(),
             BatchLocal(f) => 0 as i64,
+            BatchRemote(f) => 0 as i64,
         }
     }
 
@@ -117,6 +148,7 @@ impl WriterAdapter {
             Local(f) => f.pos(),
             Remote(f) => f.pos(),
             BatchLocal(f) => 0 as i64,
+            BatchRemote(f) => 0 as i64,
         }
     }
 
@@ -126,6 +158,7 @@ impl WriterAdapter {
             Local(f) => f.seek(pos).await,
             Remote(f) => f.seek(pos).await,
             BatchLocal(f) => Ok(()),
+            BatchRemote(f) => Ok(()),
         }
     }
 
@@ -134,6 +167,7 @@ impl WriterAdapter {
             Local(f) => f.len(),
             Remote(f) => f.len(),
             BatchLocal(f) => 0 as i64,
+            BatchRemote(f) => 0 as i64,
         }
     }
 
@@ -198,14 +232,30 @@ impl WriterAdapter {
         .collect();  
     
     println!("at WriterAdapter blocks= {:?}", blocks);
-    let writer = BatchBlockWriterLocal::new_batch(    
-        fs_context,    
+    // will change to local or remote by short circuit configuration in the next time
+    // let writer = BatchBlockWriterLocal::new_batch(    
+    //     fs_context,    
+    //     blocks,    
+    //     worker_addr.clone(),    
+    //     0  
+    // )    
+    // .await?;  
+
+    // try with BatchLocal and BatchRemote
+    // let adapter = BatchLocal(writer);  
+
+
+    let writer = BatchBlockWriterRemote::new_batch(    
+        &fs_context,    
         blocks,    
         worker_addr.clone(),    
         0  
     )    
     .await?;  
-    let adapter = BatchLocal(writer);  
+    let adapter = BatchRemote(writer);  
+    println!("DEBUG: at WriterAdapter, at new_batch, adapter 2: {:?}", adapter);
+    println!("DEBUG: at WriterAdapter, at new_batch, adapter 3: {:?}", adapter);
+    println!("DEBUG: at WriterAdapter, at new_batch, adapter 4: {:?}", adapter);
 
     Ok(adapter)  
 }
@@ -530,63 +580,124 @@ impl BatchBlockWriter {
     // } 
 
     /// Write data to all writers without flushing  
-    pub async fn write_all(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {     
-    self.file_blocks.clear();      
-      
-    // Store individual file lengths      
-    for (_, content) in files {      
-        self.file_lengths.push(content.len() as i64);      
-    }    
-      
-    // Concatenate all file contents (no metadata)      
-    let mut all_content = Vec::new();      
-    let mut boundaries = Vec::new();    
-    let mut current_offset = 0;    
-      
-    for (_, content) in files {      
-        let content_len = content.len();    
-        boundaries.push(current_offset);    
-        all_content.extend_from_slice(content.as_bytes());    
-        current_offset += content_len;    
-    }    
-      
-    // Add boundary footer AFTER all content    
-    println!("DEBUG: at BatchBlockWriter write_all, boundaries: {:?}", boundaries);  
-    all_content.extend_from_slice(&(boundaries.len() as u32).to_le_bytes());    
-    for &boundary in &boundaries {    
-        all_content.extend_from_slice(&(boundary as u32).to_le_bytes());    
-    }    
+    /// consider for remote
+    /// ********************* remmember it
+    // pub async fn write_all(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {     
+    //     self.file_blocks.clear();      
+        
+    //     // Store individual file lengths      
+    //     for (_, content) in files {      
+    //         self.file_lengths.push(content.len() as i64);      
+    //     }
+        
+    //     // Concatenate all file contents (no metadata)      
+    //     let mut all_content = Vec::new();      
+    //     let mut boundaries = Vec::new();    
+    //     let mut current_offset = 0;    
+        
+    //     for (_, content) in files {      
+    //         let content_len = content.len();    
+    //         boundaries.push(current_offset);    
+    //         all_content.extend_from_slice(content.as_bytes());    
+    //         current_offset += content_len;    
+    //     }    
+        
+    //     // Add boundary footer AFTER all content    
+    //     println!("DEBUG: at BatchBlockWriter write_all, boundaries: {:?}", boundaries);  
+    //     all_content.extend_from_slice(&(boundaries.len() as u32).to_le_bytes());    
+    //     for &boundary in &boundaries {    
+    //         all_content.extend_from_slice(&(boundary as u32).to_le_bytes());    
+    //     }    
 
-    all_content.extend_from_slice(&[0xFF]); // Clear delimiter  
-    for &boundary in &boundaries {  
-        all_content.extend_from_slice(&(boundary as u32).to_le_bytes());  
-    }  
-    all_content.push(boundaries.len() as u8); // Block count as single byte at end
-      
-    let data = DataSlice::Bytes(bytes::Bytes::from(all_content));    
-      
-    // Debug: Verify the data structure  
-    println!("DEBUG: Total data length: {}, boundaries count: {}",   
-             data.len(), boundaries.len());  
-      
-    // Write to all writers      
-    let futures = self.inners.iter_mut().map(|writer| {      
-        let data_clone = data.clone();      
-        async move {      
-            writer      
-                .write(data_clone)      
-                .await      
-                .map_err(|e| (writer.worker_address().clone(), e))      
-        }      
-    });      
-      
-    if let Err((worker_addr, e)) = try_join_all(futures).await {      
-        self.fs_context.add_failed_worker(&worker_addr);      
-        return Err(e);      
-    }      
-      
-    Ok(())      
-}
+    //     all_content.extend_from_slice(&[0xFF]); // Clear delimiter  
+    //     for &boundary in &boundaries {  
+    //         all_content.extend_from_slice(&(boundary as u32).to_le_bytes());  
+    //     }  
+    //     all_content.push(boundaries.len() as u8); // Block count as single byte at end
+        
+    //     let data = DataSlice::Bytes(bytes::Bytes::from(all_content));    
+        
+    //     // Debug: Verify the data structure  
+    //     println!("DEBUG: Total data length: {}, boundaries count: {}",   
+    //             data.len(), boundaries.len());  
+        
+    //     // Write to all writers      
+    //     let futures = self.inners.iter_mut().map(|writer| {      
+    //         let data_clone = data.clone();      
+    //         async move {      
+    //             writer      
+    //                 .write(data_clone)      
+    //                 .await      
+    //                 .map_err(|e| (writer.worker_address().clone(), e))      
+    //         }      
+    //     });      
+        
+    //     if let Err((worker_addr, e)) = try_join_all(futures).await {      
+    //         self.fs_context.add_failed_worker(&worker_addr);      
+    //         return Err(e);      
+    //     }      
+        
+    //     Ok(())      
+    // }
+
+    // write all for local, it's done
+    // pub async fn write_all(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {  
+    //     for (index, (path, content)) in files.iter().enumerate() {
+    //         let data = DataSlice::Bytes(bytes::Bytes::copy_from_slice(content.as_bytes()));
+            
+    //         // Store individual file lengths      
+    //         for (_, content) in files {      
+    //             self.file_lengths.push(content.len() as i64);      
+    //         }
+    //         // Write each file separately to all writers with index  
+    //         let futures = self.inners.iter_mut().map(|writer| {  
+    //             let data_clone = data.clone();
+    //             let index = index as i64;  // Assuming write_batch_local expects i64 index
+    //             async move {  
+    //                 writer  
+    //                     .write_batch_local(data_clone, index as i32)  // Pass index here
+    //                     .await  
+    //                     .map_err(|e| (writer.worker_address().clone(), e))  
+    //             }  
+    //         });  
+            
+    //         if let Err((worker_addr, e)) = try_join_all(futures).await {  
+    //             self.fs_context.add_failed_worker(&worker_addr);  
+    //             return Err(e);  
+    //         }  
+    //     }  
+    //     Ok(())  
+    // }
+
+
+    pub async fn write_all(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {  
+        for (index, (path, content)) in files.iter().enumerate() {
+            let data = DataSlice::Bytes(bytes::Bytes::copy_from_slice(content.as_bytes()));
+            
+            // Store individual file lengths      
+            for (_, content) in files {      
+                self.file_lengths.push(content.len() as i64);      
+            }
+            
+        }  
+        // Write each file separately to all writers with index  
+        let futures = self.inners.iter_mut().map(|writer| {  
+        async move {  
+            writer  
+                .write_batch(files)  // Pass index here
+                .await  
+                .map_err(|e| (writer.worker_address().clone(), e))  
+        }  
+        });  
+        
+        if let Err((worker_addr, e)) = try_join_all(futures).await {  
+            self.fs_context.add_failed_worker(&worker_addr);  
+            return Err(e);  
+        }  
+
+        
+        Ok(())  
+    }
 
 
     /// Reconstruct commit blocks from the original located_blocks  
@@ -665,13 +776,16 @@ impl BatchBlockWriter {
     pub fn to_commit_blocks(&self) -> Vec<CommitBlock> {    
         let mut commit_blocks = Vec::new();  
         
-        for (i, located_block) in self.located_blocks.iter().enumerate() {  
+        for (i, located_block) in self.located_blocks.iter().enumerate() { 
+            println!("DEBUG: at BatchBlockWriter, located_block before update length: {:?}", located_block); 
             let mut commit_block = CommitBlock::from(located_block);  
             
+            println!("DEBUG: at BatchBlockWriter::to_commit_blocks, self.file_lengths: {:?}", self.file_lengths);
             // Use actual file length instead of 0  
             if let Some(&length) = self.file_lengths.get(i) {  
                 commit_block.block_len = length;  
             }  
+            println!("DEBUG: at BatchBlockWriter, located_block after length: {:?}", commit_block); 
             
             commit_blocks.push(commit_block);  
         }  

@@ -67,6 +67,7 @@ impl BlockReaderLocal {
         let path = try_option!(read_context.path);
         let file = LocalFile::with_read(&path, off as u64)?;
         println!("DEBUG: at BlockReaderLocal::new, file: {:?}", file);
+        println!("DEBUG: at BlockReaderLocal::new, read_context: {:?}", read_context.len);
         if file.len() < read_context.len {
             return err_box!(
                 "File data is lost. block len: {}, actual file length: {}",

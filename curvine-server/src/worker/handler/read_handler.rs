@@ -60,6 +60,8 @@ impl ReadHandler {
         let context = ReadContext::from_req(msg)?;
         let meta = self.store.get_block(context.block_id)?;
 
+        println!("DEBUG: ReadHandler,at open, context id: {:?} with len= {:?}", context.block_id, context.len);
+        println!("DEBUG: ReadHandler,at open, meta: {:?}", meta);
         if context.off > meta.len {
             return err_box!(
                 "The length of the requested data exceeds the maximum length of the block file, \

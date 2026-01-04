@@ -15,7 +15,7 @@ pub struct BatchBlockWriterLocal {
     fs_context: Arc<FsContext>,  
     blocks: Vec<ExtendedBlock>,  
     worker_address: WorkerAddress,  
-    buffered_file: Option<RawPtr<BufWriter<LocalFile>>>,
+    files: Vec<RawPtr<LocalFile>>,
     block_size: i64,  
     req_id: i64,
     pos: i64,
@@ -28,7 +28,7 @@ impl std::fmt::Debug for BatchBlockWriterLocal {
             .field("rt", &self.rt)
             .field("blocks", &self.blocks)
             .field("worker_address", &self.worker_address)
-            .field("buffered_file", &self.buffered_file)
+            .field("buffered_file", &self.files)
             .field("block_size", &self.block_size)
             .field("req_id", &self.req_id)
             .finish()
@@ -61,17 +61,22 @@ impl BatchBlockWriterLocal {
             .await?;  
 
         println!("write_context: {:?}", write_context);
+        
+        // Create multiple files, one for each block context  
+        let mut files = Vec::new();  
+        for context in &write_context.contexts {  
+            let path = try_option!(&context.path);    
+            let file = LocalFile::with_write_offset(path, false, pos)?;    
+            files.push(RawPtr::from_owned(file));  
+        }   
 
-        let path = try_option!(&write_context.contexts.first().unwrap().path);  
-        let file: LocalFile = LocalFile::with_write_offset(path, false, pos)?;  
-        let buffered_file = BufWriter::new(file);   
           
         Ok(Self {  
             rt: fs_context.clone_runtime(),  
             fs_context,  
             blocks,  
             worker_address,  
-            buffered_file: Some(RawPtr::from_owned(buffered_file)), 
+            files, 
             block_size,  
             req_id,
             pos: 0,
@@ -111,13 +116,20 @@ impl BatchBlockWriterLocal {
             .await  
     }  
       
-    // Flush the buffered file just once  
+    // Flush all buffered files  
     pub async fn flush(&mut self) -> FsResult<()> {  
-        self.buffered_file.clone().unwrap().flush().map_err(|e| {  
-            curvine_common::error::FsError::from(e)  
-        })?;  
+        for file in &mut self.files {  
+            let file_clone = file.clone();  
+            println!("DEBUG: at LocalFile, we flush file: {:?}", file_clone);
+            self.rt  
+                .spawn_blocking(move || {  
+                    file_clone.as_mut().flush()?;  
+                    Ok::<(), FsError>(())  
+                })  
+                .await??;  
+        }  
         Ok(())  
-    } 
+    }
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
@@ -164,78 +176,111 @@ impl BatchBlockWriterLocal {
 
     //     Ok(())  
     // }  
-    pub async fn write(&mut self, data: DataSlice) -> FsResult<()> {    
-        let bytes = match data {    
-            DataSlice::Bytes(bytes) => bytes.to_vec(),    
-            _ => return Ok(()),    
-        };    
+    // pub async fn write(&mut self, data: DataSlice) -> FsResult<()> {    
+    //     let bytes = match data {    
+    //         DataSlice::Bytes(bytes) => bytes.to_vec(),    
+    //         _ => return Ok(()),    
+    //     };    
         
-        if bytes.len() < 5 {    
-            return Ok(());    
-        }    
+    //     if bytes.len() < 5 {    
+    //         return Ok(());    
+    //     }    
         
-        // Get block count from last byte    
-        let block_count = bytes[bytes.len() - 1] as usize;    
+    //     // Get block count from last byte    
+    //     let block_count = bytes[bytes.len() - 1] as usize;    
         
-        // Find delimiter (0xFF) to locate boundary start    
-        let mut boundary_start = bytes.len() - 1 - (block_count * 4);    
-        while boundary_start > 0 && bytes[boundary_start] != 0xFF {    
-            boundary_start -= 1;    
-        }    
+    //     // Find delimiter (0xFF) to locate boundary start    
+    //     let mut boundary_start = bytes.len() - 1 - (block_count * 4);    
+    //     while boundary_start > 0 && bytes[boundary_start] != 0xFF {    
+    //         boundary_start -= 1;    
+    //     }    
         
-        if boundary_start == 0 || bytes[boundary_start] != 0xFF {    
-            return err_box!("Invalid footer format - delimiter not found");    
-        }    
+    //     if boundary_start == 0 || bytes[boundary_start] != 0xFF {    
+    //         return err_box!("Invalid footer format - delimiter not found");    
+    //     }    
         
-        println!("DEBUG: extracted boundary_start: {:?}", boundary_start);
-        boundary_start += 1; // Skip delimiter    
+    //     println!("DEBUG: extracted boundary_start: {:?}", boundary_start);
+    //     boundary_start += 1; // Skip delimiter    
 
         
         
-        // Extract boundaries    
-        let mut boundaries = Vec::new();    
-        for i in 0..block_count {    
-            let start = boundary_start + (i * 4);    
-            if start + 4 <= bytes.len() - 1 {    
-                let boundary = u32::from_le_bytes([    
-                    bytes[start], bytes[start+1],     
-                    bytes[start+2], bytes[start+3]    
-                ]) as usize;    
-                boundaries.push(boundary);    
-            }    
-        }    
+    //     // Extract boundaries    
+    //     let mut boundaries = Vec::new();    
+    //     for i in 0..block_count {    
+    //         let start = boundary_start + (i * 4);    
+    //         if start + 4 <= bytes.len() - 1 {    
+    //             let boundary = u32::from_le_bytes([    
+    //                 bytes[start], bytes[start+1],     
+    //                 bytes[start+2], bytes[start+3]    
+    //             ]) as usize;    
+    //             boundaries.push(boundary);    
+    //         }    
+    //     }    
 
         
-        let mut totals = 0;
-        // Calculate this block's length and write only its data    
-        if self.block_index < boundaries.len() {    
-            let start = boundaries[self.block_index];    
-            let end = if self.block_index + 1 < boundaries.len() {    
-                boundaries[self.block_index + 1]    
-            } else {    
-                boundary_start - 1    
-            };    
+    //     let mut totals = 0;
+    //     // Calculate this block's length and write only its data    
+    //     if self.block_index < boundaries.len() {    
+    //         let start = boundaries[self.block_index];    
+    //         let end = if self.block_index + 1 < boundaries.len() {    
+    //             boundaries[self.block_index + 1]    
+    //         } else {    
+    //             boundary_start - 1    
+    //         };    
             
-            let block_len = (end - start) as i64;    
+    //         let block_len = (end - start) as i64;    
             
             
             
-            // Update block length    
-            for block in &mut self.blocks {    
-                println!("DEBUG: updating block length to {}", block_len);  
-                block.len = block_len;   
-                totals += block_len; 
-            }    
-        }    
+    //         // Update block length    
+    //         for block in &mut self.blocks {    
+    //             println!("DEBUG: updating block length to {}", block_len);  
+    //             block.len = block_len;   
+    //             totals += block_len; 
+    //         }    
+    //     }    
 
-        // FIX: Write only this block's data (not the entire buffer)  
-        let block_data = &bytes[..totals as usize];  
-        println!("DEBUG: writing block {} data: {} bytes", self.block_index, block_data.len());  
-        self.buffered_file.as_mut().unwrap().write_all(block_data)?;    
+    //     // FIX: Write only this block's data (not the entire buffer)  
+    //     let block_data = &bytes[..totals as usize];  
+    //     println!("DEBUG: writing block {} data: {} bytes", self.block_index, block_data.len());  
+    //     self.buffered_file.as_mut().unwrap().write_all(block_data)?;    
         
-        Ok(())    
-    }
+    //     Ok(())    
+    // }
 
+    pub async fn write(&mut self, data: DataSlice, index: i32) -> FsResult<()> {  
+        println!("DEBUG at BatchBlockWriter, with data: {:?}, index: {:?}", data, index);
+        // Convert DataSlice to bytes (same as BlockWriterLocal)  
+        let bytes = match data {  
+            DataSlice::Empty => return Ok(()),  
+            DataSlice::Bytes(bytes) => bytes.to_vec(),  
+            DataSlice::Buffer(buf) => buf.to_vec(),  
+            DataSlice::IOSlice(slice) => Vec::new(),  
+            DataSlice::MemSlice(slice) => Vec::new(),  
+        };  
+        
+        if bytes.is_empty() {  
+            return Ok(());  
+        }  
+        
+        // Write to current file using spawn_blocking (like BlockWriterLocal)  
+        let mut file = self.files[index as usize].clone();  
+        let bytes_clone = bytes.clone();  
+        
+        self.rt  
+            .spawn_blocking(move || {  
+                file.as_mut().write_all(&bytes_clone)?;  
+                Ok::<(), FsError>(())  
+            })  
+            .await??;  
+        
+        let current_pos = bytes.len() as i64;
+        // Update block length for current block  
+        if current_pos > self.blocks[index as usize].len {  
+            self.blocks[index as usize].len = current_pos;  
+        }  
+        Ok(())
+    }  
 
 // pub async fn write(&mut self, data: DataSlice) -> FsResult<()> {      
 //     let bytes = match data {      
@@ -279,14 +324,13 @@ impl BatchBlockWriterLocal {
       
 //     Ok(())      
 // }
-    /// Get the current position of the underlying LocalFile  
-    pub fn file_pos(&self) -> FsResult<i64> {  
-        match &self.buffered_file {  
-            Some(buffered) => {  
-                let file = buffered.get_ref();  
-                Ok(file.pos())  
-            }  
-            None => err_box!("No file initialized")  
-        }  
-    }
+    // pub fn file_pos(&self) -> FsResult<i64> {  
+    //     match &self.buffered_file {  
+    //         Some(buffered) => {  
+    //             let file = buffered.get_ref();  
+    //             Ok(file.pos())  
+    //         }  
+    //         None => err_box!("No file initialized")  
+    //     }  
+    // }
 }

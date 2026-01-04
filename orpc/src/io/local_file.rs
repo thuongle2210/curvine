@@ -143,6 +143,7 @@ impl LocalFile {
     }
 
     pub fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
+        println!("DEBUG: at LocalFile, we write_all, buf: {:?}", buf);
         try_err!(self.inner.write_all(buf));
         self.pos += buf.len() as i64;
         Ok(())

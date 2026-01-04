@@ -226,3 +226,19 @@ message BlocksBatchCommitRequest {
 message BlocksBatchCommitResponse {  
     repeated bool results = 1;  
 }
+
+
+message BatchFilesWriteRequest {  
+    repeated FileWriteData files = 1;  
+    required int64 req_id = 2;  
+    required int32 seq_id = 3;  
+}  
+  
+message FileWriteData {  
+    required string path = 1;  
+    required bytes content = 2;  
+}  
+  
+message BatchFilesWriteResponse {  
+    repeated bool results = 1;  
+}

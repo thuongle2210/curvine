@@ -49,6 +49,7 @@ impl BlockStore {
     }
 
     pub fn finalize_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        print!("DEBUG at BlockStore, at finalize_block: {:?}", block);
         self.write().finalize_block(block)
     }
 

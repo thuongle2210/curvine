@@ -456,19 +456,20 @@ impl CurvineFileSystem {
         // Write all data (no flushing yet)  
         batch_writer.write_all(files).await?;
         println!("complete write_all files");
-        // Single flush for all files  
-        batch_writer.flush().await?;  
-        println!("complete flush all files");
+        // Single flush for all files  //consider comment, don't need
+        // batch_writer.flush().await?;  
+        // println!("complete flush all files");
         
         // Complete all files  
         let commit_blocks = batch_writer.complete().await?;  
 
-        println!("DEBUG at process_batch, commit_blocks: {:?}", commit_blocks);
-        batch_writer.flush().await?;  
-        println!("complete commit files");
+        // println!("DEBUG at process_batch, commit_blocks: {:?}", commit_blocks);
+        // batch_writer.flush().await?;  
+        // println!("complete commit files");
 
         // Step 4: Batch complete  
-        let mut complete_requests = Vec::new();  
+        // comment it and testing
+        let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> = Vec::new();  
         for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {  
             complete_requests.push((  
                 path.encode(),  
@@ -478,6 +479,8 @@ impl CurvineFileSystem {
                 false,  
             ));  
         }
+
+        println!("DEBUG: complete_requests : {:?}", complete_requests);
         
         self.fs_client()  
             .complete_files_batch(complete_requests)  
