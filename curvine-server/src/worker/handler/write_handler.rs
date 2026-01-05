@@ -122,11 +122,14 @@ impl WriteHandler {
         };
 
         let _ = mem::replace(&mut self.file, file);
+        println!("DEBUT, writehandler, complete, before replace context: {:?}", self.context);
         let _ = self.context.replace(context);
+        println!("DEBUT, writehandler, complete, after replace context: {:?}", self.context);
 
         self.metrics.write_blocks.with_label_values(&[label]).inc();
 
         info!("{}", log_msg);
+        println!("DEBUG: WriteHandler, open,  file: {:?}", self.file);
         Ok(Builder::success(msg).proto_header(response).build())
     }
 
@@ -223,8 +226,10 @@ impl WriteHandler {
 
         println!("DEBUG: at WriteHandler of worker, context= {:?}", context);
         // flush and close the file.
+        println!("DEBUG: WriteHandler,at write,  self.file: {:?}", self.file);
         let file = self.file.take();
         if let Some(mut file) = file {
+            println!("DEBUG: WriteHandler, flush right now");
             file.flush()?;
             drop(file);
         }

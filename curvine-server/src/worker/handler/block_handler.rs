@@ -50,7 +50,10 @@ impl MessageHandler for BlockHandler {
         let response = match self {
             Writer(h) => h.handle(msg),
             Reader(h) => h.handle(msg),
-            BatchWriter(h) => h.handle(msg),
+            BatchWriter(h) => {
+                println!("DEBUG at BlockHandler::handle,at BatchWriter, msg: {:?}", msg);
+                h.handle(msg)
+            },
             _ => err_box!("Unsupported request type"),
         };
 

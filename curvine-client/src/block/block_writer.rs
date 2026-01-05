@@ -86,7 +86,7 @@ impl WriterAdapter {
         match self {
             Local(f) => Ok(()),
             Remote(f) => Ok(()),
-            BatchLocal(f) =>  Ok(()),
+            BatchLocal(f) =>  f.write_v2(files).await,
             BatchRemote(f) => f.write(files).await,
         }
     }
@@ -188,7 +188,8 @@ impl WriterAdapter {
 ) -> FsResult<Self> {  
     let conf = &fs_context.conf.client;  
     let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);  
-  
+    
+    println!("DEBUG, at WriterAdapter::new_batch() short_circuit: {:?}", short_circuit);
     // let adapter = if short_circuit {    
     //     // Extract ExtendedBlock from each LocatedBlock for batch processing  
     //     let blocks: Vec<ExtendedBlock> = located_blocks  
@@ -226,12 +227,35 @@ impl WriterAdapter {
     //     Remote(writer)    
     // };    
 
+
     let blocks: Vec<ExtendedBlock> = located_blocks  
         .iter()  
         .map(|lb| lb.block.clone())  
         .collect();  
-    
+
     println!("at WriterAdapter blocks= {:?}", blocks);
+    let adapter = if short_circuit { 
+        println!("DEBUG, at WriterAdapter::new_batch(): choose BatchBlockWriterLocal");
+        let writer = BatchBlockWriterLocal::new_batch(    
+            fs_context,    
+            blocks,    
+            worker_addr.clone(),    
+            0  
+        )    
+        .await?;  
+        BatchLocal(writer)
+    } else {
+        println!("DEBUG, at WriterAdapter::new_batch(): choose BatchBlockWriterRemote");
+        let writer = BatchBlockWriterRemote::new_batch(
+            &fs_context,    
+            blocks,    
+            worker_addr.clone(),    
+            0  
+        )    
+        .await?;  
+        BatchRemote(writer)
+    };
+    
     // will change to local or remote by short circuit configuration in the next time
     // let writer = BatchBlockWriterLocal::new_batch(    
     //     fs_context,    
@@ -243,20 +267,8 @@ impl WriterAdapter {
 
     // try with BatchLocal and BatchRemote
     // let adapter = BatchLocal(writer);  
-
-
-    let writer = BatchBlockWriterRemote::new_batch(    
-        &fs_context,    
-        blocks,    
-        worker_addr.clone(),    
-        0  
-    )    
-    .await?;  
-    let adapter = BatchRemote(writer);  
-    println!("DEBUG: at WriterAdapter, at new_batch, adapter 2: {:?}", adapter);
-    println!("DEBUG: at WriterAdapter, at new_batch, adapter 3: {:?}", adapter);
-    println!("DEBUG: at WriterAdapter, at new_batch, adapter 4: {:?}", adapter);
-
+    
+    println!("DEBUG: at WriterAdapter, at new_batch, adapter: {:?}", adapter);
     Ok(adapter)  
 }
 
@@ -641,6 +653,8 @@ impl BatchBlockWriter {
     // }
 
     // write all for local, it's done
+
+    /// remember to merge with write to remote
     // pub async fn write_all(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {  
     //     for (index, (path, content)) in files.iter().enumerate() {
     //         let data = DataSlice::Bytes(bytes::Bytes::copy_from_slice(content.as_bytes()));
@@ -694,7 +708,7 @@ impl BatchBlockWriter {
             self.fs_context.add_failed_worker(&worker_addr);  
             return Err(e);  
         }  
-
+        println!("DEBUG at BatchBlockWriter, at write_all, self.inners: {:?}", self.inners);
         
         Ok(())  
     }
@@ -751,17 +765,20 @@ impl BatchBlockWriter {
       
     /// Complete all writers and return commit blocks  
     pub async fn complete(&mut self) -> FsResult<Vec<CommitBlock>> {  
+        println!("DEBUG at BatchBlockWriter, at complete, self.inners: {:?}", self.inners);
         let futures = self.inners.iter_mut().map(|writer| async move {
             writer
                 .complete()
                 .await
                 .map_err(|e| (writer.worker_address().clone(), e))
         });
-  
+        
         if let Err((worker_addr, e)) = try_join_all(futures).await {
             self.fs_context.add_failed_worker(&worker_addr);
             return Err(e);
         }
+
+        println!("DEBUG at BatchBlockWriter, end_complete");
 
         // Collect commit blocks like FsWriterBase does  
         // let mut commits = Vec::new();  
