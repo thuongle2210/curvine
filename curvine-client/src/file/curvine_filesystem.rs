@@ -364,7 +364,7 @@ impl CurvineFileSystem {
 
     pub async fn write_batch_string(&self, files: &[(Path, &str)]) -> FsResult<()> {
         let chunk_size = self.fs_context().write_chunk_size();
-        let mut batch = Vec::new();
+        let mut batch = Vec::with_capacity(files.len());
         let mut batch_memory = 0;
 
         for (path, content) in files.iter() {
@@ -375,7 +375,7 @@ impl CurvineFileSystem {
                 continue;
             }
 
-            if batch.len() >= chunk_size || batch_memory + content_size > chunk_size {
+            if batch_memory + content_size > chunk_size {
                 self.handle_batch_files(&batch).await?;
                 batch.clear();
                 batch_memory = 0;
@@ -414,11 +414,7 @@ impl CurvineFileSystem {
         // Step 2: Batch allocate blocks
         let mut add_block_requests = Vec::with_capacity(file_statuses.len());
         for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
-            add_block_requests.push(
-                path.encode(), // vec![],
-                               // _content.len() as i64,
-                               // None,
-            );
+            add_block_requests.push(path.encode());
         }
 
         println!("add_block_requests: {:?}", add_block_requests);
@@ -431,11 +427,11 @@ impl CurvineFileSystem {
         // assert if allocated_blocks is not smae with add_block_requests
 
         let mut batch_writer =
-            BatchBlockWriter::new_batch(self.fs_context.clone(), allocated_blocks, 0).await?;
+            BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks, 0).await?;
 
         println!("files: {:?}", files);
         // Write all data (no flushing yet)
-        batch_writer.write_all(files).await?;
+        batch_writer.write(files).await?;
         println!("complete write_all files");
 
         // Complete all files
@@ -461,19 +457,3 @@ impl CurvineFileSystem {
         Ok(())
     }
 }
-
-// Step 3: Write data to workers
-// for ((path, content), block) in files.iter().zip(allocated_blocks.iter()) {
-//     let mut block_writer: BlockWriter =
-//         BlockWriter::new(self.fs_context.clone(), block.clone(), 0).await?;
-
-//     // Write the actual file content to all worker replicas
-//     block_writer.write(DataSlice::from_str(content)).await?;
-//     block_writer.flush().await?;
-//     block_writer.complete().await?;
-//     println!(
-//         "Written {} bytes to workers for file: {}",
-//         content.len(),
-//         path.path()
-//     );
-// }

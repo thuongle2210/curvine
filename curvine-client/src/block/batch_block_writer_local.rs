@@ -249,44 +249,44 @@ impl BatchBlockWriterLocal {
     //     Ok(())
     // }
 
-    pub async fn write(&mut self, data: DataSlice, index: i32) -> FsResult<()> {
-        println!(
-            "DEBUG at BatchBlockWriter, with data: {:?}, index: {:?}",
-            data, index
-        );
-        // Convert DataSlice to bytes (same as BlockWriterLocal)
-        let bytes = match data {
-            DataSlice::Empty => return Ok(()),
-            DataSlice::Bytes(bytes) => bytes.to_vec(),
-            DataSlice::Buffer(buf) => buf.to_vec(),
-            DataSlice::IOSlice(slice) => Vec::new(),
-            DataSlice::MemSlice(slice) => Vec::new(),
-        };
+    // pub async fn write(&mut self, data: DataSlice, index: i32) -> FsResult<()> {
+    //     println!(
+    //         "DEBUG at BatchBlockWriter, with data: {:?}, index: {:?}",
+    //         data, index
+    //     );
+    //     // Convert DataSlice to bytes (same as BlockWriterLocal)
+    //     let bytes = match data {
+    //         DataSlice::Empty => return Ok(()),
+    //         DataSlice::Bytes(bytes) => bytes.to_vec(),
+    //         DataSlice::Buffer(buf) => buf.to_vec(),
+    //         DataSlice::IOSlice(slice) => Vec::new(),
+    //         DataSlice::MemSlice(slice) => Vec::new(),
+    //     };
 
-        if bytes.is_empty() {
-            return Ok(());
-        }
+    //     if bytes.is_empty() {
+    //         return Ok(());
+    //     }
 
-        // Write to current file using spawn_blocking (like BlockWriterLocal)
-        let mut file = self.files[index as usize].clone();
-        let bytes_clone = bytes.clone();
+    //     // Write to current file using spawn_blocking (like BlockWriterLocal)
+    //     let mut file = self.files[index as usize].clone();
+    //     let bytes_clone = bytes.clone();
 
-        self.rt
-            .spawn_blocking(move || {
-                file.as_mut().write_all(&bytes_clone)?;
-                Ok::<(), FsError>(())
-            })
-            .await??;
+    //     self.rt
+    //         .spawn_blocking(move || {
+    //             file.as_mut().write_all(&bytes_clone)?;
+    //             Ok::<(), FsError>(())
+    //         })
+    //         .await??;
 
-        let current_pos = bytes.len() as i64;
-        // Update block length for current block
-        if current_pos > self.blocks[index as usize].len {
-            self.blocks[index as usize].len = current_pos;
-        }
-        Ok(())
-    }
+    //     let current_pos = bytes.len() as i64;
+    //     // Update block length for current block
+    //     if current_pos > self.blocks[index as usize].len {
+    //         self.blocks[index as usize].len = current_pos;
+    //     }
+    //     Ok(())
+    // }
 
-    pub async fn write_v2(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
+    pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
         println!("DEBUG at BatchBlockWriter, with files: {:?}", files);
 
         for (index, file) in files.iter().enumerate() {
