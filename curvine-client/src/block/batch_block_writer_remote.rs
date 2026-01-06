@@ -106,7 +106,7 @@ impl BatchBlockWriterRemote {
         println!("DEBUG: BatchBlockWriteRemote, at write, next_seq_id: {:?}, req_id: {:?}", next_seq_id, self.req_id);
           
         // Send all files in one RPC call  
-        let results = self.client  
+        let _ = self.client  
             .write_files_batch(files, self.req_id, next_seq_id)  
             .await?;  
           

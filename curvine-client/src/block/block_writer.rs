@@ -684,16 +684,11 @@ impl BatchBlockWriter {
     // }
 
 
-    pub async fn write_all(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {  
-        for (index, (path, content)) in files.iter().enumerate() {
-            let data = DataSlice::Bytes(bytes::Bytes::copy_from_slice(content.as_bytes()));
-            
-            // Store individual file lengths      
-            for (_, content) in files {      
-                self.file_lengths.push(content.len() as i64);      
-            }
-            
-        }  
+    pub async fn write_all(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {   
+        // Store individual file lengths      
+        for (_, content) in files {      
+            self.file_lengths.push(content.len() as i64);      
+        }
         // Write each file separately to all writers with index  
         let futures = self.inners.iter_mut().map(|writer| {  
         async move {  

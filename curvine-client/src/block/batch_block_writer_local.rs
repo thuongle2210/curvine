@@ -292,17 +292,15 @@ impl BatchBlockWriterLocal {
         for (index, file) in files.iter().enumerate() {
             let local_file = self.files[index as usize].clone();
             let current_pos = file.1.len() as i64;
-            
             let content_owned = file.1.to_string();
-            
             let handle = self.rt.spawn_blocking(move || {
                 let bytes_content = bytes::Bytes::copy_from_slice(content_owned.as_bytes());
                 local_file.as_mut().write_all(&bytes_content)?;
                 Ok::<(), FsError>(())
             });
-            
             handle.await??;
             
+            // update length of block
             if current_pos > self.blocks[index as usize].len {
                 self.blocks[index as usize].len = current_pos;
             }

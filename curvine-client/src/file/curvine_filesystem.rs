@@ -414,12 +414,12 @@ impl CurvineFileSystem {
         // Step 2: Batch allocate blocks
         let mut add_block_requests = Vec::with_capacity(file_statuses.len());
         for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
-            add_block_requests.push((
-                path.encode(),
-                vec![],
-                _content.len() as i64,
-                None,
-            ));
+            add_block_requests.push(
+                path.encode()
+                // vec![],
+                // _content.len() as i64,
+                // None,
+            );
         }
 
         println!("add_block_requests: {:?}", add_block_requests);
@@ -438,7 +438,7 @@ impl CurvineFileSystem {
         ).await?; 
 
         println!("files: {:?}", files);
-        // Write all data (no flushing yet)  
+        // Write all data (no flushing yet) 
         batch_writer.write_all(files).await?;
         println!("complete write_all files");
          

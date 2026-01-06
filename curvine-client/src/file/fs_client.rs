@@ -257,16 +257,18 @@ impl FsClient {
 
     pub async fn add_blocks_batch(
         &self,
-        requests: Vec<(String, Vec<CommitBlock>, i64, Option<ExtendedBlock>)>,
+        // requests: Vec<(String, Vec<CommitBlock>, i64, Option<ExtendedBlock>)>,
+        requests: Vec<(String)>,
     ) -> FsResult<Vec<LocatedBlock>> {
         let pb_requests: Vec<AddBlockRequest> = requests
             .into_iter()
-            .map(|(path, commit_blocks, _file_len, last_block)| {
-                let commit_blocks = commit_blocks
-                    .into_iter()
-                    .map(ProtoUtils::commit_block_to_pb)
-                    .collect();
-
+            .map(|(path)| {
+                // let commit_blocks = commit_blocks
+                //     .into_iter()
+                //     .map(ProtoUtils::commit_block_to_pb)
+                //     .collect();
+                // println!("DEBUG: FsClient::add_blocks_batch, _file_len: {:?}, last_block: {:?}, commit_blocks: {:?}", _file_len, last_block, commit_blocks);
+                let commit_blocks :Vec<CommitBlockProto> = Vec::new();
                 AddBlockRequest {
                     path,
                     commit_blocks,
@@ -274,7 +276,7 @@ impl FsClient {
                     located: true,
                     client_address: self.context.client_addr_pb(),
                     file_len: 0, //file_len
-                    last_block: last_block.map(ProtoUtils::extend_block_to_pb),
+                    last_block: None,
                 }
             })
             .collect();

@@ -79,7 +79,7 @@ impl BatchWriteHandler {
         Ok(())
     }
 
-    pub fn open(&mut self, msg: &Message, index: usize) -> FsResult<Message> {
+    pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = WriteContext::from_req(msg)?;
         println!("DEBUG, at BatchWriterHandler, open with context={:?}", context);
         // println!("DEBUG, at BatchWriterHandler, short_circuit: {:?}", context.short_circuit);
@@ -129,7 +129,6 @@ impl BatchWriteHandler {
         };
         println!("DEBUG, at BatchWriterHandler, reponse before: {:?}", response);
 
-        // let _ = mem::replace(&mut self.file.unwrap()[index], file.unwrap());
 
        if let Some(files) = &mut self.file {
             if let Some(file) = file {
@@ -138,9 +137,7 @@ impl BatchWriteHandler {
         }
         println!("DEBUG, at BatchWriterHandler, before update context: {:?}", self.context);
         if let Some(contexts) = &mut self.context {
-            // let _ = std::mem::replace(&mut contexts[index], context);
                 contexts.push(context);
-            // old_context is dropped here
         }
         println!("DEBUG, at BatchWriterHandler, after update context: {:?}", self.context);
 
@@ -283,11 +280,11 @@ impl BatchWriteHandler {
         println!("DEBUG: open_batch - handler instance: {:p}, context before: {:?}", self, self.context);  
         let header: BlocksBatchWriteRequest = msg.parse_header()?;  
         println!("DEBUG at open_batch: {:?}", header);  
-        let mut responses = Vec::new();    
+        let mut responses = Vec::with_capacity(header.blocks.len());    
 
         // reserve size of files and contexts
-        self.file.as_mut().unwrap().reserve(header.blocks.len());
-        self.context.as_mut().unwrap().reserve(header.blocks.len());
+        // self.file.as_mut().unwrap().reserve(header.blocks.len());
+        // self.context.as_mut().unwrap().reserve(header.blocks.len());
         self.file = Some(Vec::with_capacity(header.blocks.len()));
         self.context = Some(Vec::with_capacity(header.blocks.len()));
 
@@ -298,7 +295,7 @@ impl BatchWriteHandler {
             let unique_req_id = msg.req_id() + i as i64;    
             
             // Create a single BlockWriteRequest from the block  
-            let single_request = BlockWriteRequest {  
+            let header = BlockWriteRequest {  
                 block: block_proto,  
                 off: header.off,  
                 block_size: header.block_size,  
@@ -313,10 +310,10 @@ impl BatchWriteHandler {
                 .request(RequestStatus::Open)  
                 .req_id(unique_req_id)    
                 .seq_id(msg.seq_id())  
-                .proto_header(single_request)    
+                .proto_header(header)    
                 .build();    
                 
-            let response = self.open(&single_msg, i)?;    
+            let response = self.open(&single_msg)?;    
             println!("DEBUG, at BatchWriteHandler, response={:?}", response);
             let block_response: BlockWriteResponse = response.parse_header()?;    
             responses.push(block_response);    
