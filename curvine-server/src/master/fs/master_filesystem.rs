@@ -305,7 +305,10 @@ impl MasterFilesystem {
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         let status = fs_dir.file_status(&inp)?;
-        println!("DEBUG at MasterFilesystem::file_status, status: {:?}", status);
+        println!(
+            "DEBUG at MasterFilesystem::file_status, status: {:?}",
+            status
+        );
         Ok(status)
     }
 
@@ -448,7 +451,10 @@ impl MasterFilesystem {
 
         let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
         let block = fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
-        println!("DEBUG: at MasterFilesystem::add_block, new block allocated: {:?}", block);
+        println!(
+            "DEBUG: at MasterFilesystem::add_block, new block allocated: {:?}",
+            block
+        );
         let located = LocatedBlock {
             block,
             locs: choose_workers,

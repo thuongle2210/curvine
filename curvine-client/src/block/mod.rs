@@ -24,10 +24,9 @@ pub use self::block_writer_local::BlockWriterLocal;
 mod batch_block_writer_remote;
 pub use self::batch_block_writer_remote::BatchBlockWriterRemote;
 
-
 mod block_writer;
-pub use self::block_writer::BlockWriter;
 pub use self::block_writer::BatchBlockWriter;
+pub use self::block_writer::BlockWriter;
 
 mod context;
 pub use self::context::*;
@@ -46,5 +45,3 @@ pub use self::block_reader_hole::BlockReaderHole;
 
 mod batch_block_writer_local;
 pub use self::batch_block_writer_local::BatchBlockWriterLocal;
-
-

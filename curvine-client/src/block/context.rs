@@ -42,29 +42,29 @@ impl BlockReadContext {
     }
 }
 
-#[derive(Debug)]  
-pub struct CreateBatchBlockContext {  
-    pub contexts: Vec<CreateBlockContext>,  
-    pub batch_id: i64,  
-}  
-  
-impl CreateBatchBlockContext {  
-    pub fn new(batch_id: i64) -> Self {  
-        Self {  
-            contexts: Vec::new(),  
-            batch_id,  
-        }  
-    }  
-      
-    pub fn push(&mut self, context: CreateBlockContext) {  
-        self.contexts.push(context);  
-    }  
-      
-    pub fn len(&self) -> usize {  
-        self.contexts.len()  
-    }  
-      
-    pub fn is_empty(&self) -> bool {  
-        self.contexts.is_empty()  
-    }  
+#[derive(Debug)]
+pub struct CreateBatchBlockContext {
+    pub contexts: Vec<CreateBlockContext>,
+    pub batch_id: i64,
+}
+
+impl CreateBatchBlockContext {
+    pub fn new(batch_id: i64) -> Self {
+        Self {
+            contexts: Vec::new(),
+            batch_id,
+        }
+    }
+
+    pub fn push(&mut self, context: CreateBlockContext) {
+        self.contexts.push(context);
+    }
+
+    pub fn len(&self) -> usize {
+        self.contexts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.contexts.is_empty()
+    }
 }

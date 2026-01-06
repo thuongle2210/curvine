@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::{BlockWriter, BatchBlockWriter};
+use crate::block::{BatchBlockWriter, BlockWriter};
 use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use bytes::BytesMut;
@@ -415,10 +415,9 @@ impl CurvineFileSystem {
         let mut add_block_requests = Vec::with_capacity(file_statuses.len());
         for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
             add_block_requests.push(
-                path.encode()
-                // vec![],
-                // _content.len() as i64,
-                // None,
+                path.encode(), // vec![],
+                               // _content.len() as i64,
+                               // None,
             );
         }
 
@@ -430,56 +429,51 @@ impl CurvineFileSystem {
 
         println!("allocated_blocks: {:?}", allocated_blocks);
         // assert if allocated_blocks is not smae with add_block_requests
-       
-        let mut batch_writer = BatchBlockWriter::new_batch(  
-            self.fs_context.clone(),  
-            allocated_blocks,  
-            0,  
-        ).await?; 
+
+        let mut batch_writer =
+            BatchBlockWriter::new_batch(self.fs_context.clone(), allocated_blocks, 0).await?;
 
         println!("files: {:?}", files);
-        // Write all data (no flushing yet) 
+        // Write all data (no flushing yet)
         batch_writer.write_all(files).await?;
         println!("complete write_all files");
-         
-        // Complete all files  
-        let commit_blocks = batch_writer.complete().await?;  
 
-        // Step 4: Batch complete  
-        let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> = Vec::new();  
-        for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {  
-            complete_requests.push((  
-                path.encode(),  
-                content.len() as i64,  
-                vec![commit_block.clone()],  
-                self.fs_context().clone_client_name(),  
-                false,  
-            ));  
+        // Complete all files
+        let commit_blocks = batch_writer.complete().await?;
+
+        // Step 4: Batch complete
+        let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> = Vec::new();
+        for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {
+            complete_requests.push((
+                path.encode(),
+                content.len() as i64,
+                vec![commit_block.clone()],
+                self.fs_context().clone_client_name(),
+                false,
+            ));
         }
 
         println!("DEBUG: complete_requests : {:?}", complete_requests);
-        self.fs_client()  
-            .complete_files_batch(complete_requests)  
-            .await?;  
+        self.fs_client()
+            .complete_files_batch(complete_requests)
+            .await?;
 
         Ok(())
     }
 }
 
+// Step 3: Write data to workers
+// for ((path, content), block) in files.iter().zip(allocated_blocks.iter()) {
+//     let mut block_writer: BlockWriter =
+//         BlockWriter::new(self.fs_context.clone(), block.clone(), 0).await?;
 
-
- // Step 3: Write data to workers
-        // for ((path, content), block) in files.iter().zip(allocated_blocks.iter()) {
-        //     let mut block_writer: BlockWriter =
-        //         BlockWriter::new(self.fs_context.clone(), block.clone(), 0).await?;
-
-        //     // Write the actual file content to all worker replicas
-        //     block_writer.write(DataSlice::from_str(content)).await?;
-        //     block_writer.flush().await?;
-        //     block_writer.complete().await?;
-        //     println!(
-        //         "Written {} bytes to workers for file: {}",
-        //         content.len(),
-        //         path.path()
-        //     );
-        // }
+//     // Write the actual file content to all worker replicas
+//     block_writer.write(DataSlice::from_str(content)).await?;
+//     block_writer.flush().await?;
+//     block_writer.complete().await?;
+//     println!(
+//         "Written {} bytes to workers for file: {}",
+//         content.len(),
+//         path.path()
+//     );
+// }

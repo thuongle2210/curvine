@@ -72,7 +72,7 @@ pub enum RpcCode {
     WriteBlock = 80,
     ReadBlock = 81,
     WriteBlocksBatch = 82,
-    WriteCommitsBatch = 83
+    WriteCommitsBatch = 83,
 }
 
 impl fmt::Display for RpcCode {

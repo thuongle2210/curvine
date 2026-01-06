@@ -330,5 +330,3 @@ impl WriteFileBlocks {
         self.block_locs.last().map(|x| x.block.clone())
     }
 }
-
-

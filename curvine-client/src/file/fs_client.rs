@@ -268,7 +268,7 @@ impl FsClient {
                 //     .map(ProtoUtils::commit_block_to_pb)
                 //     .collect();
                 // println!("DEBUG: FsClient::add_blocks_batch, _file_len: {:?}, last_block: {:?}, commit_blocks: {:?}", _file_len, last_block, commit_blocks);
-                let commit_blocks :Vec<CommitBlockProto> = Vec::new();
+                let commit_blocks: Vec<CommitBlockProto> = Vec::new();
                 AddBlockRequest {
                     path,
                     commit_blocks,
@@ -286,7 +286,10 @@ impl FsClient {
             requests: pb_requests,
         };
 
-        println!("DEBUG at, Fs_client, add_blocks_batch, header: {:?}", header);
+        println!(
+            "DEBUG at, Fs_client, add_blocks_batch, header: {:?}",
+            header
+        );
         let rep: AddBlocksBatchResponse = self.rpc(RpcCode::AddBlocksBatch, header).await?;
         println!("reponse from add_blocks_batch: {:?}", rep);
         Ok(rep

@@ -14,16 +14,14 @@
 
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
+use curvine_common::fs::Path;
 use curvine_common::proto::DataHeaderProto;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
-use orpc::{err_box, try_option};
-use orpc::sys::{DataSlice, RawPtr};
-use curvine_common::fs::Path;
 use orpc::io::LocalFile;
-
-
+use orpc::sys::{DataSlice, RawPtr};
+use orpc::{err_box, try_option};
 
 pub struct BatchBlockWriterRemote {
     blocks: Vec<ExtendedBlock>,
@@ -40,7 +38,7 @@ pub struct BatchBlockWriterRemote {
 impl BatchBlockWriterRemote {
     pub async fn new_batch(
         fs_context: &FsContext,
-        blocks: Vec<ExtendedBlock>,  
+        blocks: Vec<ExtendedBlock>,
         worker_address: WorkerAddress,
         pos: i64,
     ) -> FsResult<Self> {
@@ -61,7 +59,7 @@ impl BatchBlockWriterRemote {
             )
             .await?;
 
-        for context in &write_context.contexts { 
+        for context in &write_context.contexts {
             if block_size != context.block_size {
                 return err_box!(
                     "Abnormal block size, expected length {}, actual length {}",
@@ -69,14 +67,14 @@ impl BatchBlockWriterRemote {
                     context.block_size
                 );
             }
-        } 
-        // Create files from all contexts  
-        // let mut files = Vec::new();  
-        // for context in &write_context.contexts {  
-        //     let path = try_option!(context.path.clone());  
-        //     let file = LocalFile::with_write_offset(path, false, pos)?;  
-        //     files.push(RawPtr::from_owned(file));  
-        // }  
+        }
+        // Create files from all contexts
+        // let mut files = Vec::new();
+        // for context in &write_context.contexts {
+        //     let path = try_option!(context.path.clone());
+        //     let file = LocalFile::with_write_offset(path, false, pos)?;
+        //     files.push(RawPtr::from_owned(file));
+        // }
 
         let writer = Self {
             blocks,
@@ -99,25 +97,29 @@ impl BatchBlockWriterRemote {
     }
 
     // Write data.
-    pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {  
-        println!("DEBUG: BatchBlockWriteRemote writing {} files", files.len());  
-          
-        let next_seq_id = self.next_seq_id();  
-        println!("DEBUG: BatchBlockWriteRemote, at write, next_seq_id: {:?}, req_id: {:?}", next_seq_id, self.req_id);
-          
-        // Send all files in one RPC call  
-        let _ = self.client  
-            .write_files_batch(files, self.req_id, next_seq_id)  
-            .await?;  
-          
-        for (i, (_, content)) in files.iter().enumerate() {  
-            if i < self.blocks.len() {  
-                let file_len = content.len() as i64;  
-                self.blocks[i].len = file_len;  
-            }  
+    pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
+        println!("DEBUG: BatchBlockWriteRemote writing {} files", files.len());
+
+        let next_seq_id = self.next_seq_id();
+        println!(
+            "DEBUG: BatchBlockWriteRemote, at write, next_seq_id: {:?}, req_id: {:?}",
+            next_seq_id, self.req_id
+        );
+
+        // Send all files in one RPC call
+        let _ = self
+            .client
+            .write_files_batch(files, self.req_id, next_seq_id)
+            .await?;
+
+        for (i, (_, content)) in files.iter().enumerate() {
+            if i < self.blocks.len() {
+                let file_len = content.len() as i64;
+                self.blocks[i].len = file_len;
+            }
         }
-        Ok(())  
-    }  
+        Ok(())
+    }
 
     // refresh.
     pub async fn flush(&mut self) -> FsResult<()> {
