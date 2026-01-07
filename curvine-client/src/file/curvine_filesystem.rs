@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::{BatchBlockWriter, BlockWriter};
+use crate::block::BatchBlockWriter;
 use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{BlockLocation, CommitBlock};
+use curvine_common::state::CommitBlock;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags,
@@ -32,8 +32,6 @@ use log::info;
 use log::warn;
 use orpc::client::ClientConf;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::DataSlice;
-use orpc::test::file;
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
 use std::time::Duration;
@@ -427,7 +425,7 @@ impl CurvineFileSystem {
         // assert if allocated_blocks is not smae with add_block_requests
 
         let mut batch_writer =
-            BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks, 0).await?;
+            BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks).await?;
 
         println!("files: {:?}", files);
         // Write all data (no flushing yet)

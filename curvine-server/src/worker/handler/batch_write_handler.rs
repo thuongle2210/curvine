@@ -16,48 +16,34 @@
 use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
-use crate::worker::{Worker, WorkerMetrics};
-use axum::handler;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     FilesBatchWriteRequest, FilesBatchWriteResponse, BlockWriteRequest, BlockWriteResponse,
     BlocksBatchCommitRequest, BlocksBatchCommitResponse, BlocksBatchWriteRequest,
-    BlocksBatchWriteResponse, DataHeaderProto, WriteBlocksBatchRequest, WriteBlocksBatchResponse,
-    WriteCommitRequest, WriteCommitsBatchRequest, WriteCommitsBatchResponse,
+    BlocksBatchWriteResponse
 };
 use curvine_common::state::ExtendedBlock;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use log::{info, warn};
-use orpc::common::{ByteUnit, TimeSpent};
+use log::info;
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::RawPtr;
-use orpc::sys::{DataSlice, RawVec};
-use orpc::{err_box, ternary, try_option_mut};
-use rand::seq::index;
-use std::task::Context;
-use std::{mem, result};
-use tokio_util::context;
-
+use orpc::sys::DataSlice;
+use orpc::err_box;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<Vec<WriteContext>>,
     pub(crate) file: Option<Vec<LocalFile>>,
     pub(crate) is_commit: bool,
-    pub(crate) io_slow_us: u64,
-    pub(crate) metrics: &'static WorkerMetrics,
     pub(crate) write_handler: WriteHandler,
 }
 
 
 impl BatchWriteHandler {
     pub fn new(store: BlockStore) -> Self {
-        let conf = Worker::get_conf();
-        let metrics = Worker::get_metrics();
         println!("DEBUG: at BatchWriteHandler::new()");
         let store_clone = store.clone();
         Self {
@@ -65,8 +51,6 @@ impl BatchWriteHandler {
             context: Some(Vec::new()),
             file: Some(Vec::new()),
             is_commit: false,
-            io_slow_us: conf.worker.io_slow_us(),
-            metrics,
             write_handler: WriteHandler::new(store_clone),
         }
     }
@@ -370,7 +354,12 @@ impl BatchWriteHandler {
 
 
             println!("DEBUG: at write_batch, at before swap: {:?}", self.file);
-            let file = std::mem::replace(&mut self.file.as_mut().unwrap()[i], LocalFile::default());
+            #[allow(clippy::mem_replace_with_default)]
+            let file = std::mem::replace(
+                &mut self.file.as_mut().unwrap()[i],
+                LocalFile::default());
+            
+            #[allow(clippy::mem_replace_with_default)]
             let context = std::mem::replace(
                 &mut self.context.as_mut().unwrap()[i],
                 WriteContext::default(),

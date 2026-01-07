@@ -15,23 +15,18 @@
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
 use curvine_common::fs::Path;
-use curvine_common::proto::DataHeaderProto;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
-use orpc::io::LocalFile;
-use orpc::sys::{DataSlice, RawPtr};
-use orpc::{err_box, try_option};
+use orpc::err_box;
 
 pub struct BatchBlockWriterRemote {
     blocks: Vec<ExtendedBlock>,
     worker_address: WorkerAddress,
-    // files: Option<Vec<RawPtr<LocalFile>>>,
     client: BlockClient,
     pos: i64,
     seq_id: i32,
     req_id: i64,
-    pending_header: Option<DataHeaderProto>,
     block_size: i64,
 }
 
@@ -77,7 +72,6 @@ impl BatchBlockWriterRemote {
             pos,
             seq_id,
             req_id,
-            pending_header: None,
             block_size,
         };
 
@@ -100,7 +94,7 @@ impl BatchBlockWriterRemote {
         );
 
         // Send all files in one RPC call
-        let _ = self
+        self
             .client
             .write_files_batch(files, self.req_id, next_seq_id)
             .await?;

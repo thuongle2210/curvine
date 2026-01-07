@@ -6,9 +6,8 @@ use curvine_common::FsResult;
 use orpc::common::Utils;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::{DataSlice, RawPtr};
-use orpc::{err_box, try_option};
-use std::io::{BufWriter, Write};
+use orpc::sys::RawPtr;
+use orpc::try_option;
 use std::sync::Arc;
 
 pub struct BatchBlockWriterLocal {
@@ -57,7 +56,7 @@ impl BatchBlockWriterLocal {
                 0,
                 block_size,
                 req_id,
-                0 as i32,
+                0_i32,
                 fs_context.write_chunk_size() as i32,
                 true,
             )
@@ -126,7 +125,7 @@ impl BatchBlockWriterLocal {
         println!("DEBUG at BatchBlockWriter, with files: {:?}", files);
 
         for (index, file) in files.iter().enumerate() {
-            let local_file = self.files[index as usize].clone();
+            let local_file = self.files[index].clone();
             let current_pos = file.1.len() as i64;
             let content_owned = file.1.to_string();
             let handle = self.rt.spawn_blocking(move || {
@@ -137,8 +136,8 @@ impl BatchBlockWriterLocal {
             handle.await??;
 
             // update length of block
-            if current_pos > self.blocks[index as usize].len {
-                self.blocks[index as usize].len = current_pos;
+            if current_pos > self.blocks[index].len {
+                self.blocks[index].len = current_pos;
             }
         }
 

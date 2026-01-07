@@ -24,8 +24,11 @@ pub use self::block_writer_local::BlockWriterLocal;
 mod batch_block_writer_remote;
 pub use self::batch_block_writer_remote::BatchBlockWriterRemote;
 
+
+mod batch_block_writer;
+pub use self::batch_block_writer::BatchBlockWriter;
+
 mod block_writer;
-pub use self::block_writer::BatchBlockWriter;
 pub use self::block_writer::BlockWriter;
 
 mod context;

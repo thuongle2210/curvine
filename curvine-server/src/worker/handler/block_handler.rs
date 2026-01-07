@@ -57,7 +57,6 @@ impl MessageHandler for BlockHandler {
                 );
                 h.handle(msg)
             }
-            _ => err_box!("Unsupported request type"),
         };
 
         match response {

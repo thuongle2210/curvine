@@ -25,7 +25,6 @@ use orpc::client::ClusterConnector;
 use orpc::err_box;
 use orpc::message::MessageBuilder;
 use orpc::runtime::RpcRuntime;
-use orpc::test::file;
 use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
@@ -258,11 +257,11 @@ impl FsClient {
     pub async fn add_blocks_batch(
         &self,
         // requests: Vec<(String, Vec<CommitBlock>, i64, Option<ExtendedBlock>)>,
-        requests: Vec<(String)>,
+        requests: Vec<String>,
     ) -> FsResult<Vec<LocatedBlock>> {
         let pb_requests: Vec<AddBlockRequest> = requests
             .into_iter()
-            .map(|(path)| {
+            .map(|path| {
                 // let commit_blocks = commit_blocks
                 //     .into_iter()
                 //     .map(ProtoUtils::commit_block_to_pb)

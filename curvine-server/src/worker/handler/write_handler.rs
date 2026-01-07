@@ -17,23 +17,18 @@ use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
-use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    FilesBatchWriteRequest, FilesBatchWriteResponse, BlockWriteRequest, BlockWriteResponse,
-    BlocksBatchCommitRequest, BlocksBatchCommitResponse, BlocksBatchWriteRequest,
-    BlocksBatchWriteResponse, DataHeaderProto,
+    BlockWriteResponse,DataHeaderProto,
 };
 use curvine_common::state::ExtendedBlock;
-use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::{DataSlice, RawVec};
 use orpc::{err_box, ternary, try_option_mut};
-use std::{mem, result};
+use std::mem;
 
 
 pub struct WriteHandler {

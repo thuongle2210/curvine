@@ -16,16 +16,15 @@
 #![allow(clippy::too_many_arguments)]
 
 
-use crate::block::{self, BlockReadContext, CreateBatchBlockContext, CreateBlockContext};
+use crate::block::{BlockReadContext, CreateBatchBlockContext, CreateBlockContext};
 use crate::file::FsContext;
 use curvine_common::conf::ClientConf;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     FilesBatchWriteRequest, BlockReadRequest, BlockReadResponse, BlockWriteRequest,
-    BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
+    BlockWriteResponse, BlocksBatchCommitRequest,
     BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto, FileWriteData,
-    WriteCommitRequest, WriteCommitsBatchRequest,
 };
 use curvine_common::state::{ExtendedBlock, StorageType};
 use curvine_common::utils::ProtoUtils;
