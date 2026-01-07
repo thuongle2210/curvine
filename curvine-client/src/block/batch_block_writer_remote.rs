@@ -68,13 +68,6 @@ impl BatchBlockWriterRemote {
                 );
             }
         }
-        // Create files from all contexts
-        // let mut files = Vec::new();
-        // for context in &write_context.contexts {
-        //     let path = try_option!(context.path.clone());
-        //     let file = LocalFile::with_write_offset(path, false, pos)?;
-        //     files.push(RawPtr::from_owned(file));
-        // }
 
         let writer = Self {
             blocks,
@@ -147,62 +140,9 @@ impl BatchBlockWriterRemote {
         Ok(())
     }
 
-    pub async fn cancel(&mut self) -> FsResult<()> {
-        let next_seq_id = self.next_seq_id();
-        self.client
-            .write_blocks_batch(
-                &self.blocks,
-                self.pos,
-                self.block_size,
-                self.req_id,
-                next_seq_id,
-                0,
-                true,
-            )
-            .await;
-        Ok(())
-    }
-
-    // Get the number of bytes left to writable in the current block.
-    pub fn remaining(&self) -> i64 {
-        self.block_size - self.pos
-    }
-
-    pub fn pos(&self) -> i64 {
-        self.pos
-    }
-
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
     }
 
-    pub fn len(&self) -> i64 {
-        self.blocks.first().unwrap().len
-    }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        if pos < 0 {
-            return err_box!("Cannot seek to negative position: {}", pos);
-        } else if pos > self.block_size {
-            return err_box!(
-                "Seek position {} exceeds block capacity {}",
-                pos,
-                self.block_size
-            );
-        }
-
-        // Set new position and pending header
-        self.pos = pos;
-        self.pending_header = Some(DataHeaderProto {
-            offset: pos,
-            flush: false,
-            is_last: false,
-        });
-
-        Ok(())
-    }
 }

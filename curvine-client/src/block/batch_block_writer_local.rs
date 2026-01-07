@@ -20,7 +20,6 @@ pub struct BatchBlockWriterLocal {
     block_size: i64,
     req_id: i64,
     pos: i64,
-    block_index: usize,
 }
 
 impl std::fmt::Debug for BatchBlockWriterLocal {
@@ -83,26 +82,8 @@ impl BatchBlockWriterLocal {
             block_size,
             req_id,
             pos: 0,
-            block_index: 0,
         })
     }
-
-    // Write to multiple blocks without RPCs
-    // pub async fn write_to_blocks(&mut self, block_data: Vec<(usize, DataSlice)>) -> FsResult<()> {
-    //     for (block_idx, data) in block_data {
-    //         if let Some(file) = self.files.get_mut(block_idx) {
-    //             let file_clone = file.clone();
-    //             self.rt
-    //                 .spawn_blocking(move || {
-    //                     use std::io::Write;
-    //                     file_clone.write_all(data.as_slice())?;
-    //                     Ok::<(), FsError>(())
-    //                 })
-    //                 .await??;
-    //         }
-    //     }
-    //     Ok(())
-    // }
 
     // SINGLE RPC call to complete all blocks
     pub async fn complete(&mut self) -> FsResult<()> {
@@ -140,151 +121,6 @@ impl BatchBlockWriterLocal {
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
     }
-
-    // pub async fn write(&mut self, data: DataSlice) -> FsResult<()> {
-    //     // Convert DataSlice to bytes and write to internal buffer
-    //     let bytes = match data {
-    //         DataSlice::Empty => return Ok(()),
-    //         DataSlice::Bytes(bytes) => bytes.to_vec(),
-    //         DataSlice::Buffer(buf) => buf.to_vec(),
-    //         DataSlice::IOSlice(slice) => Vec::new(),
-    //         DataSlice::MemSlice(slice) => Vec::new(),
-    //     };
-
-    //     // // Update position for all blocks (they share the same file)
-    //     // for i in 0..self.block_positions.len() {
-    //     //     self.block_positions[i] += write_len;
-    //     // }
-
-    //     // // Update block lengths to match current position
-    //     // for block in &mut self.blocks {
-    //     //     if self.block_positions[0] > block.len {
-    //     //         block.len = self.block_positions[0];
-    //     //     }
-    //     // }
-
-    //     // Get current file position after write
-
-    // // Write to internal BufWriter (no actual I/O yet)
-    // println!("DEBUG: at BatchBlockWriterLocal write, writing {} bytes", bytes.len());
-    // self.buffered_file.as_mut().unwrap().write_all(&bytes).map_err(|e| {
-    //     curvine_common::error::FsError::from(e)
-    // })?;
-
-    //     let current_pos = bytes.len() as i64;
-    //     self.pos += current_pos;
-    //     println!("DEBUG: at BatchBlockWriterLocal write, current_pos = {:?}", current_pos);
-    //     for block in &mut self.blocks {
-    //         if current_pos > block.len {
-    //             block.len = current_pos;
-    //         }
-    //     }
-
-    //     Ok(())
-    // }
-    // pub async fn write(&mut self, data: DataSlice) -> FsResult<()> {
-    //     let bytes = match data {
-    //         DataSlice::Bytes(bytes) => bytes.to_vec(),
-    //         _ => return Ok(()),
-    //     };
-
-    //     if bytes.len() < 5 {
-    //         return Ok(());
-    //     }
-
-    //     // Get block count from last byte
-    //     let block_count = bytes[bytes.len() - 1] as usize;
-
-    //     // Find delimiter (0xFF) to locate boundary start
-    //     let mut boundary_start = bytes.len() - 1 - (block_count * 4);
-    //     while boundary_start > 0 && bytes[boundary_start] != 0xFF {
-    //         boundary_start -= 1;
-    //     }
-
-    //     if boundary_start == 0 || bytes[boundary_start] != 0xFF {
-    //         return err_box!("Invalid footer format - delimiter not found");
-    //     }
-
-    //     println!("DEBUG: extracted boundary_start: {:?}", boundary_start);
-    //     boundary_start += 1; // Skip delimiter
-
-    //     // Extract boundaries
-    //     let mut boundaries = Vec::new();
-    //     for i in 0..block_count {
-    //         let start = boundary_start + (i * 4);
-    //         if start + 4 <= bytes.len() - 1 {
-    //             let boundary = u32::from_le_bytes([
-    //                 bytes[start], bytes[start+1],
-    //                 bytes[start+2], bytes[start+3]
-    //             ]) as usize;
-    //             boundaries.push(boundary);
-    //         }
-    //     }
-
-    //     let mut totals = 0;
-    //     // Calculate this block's length and write only its data
-    //     if self.block_index < boundaries.len() {
-    //         let start = boundaries[self.block_index];
-    //         let end = if self.block_index + 1 < boundaries.len() {
-    //             boundaries[self.block_index + 1]
-    //         } else {
-    //             boundary_start - 1
-    //         };
-
-    //         let block_len = (end - start) as i64;
-
-    //         // Update block length
-    //         for block in &mut self.blocks {
-    //             println!("DEBUG: updating block length to {}", block_len);
-    //             block.len = block_len;
-    //             totals += block_len;
-    //         }
-    //     }
-
-    //     // FIX: Write only this block's data (not the entire buffer)
-    //     let block_data = &bytes[..totals as usize];
-    //     println!("DEBUG: writing block {} data: {} bytes", self.block_index, block_data.len());
-    //     self.buffered_file.as_mut().unwrap().write_all(block_data)?;
-
-    //     Ok(())
-    // }
-
-    // pub async fn write(&mut self, data: DataSlice, index: i32) -> FsResult<()> {
-    //     println!(
-    //         "DEBUG at BatchBlockWriter, with data: {:?}, index: {:?}",
-    //         data, index
-    //     );
-    //     // Convert DataSlice to bytes (same as BlockWriterLocal)
-    //     let bytes = match data {
-    //         DataSlice::Empty => return Ok(()),
-    //         DataSlice::Bytes(bytes) => bytes.to_vec(),
-    //         DataSlice::Buffer(buf) => buf.to_vec(),
-    //         DataSlice::IOSlice(slice) => Vec::new(),
-    //         DataSlice::MemSlice(slice) => Vec::new(),
-    //     };
-
-    //     if bytes.is_empty() {
-    //         return Ok(());
-    //     }
-
-    //     // Write to current file using spawn_blocking (like BlockWriterLocal)
-    //     let mut file = self.files[index as usize].clone();
-    //     let bytes_clone = bytes.clone();
-
-    //     self.rt
-    //         .spawn_blocking(move || {
-    //             file.as_mut().write_all(&bytes_clone)?;
-    //             Ok::<(), FsError>(())
-    //         })
-    //         .await??;
-
-    //     let current_pos = bytes.len() as i64;
-    //     // Update block length for current block
-    //     if current_pos > self.blocks[index as usize].len {
-    //         self.blocks[index as usize].len = current_pos;
-    //     }
-    //     Ok(())
-    // }
 
     pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
         println!("DEBUG at BatchBlockWriter, with files: {:?}", files);
