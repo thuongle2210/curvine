@@ -12,25 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::block_writer::WriterAdapter::{Local, Remote};
 use crate::block::block_writer::BatchWriterAdapter::{BatchLocal, BatchRemote};
+use crate::block::block_writer::WriterAdapter::{Local, Remote};
 
 use crate::block::{
     BatchBlockWriterLocal, BatchBlockWriterRemote, BlockWriterLocal, BlockWriterRemote,
 };
 use crate::file::FsContext;
 use bytes::buf::Writer;
+use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::state::{
     BlockLocation, CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress,
 };
 use curvine_common::FsResult;
 use futures::future::try_join_all;
-use orpc::{err_box, err_ext};
-use curvine_common::error::FsError;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::{DataSlice, RawPtr};
+use orpc::{err_box, err_ext};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -68,8 +68,6 @@ impl WriterAdapter {
             Remote(f) => f.write(buf).await,
         }
     }
-
-
 
     fn blocking_write(&mut self, rt: &Runtime, buf: DataSlice) -> FsResult<()> {
         match self {
@@ -125,10 +123,8 @@ impl WriterAdapter {
         match self {
             Local(f) => f.len(),
             Remote(f) => f.len(),
-
         }
     }
-
 
     async fn new(
         fs_context: Arc<FsContext>,
@@ -201,14 +197,12 @@ impl BatchWriterAdapter {
         }
     }
 
-
     async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
         match self {
             BatchLocal(f) => f.write(files).await,
             BatchRemote(f) => f.write(files).await,
         }
     }
-
 
     fn blocking_write(&mut self, rt: &Runtime, buf: DataSlice) -> FsResult<()> {
         match self {
@@ -230,7 +224,7 @@ impl BatchWriterAdapter {
             BatchRemote(f) => f.complete().await,
         }
     }
-    
+
     // Create new WriterAdapter
     async fn new(
         fs_context: Arc<FsContext>,
@@ -486,7 +480,6 @@ impl BatchBlockWriter {
             file_lengths: Vec::new(),
         })
     }
-
 
     pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
         // Store individual file lengths
