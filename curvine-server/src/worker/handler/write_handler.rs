@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    BatchFilesWriteRequest, BatchFilesWriteResponse, BlockWriteRequest, BlockWriteResponse,
+    FilesBatchWriteRequest, FilesBatchWriteResponse, BlockWriteRequest, BlockWriteResponse,
     BlocksBatchCommitRequest, BlocksBatchCommitResponse, BlocksBatchWriteRequest,
     BlocksBatchWriteResponse, DataHeaderProto,
 };
@@ -34,6 +35,7 @@ use orpc::sys::{DataSlice, RawVec};
 use orpc::{err_box, ternary, try_option_mut};
 use std::{mem, result};
 
+
 pub struct WriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<WriteContext>,
@@ -43,10 +45,12 @@ pub struct WriteHandler {
     pub(crate) metrics: &'static WorkerMetrics,
 }
 
+
 impl WriteHandler {
     pub fn new(store: BlockStore) -> Self {
         let conf = Worker::get_conf();
         let metrics = Worker::get_metrics();
+
 
         Self {
             store,
@@ -61,9 +65,11 @@ impl WriteHandler {
     //     self.file = Some(file);
     // }
 
+
     // pub fn set_context(&mut self, context: &WriteContext) {
     //     self.context = Some(context.clone());
     // }
+
 
     pub fn resize(file: &mut LocalFile, ctx: &WriteContext) -> FsResult<()> {
         let opts = if let Some(opts) = &ctx.block.alloc_opts {
@@ -72,6 +78,7 @@ impl WriteHandler {
             return Ok(());
         };
         opts.validate()?;
+
 
         if opts.len > ctx.block_size {
             return err_box!(
@@ -84,9 +91,11 @@ impl WriteHandler {
             return Ok(());
         }
 
+
         file.resize(opts.truncate, opts.off, opts.len, opts.mode.bits())?;
         Ok(())
     }
+
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = WriteContext::from_req(msg)?;
@@ -98,21 +107,25 @@ impl WriteHandler {
             );
         }
 
+
         let open_block = ExtendedBlock {
             len: context.block_size,
             ..context.block.clone()
         };
+
 
         let meta = self.store.open_block(&open_block)?;
         let mut file = meta.create_writer(context.off, false)?;
         // check file resize
         Self::resize(&mut file, &context)?;
 
+
         let (label, path, file) = if context.short_circuit {
             ("local", file.path().to_string(), None)
         } else {
             ("remote", file.path().to_string(), Some(file))
         };
+
 
         let log_msg = format!(
             "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, off: {}, block_size: {}",
@@ -131,6 +144,7 @@ impl WriteHandler {
             storage_type: meta.storage_type().into(),
         };
 
+
         let _ = mem::replace(&mut self.file, file);
         println!(
             "DEBUT, writehandler, complete, before replace context: {:?}",
@@ -142,12 +156,15 @@ impl WriteHandler {
             self.context
         );
 
+
         self.metrics.write_blocks.with_label_values(&[label]).inc();
+
 
         info!("{}", log_msg);
         println!("DEBUG: WriteHandler, open,  file: {:?}", self.file);
         Ok(Builder::success(msg).proto_header(response).build())
     }
+
 
     fn check_context(context: &WriteContext, msg: &Message) -> FsResult<()> {
         if context.req_id != msg.req_id() {
@@ -160,10 +177,12 @@ impl WriteHandler {
         Ok(())
     }
 
+
     pub fn write(&mut self, msg: &Message) -> FsResult<Message> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
         Self::check_context(context, msg)?;
+
 
         // msg.header
         if msg.header_len() > 0 {
@@ -181,6 +200,7 @@ impl WriteHandler {
             }
         }
 
+
         // Write existing data blocks.
         let data_len = msg.data_len() as i64;
         if data_len > 0 {
@@ -193,8 +213,10 @@ impl WriteHandler {
                 );
             }
 
+
             let spend = TimeSpent::new();
             file.write_region(&msg.data)?;
+
 
             let used = spend.used_us();
             if used >= self.io_slow_us {
@@ -210,8 +232,10 @@ impl WriteHandler {
             self.metrics.write_count.inc();
         }
 
+
         Ok(msg.success())
     }
+
 
     fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {
         if commit {
@@ -221,6 +245,7 @@ impl WriteHandler {
         }
         Ok(())
     }
+
 
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
         println!(
@@ -237,6 +262,7 @@ impl WriteHandler {
             };
         }
 
+
         println!(
             "DEBUT, writehandler, complete, before check context: {:?}",
             self.context
@@ -245,6 +271,7 @@ impl WriteHandler {
             Self::check_context(&context, msg)?;
         }
         let context = WriteContext::from_req(msg)?;
+
 
         println!("DEBUG: at WriteHandler of worker, context= {:?}", context);
         // flush and close the file.
@@ -266,9 +293,11 @@ impl WriteHandler {
             );
         }
 
+
         // Submit block.
         self.commit_block(&context.block, commit)?;
         self.is_commit = true;
+
 
         info!(
             "write block end for req_id {}, is commit: {}, off: {}, len: {}",
@@ -278,21 +307,26 @@ impl WriteHandler {
             context.block.len
         );
 
+
         Ok(msg.success())
     }
 }
 
+
 impl MessageHandler for WriteHandler {
     type Error = FsError;
 
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let request_status = msg.request_status();
+
 
         match request_status {
             RequestStatus::Open => self.open(msg),
             RequestStatus::Running => self.write(msg),
             RequestStatus::Complete => self.complete(msg, true),
             RequestStatus::Cancel => self.complete(msg, false),
+
 
             _ => err_box!("Unsupported request type"),
         }

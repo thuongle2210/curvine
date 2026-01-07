@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
@@ -20,7 +21,7 @@ use axum::handler;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    BatchFilesWriteRequest, BatchFilesWriteResponse, BlockWriteRequest, BlockWriteResponse,
+    FilesBatchWriteRequest, FilesBatchWriteResponse, BlockWriteRequest, BlockWriteResponse,
     BlocksBatchCommitRequest, BlocksBatchCommitResponse, BlocksBatchWriteRequest,
     BlocksBatchWriteResponse, DataHeaderProto, WriteBlocksBatchRequest, WriteBlocksBatchResponse,
     WriteCommitRequest, WriteCommitsBatchRequest, WriteCommitsBatchResponse,
@@ -37,8 +38,10 @@ use orpc::sys::RawPtr;
 use orpc::sys::{DataSlice, RawVec};
 use orpc::{err_box, ternary, try_option_mut};
 use rand::seq::index;
+use std::task::Context;
 use std::{mem, result};
 use tokio_util::context;
+
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
@@ -49,6 +52,7 @@ pub struct BatchWriteHandler {
     pub(crate) metrics: &'static WorkerMetrics,
     pub(crate) write_handler: WriteHandler,
 }
+
 
 impl BatchWriteHandler {
     pub fn new(store: BlockStore) -> Self {
@@ -67,112 +71,6 @@ impl BatchWriteHandler {
         }
     }
 
-    // pub fn resize(file: &mut LocalFile, ctx: &WriteContext) -> FsResult<()> {
-    //     let opts = if let Some(opts) = &ctx.block.alloc_opts {
-    //         opts
-    //     } else {
-    //         return Ok(());
-    //     };
-    //     opts.validate()?;
-
-    //     if opts.len > ctx.block_size {
-    //         return err_box!(
-    //             "Invalid resize operation: allocation size {} > block size {}",
-    //             opts.len,
-    //             ctx.block_size
-    //         );
-    //     }
-    //     if opts.len == 0 {
-    //         return Ok(());
-    //     }
-
-    //     file.resize(opts.truncate, opts.off, opts.len, opts.mode.bits())?;
-    //     Ok(())
-    // }
-
-    // pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
-    //     let context = WriteContext::from_req(msg)?;
-    //     println!(
-    //         "DEBUG, at BatchWriterHandler, open with context={:?}",
-    //         context
-    //     );
-    //     // println!("DEBUG, at BatchWriterHandler, short_circuit: {:?}", context.short_circuit);
-    //     if context.off > context.block_size {
-    //         return err_box!(
-    //             "Invalid write offset: {}, block size: {}",
-    //             context.off,
-    //             context.block_size
-    //         );
-    //     }
-
-    //     let open_block = ExtendedBlock {
-    //         len: context.block_size,
-    //         ..context.block.clone()
-    //     };
-
-    //     let meta = self.store.open_block(&open_block)?;
-    //     println!("DEBUG, at BatchWriterHandler, open with meta={:?}", meta);
-    //     let mut file = meta.create_writer(context.off, false)?;
-    //     println!("DEBUG, at BatchWriterHandler, open with file={:?}", file);
-    //     // check file resize
-    //     Self::resize(&mut file, &context)?;
-    //     println!("DEBUG, at BatchWriterHandler, open with file={:?}", file);
-
-    //     let (label, path, file) = if context.short_circuit {
-    //         ("local", file.path().to_string(), None)
-    //     } else {
-    //         ("remote", file.path().to_string(), Some(file))
-    //     };
-
-    //     let log_msg = format!(
-    //         "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, off: {}, block_size: {}",
-    //         label,
-    //         context.req_id,
-    //         path,
-    //         context.chunk_size,
-    //         context.off,
-    //         ByteUnit::byte_to_string(context.block_size as u64)
-    //     );
-    //     println!("DEBUG, at BatchWriterHandler, log_msg: {:?}", log_msg);
-    //     let response = BlockWriteResponse {
-    //         id: meta.id,
-    //         path: ternary!(context.short_circuit, Some(path), None),
-    //         off: context.off,
-    //         block_size: context.block_size,
-    //         storage_type: meta.storage_type().into(),
-    //     };
-    //     println!(
-    //         "DEBUG, at BatchWriterHandler, reponse before: {:?}",
-    //         response
-    //     );
-
-    //     if let Some(files) = &mut self.file {
-    //         if let Some(file) = file {
-    //             files.push(file);
-    //         }
-    //     }
-    //     println!(
-    //         "DEBUG, at BatchWriterHandler, before update context: {:?}",
-    //         self.context
-    //     );
-    //     if let Some(contexts) = &mut self.context {
-    //         contexts.push(context);
-    //     }
-    //     println!(
-    //         "DEBUG, at BatchWriterHandler, after update context: {:?}",
-    //         self.context
-    //     );
-
-    //     self.metrics.write_blocks.with_label_values(&[label]).inc();
-
-    //     info!("{}", log_msg);
-
-    //     println!(
-    //         "DEBUG, at BatchWriterHandler, reponse after: {:?}",
-    //         response
-    //     );
-    //     Ok(Builder::success(msg).proto_header(response).build())
-    // }
 
     fn check_context(context: &WriteContext, msg: &Message) -> FsResult<()> {
         if context.req_id != msg.req_id() {
@@ -185,6 +83,7 @@ impl BatchWriteHandler {
         Ok(())
     }
 
+
     fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {
         if commit {
             self.store.finalize_block(block)?;
@@ -193,6 +92,7 @@ impl BatchWriteHandler {
         }
         Ok(())
     }
+
 
     pub fn complete(&mut self, msg: &Message, commit: bool, index: usize) -> FsResult<Message> {
         println!(
@@ -212,6 +112,7 @@ impl BatchWriteHandler {
             };
         }
 
+
         println!(
             "DEBUT, BatchWriteHandler, complete, before check context: {:?}",
             self.context
@@ -220,6 +121,7 @@ impl BatchWriteHandler {
             Self::check_context(&context[index], msg)?;
         }
         let context = WriteContext::from_req(msg)?;
+
 
         println!(
             "DEBUG: at BatchWriteHandler of worker, context= {:?}",
@@ -242,9 +144,11 @@ impl BatchWriteHandler {
             );
         }
 
+
         // Submit block.
         self.commit_block(&context.block, commit)?;
         self.is_commit = true;
+
 
         info!(
             "write block end for req_id {}, is commit: {}, off: {}, len: {}",
@@ -254,8 +158,10 @@ impl BatchWriteHandler {
             context.block.len
         );
 
+
         Ok(msg.success())
     }
+
 
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
         println!(
@@ -266,11 +172,11 @@ impl BatchWriteHandler {
         println!("DEBUG at open_batch: {:?}", header);
         let mut responses = Vec::with_capacity(header.blocks.len());
 
+
         // reserve size of files and contexts
-        // self.file.as_mut().unwrap().reserve(header.blocks.len());
-        // self.context.as_mut().unwrap().reserve(header.blocks.len());
         self.file = Some(Vec::with_capacity(header.blocks.len()));
         self.context = Some(Vec::with_capacity(header.blocks.len()));
+
 
         println!(
             "DEBUG at BatchWriteHandler, at open_batch, self.file= {:?}",
@@ -281,8 +187,10 @@ impl BatchWriteHandler {
             self.context
         );
 
+
         for (i, block_proto) in header.blocks.into_iter().enumerate() {
             let unique_req_id = msg.req_id() + i as i64;
+
 
             // Create a single BlockWriteRequest from the block
             let header = BlockWriteRequest {
@@ -294,6 +202,7 @@ impl BatchWriteHandler {
                 chunk_size: header.chunk_size,
             };
 
+
             // Create single request message for each block
             let single_msg = Builder::new()
                 .code(msg.code())
@@ -303,14 +212,26 @@ impl BatchWriteHandler {
                 .proto_header(header)
                 .build();
 
+
             let response = self.write_handler.open(&single_msg)?;
             println!("DEBUG, at BatchWriteHandler, response={:?}", response);
             let block_response: BlockWriteResponse = response.parse_header()?;
             responses.push(block_response);
+
+
+            // Extract file and context from handler and store in batch vectors
+            if let Some(file) = self.write_handler.file.take() {
+                self.file.as_mut().unwrap().push(file);
+            }
+            if let Some(context) = self.write_handler.context.take() {
+                self.context.as_mut().unwrap().push(context);
+            }
         }
+
 
         println!("DEBUG: at open_batch, reponses = {:?}", responses);
         let batch_response = BlocksBatchWriteResponse { responses };
+
 
         println!(
             "DEBUG at BatchWriteHandler, at the end of open_batch, context= {:?}",
@@ -321,8 +242,10 @@ impl BatchWriteHandler {
             self.context
         );
 
+
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
+
 
     pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
         println!(
@@ -338,6 +261,7 @@ impl BatchWriteHandler {
         );
         let mut results = Vec::new();
 
+
         if self.is_commit {
             return if !msg.data.is_empty() {
                 err_box!("The block has been committed and data cannot be written anymore.")
@@ -346,12 +270,14 @@ impl BatchWriteHandler {
             };
         }
 
+
         println!("DEBUG at BatchWriteHandler, at complete_batch, before resolve complete batch");
         // Take and check existing context (same as complete)
         println!(
             "DEBUG at BatchWriteHandler, at complete_batch, self.context: {:?}",
             self.context
         );
+
 
         // Process each block independently
         for (i, block_proto) in header.blocks.into_iter().enumerate() {
@@ -361,14 +287,17 @@ impl BatchWriteHandler {
                 }
             }
 
+
             // Flush and close the file (same as complete)
             let file = self.file.take();
+            println!("DEBUG: file need to flush: {:?}", file);
             if let Some(mut file) = file {
                 if file.len() > 1 {
                     file[i].flush()?;
                     drop(file);
                 }
             }
+
 
             // Create context manually for each block from block_proto
             let unique_req_id = msg.req_id() + i as i64;
@@ -381,10 +310,12 @@ impl BatchWriteHandler {
                 block_size: header.block_size,
             };
 
+
             println!(
                 "DEBUG at BatchWriteHandler, at complete_batch, context[{}] = {:?}",
                 i, context
             );
+
 
             // Validate block length (same as complete)
             if context.block.len > context.block_size {
@@ -395,10 +326,12 @@ impl BatchWriteHandler {
                 );
             }
 
+
             // Commit the block
             self.commit_block(&context.block, commit)?;
             results.push(true);
         }
+
 
         self.is_commit = true;
         println!(
@@ -407,45 +340,78 @@ impl BatchWriteHandler {
         );
         let batch_response = BlocksBatchCommitResponse { results };
 
+
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
 
+
     pub fn write_batch(&mut self, msg: &Message) -> FsResult<Message> {
-        let header: BatchFilesWriteRequest = msg.parse_header()?;
+        let header: FilesBatchWriteRequest = msg.parse_header()?;
         let mut results = Vec::new();
+
 
         for (i, file_data) in header.files.iter().enumerate() {
             // Convert bytes to DataSlice
             let data_slice = DataSlice::Bytes(bytes::Bytes::from(file_data.clone().content));
 
+
+            let unique_req_id = header.req_id + i as i64;
             // Create a temporary message for each file
             let single_msg = Builder::new()
                 .code(RpcCode::WriteBlock)
                 .request(RequestStatus::Running)
-                .req_id(header.req_id + i as i64)
+                .req_id(unique_req_id)
                 .seq_id(header.seq_id)
                 .data(data_slice)
                 .build();
 
+
             // Reuse existing write method
+
 
             // Use raw pointers for direct access
             let dummy_file = LocalFile::default();
             let dummy_context = WriteContext::default();
 
+
             let mut file = dummy_file;
             let mut context = dummy_context;
-            std::mem::swap(&mut self.file.as_mut().unwrap()[i], &mut file);
-            std::mem::swap(&mut self.context.as_mut().unwrap()[i], &mut context);
+            println!("DEBUG: at write_batch, at before swap: {:?}", self.file);
+            // std::mem::swap(&mut self.file.as_mut().unwrap()[i], &mut file);
+            let file = std::mem::replace(&mut self.file.as_mut().unwrap()[i], LocalFile::default());
 
+
+            let context = std::mem::replace(
+                &mut self.context.as_mut().unwrap()[i],
+                WriteContext::default(),
+            );
+
+
+            println!("DEBUG: at write_batch, at after swap: {:?}", self.file);
+
+
+            println!("DEBUG: at write_batch, file i get: {:?}", file);
             // Set handler state via raw pointers
             self.write_handler.file = Some(file);
             self.write_handler.context = Some(context);
             let response = self.write_handler.write(&single_msg);
+
+
+            // Restore back to vector
+            let file = self.write_handler.file.take().unwrap();
+            self.file.as_mut().unwrap()[i] = file;
+
+
+            let context = self.write_handler.context.take().unwrap();
+            self.context.as_mut().unwrap()[i] = context;
+
+
+            println!("DEBUG: at write_batch, at after restore: {:?}", self.file);
             results.push(response.is_ok());
         }
 
-        let batch_response = BatchFilesWriteResponse { results };
+
+        let batch_response = FilesBatchWriteResponse { results };
         println!(
             "DEBUG: BatchWriteHandler, at write_files_batch_for_remote, batch_response: {:?}",
             batch_response
@@ -454,11 +420,12 @@ impl BatchWriteHandler {
     }
 }
 
+
 impl MessageHandler for BatchWriteHandler {
     type Error = FsError;
-
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let request_status = msg.request_status();
+
 
         match request_status {
             // batch operations
@@ -466,7 +433,6 @@ impl MessageHandler for BatchWriteHandler {
             RequestStatus::RunningBatch => self.write_batch(msg),
             RequestStatus::CompleteBatch => self.complete_batch(msg, true),
             RequestStatus::CancelBatch => self.complete_batch(msg, false),
-
             _ => err_box!("Unsupported request type"),
         }
     }

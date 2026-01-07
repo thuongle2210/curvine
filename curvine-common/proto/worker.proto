@@ -24,7 +24,7 @@ message WriteCommitRequest {
     required ExtendedBlockProto block = 1;  
     required int64 pos = 2;  
     required int64 block_size = 3;  
-    required bool cancel = 6;  
+    required bool cancel = 4;  
 }  
 
 message BlockReadRequest {

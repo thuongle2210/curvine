@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 #![allow(clippy::too_many_arguments)]
+
 
 use crate::block::{self, BlockReadContext, CreateBatchBlockContext, CreateBlockContext};
 use crate::file::FsContext;
@@ -20,7 +22,7 @@ use curvine_common::conf::ClientConf;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    BatchFilesWriteRequest, BlockReadRequest, BlockReadResponse, BlockWriteRequest,
+    FilesBatchWriteRequest, BlockReadRequest, BlockReadResponse, BlockWriteRequest,
     BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
     BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto, FileWriteData,
     WriteCommitRequest, WriteCommitsBatchRequest,
@@ -34,11 +36,13 @@ use orpc::sys::DataSlice;
 use orpc::{err_box, CommonResult};
 use std::time::Duration;
 
+
 pub struct BlockClient {
     client: RpcClient,
     client_name: String,
     timeout: Duration,
 }
+
 
 impl BlockClient {
     pub fn new(client: RpcClient, context: &FsContext) -> Self {
@@ -49,6 +53,7 @@ impl BlockClient {
         }
     }
 
+
     pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
         let rep_msg = self.client.timeout_rpc(self.timeout, msg).await?;
         println!("DEBUG rep_msg: {:?}", rep_msg);
@@ -58,6 +63,7 @@ impl BlockClient {
             Ok(rep_msg)
         }
     }
+
 
     pub async fn write_block(
         &self,
@@ -78,6 +84,7 @@ impl BlockClient {
             chunk_size,
         };
 
+
         let msg = Builder::new()
             .code(RpcCode::WriteBlock)
             .request(RequestStatus::Open)
@@ -86,8 +93,10 @@ impl BlockClient {
             .proto_header(header)
             .build();
 
+
         let rep = self.rpc(msg).await?;
         let rep_header: BlockWriteResponse = rep.parse_header()?;
+
 
         let context = CreateBlockContext {
             id: rep_header.id,
@@ -97,8 +106,10 @@ impl BlockClient {
             path: rep_header.path,
         };
 
+
         Ok(context)
     }
+
 
     pub async fn write_data(
         &self,
@@ -114,14 +125,17 @@ impl BlockClient {
             .seq_id(seq_id)
             .data(buf);
 
+
         if let Some(header) = header {
             builder = builder.proto_header(header);
         }
+
 
         let msg = builder.build();
         let _ = self.rpc(msg).await?;
         Ok(())
     }
+
 
     pub async fn write_flush(&self, pos: i64, req_id: i64, seq_id: i32) -> CommonResult<()> {
         let header = DataHeaderProto {
@@ -130,9 +144,10 @@ impl BlockClient {
             is_last: false,
         };
 
+
         let msg = Builder::new()
-            .code(RpcCode::WriteBlocksBatch)
-            .request(RequestStatus::RunningBatch)
+            .code(RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
             .req_id(req_id)
             .seq_id(seq_id)
             .proto_header(header)
@@ -141,6 +156,7 @@ impl BlockClient {
         let _ = self.rpc(msg).await?;
         Ok(())
     }
+
 
     // Write complete
     pub async fn write_commit(
@@ -160,11 +176,13 @@ impl BlockClient {
             ..Default::default()
         };
 
+
         let status = if cancel {
             RequestStatus::Cancel
         } else {
             RequestStatus::Complete
         };
+
 
         let msg = Builder::new()
             .code(RpcCode::WriteBlock)
@@ -174,9 +192,11 @@ impl BlockClient {
             .proto_header(header)
             .build();
 
+
         let _ = self.rpc(msg).await?;
         Ok(())
     }
+
 
     // Open a block.
     pub async fn open_block(
@@ -200,6 +220,7 @@ impl BlockClient {
             drop_cache_len: conf.drop_cache_len,
         };
 
+
         let msg = Builder::new()
             .code(RpcCode::ReadBlock)
             .request(RequestStatus::Open)
@@ -208,7 +229,9 @@ impl BlockClient {
             .proto_header(request)
             .build();
 
+
         let rep = self.rpc(msg).await?;
+
 
         let rep_header: BlockReadResponse = rep.parse_header()?;
         println!(
@@ -217,6 +240,7 @@ impl BlockClient {
         );
         Ok(BlockReadContext::from_req(rep_header))
     }
+
 
     pub async fn read_commit(
         &self,
@@ -229,6 +253,7 @@ impl BlockClient {
             ..Default::default()
         };
 
+
         let msg = Builder::new()
             .code(RpcCode::ReadBlock)
             .request(RequestStatus::Complete)
@@ -237,9 +262,11 @@ impl BlockClient {
             .proto_header(request)
             .build();
 
+
         let _ = self.rpc(msg).await?;
         Ok(())
     }
+
 
     pub async fn read_data(
         &self,
@@ -247,17 +274,19 @@ impl BlockClient {
         seq_id: i32,
         header: Option<DataHeaderProto>,
     ) -> FsResult<DataSlice> {
-        let builder: orpc::message::MessageBuilder = Builder::new()
+        let builder = Builder::new()
             .code(RpcCode::ReadBlock)
             .request(RequestStatus::Running)
             .req_id(req_id)
             .seq_id(seq_id);
+
 
         let msg = if let Some(header) = header {
             builder.proto_header(header).build()
         } else {
             builder.build()
         };
+
 
         let rep = self.rpc(msg).await?;
         Ok(rep.data)
@@ -282,6 +311,7 @@ impl BlockClient {
             .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
             .collect();
 
+
         let header = BlocksBatchWriteRequest {
             blocks: blocks_pb,
             off,
@@ -301,6 +331,7 @@ impl BlockClient {
             .proto_header(header)
             .build();
 
+
         println!("at BlockClient, write_blocks_batch, msg= {:?}", msg);
         let rep = self.rpc(msg).await?;
         println!(
@@ -313,7 +344,9 @@ impl BlockClient {
             rep_header
         );
 
+
         let mut batch_context = CreateBatchBlockContext::new(req_id);
+
 
         for response in rep_header.responses {
             let context = CreateBlockContext {
@@ -331,6 +364,7 @@ impl BlockClient {
         );
         Ok(batch_context)
     }
+
 
     pub async fn write_commit_batch(
         &self,
@@ -371,11 +405,13 @@ impl BlockClient {
             cancel,
         };
 
+
         let status = if cancel {
             RequestStatus::CancelBatch
         } else {
             RequestStatus::CompleteBatch
         };
+
 
         let msg = Builder::new()
             .code(RpcCode::WriteBlocksBatch)
@@ -385,11 +421,13 @@ impl BlockClient {
             .proto_header(header)
             .build();
 
+
         println!("DEBUG, at BlockClient, at write_commit_batch, wait rpc starting signal");
         let _ = self.rpc(msg).await?;
         println!("DEBUG, at BlockClient, at write_commit_batch, wait rpc ending signal");
         Ok(())
     }
+
 
     pub async fn write_files_batch(
         &self,
@@ -405,11 +443,13 @@ impl BlockClient {
             })
             .collect();
 
-        let header = BatchFilesWriteRequest {
+
+        let header = FilesBatchWriteRequest {
             files: file_data,
             req_id,
             seq_id,
         };
+
 
         let msg = Builder::new()
             .code(RpcCode::WriteBlocksBatch)
@@ -418,6 +458,7 @@ impl BlockClient {
             .seq_id(seq_id)
             .proto_header(header)
             .build();
+
 
         let _ = self.rpc(msg).await?;
         Ok(())

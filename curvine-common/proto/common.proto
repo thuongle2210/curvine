@@ -228,7 +228,7 @@ message BlocksBatchCommitResponse {
 }
 
 
-message BatchFilesWriteRequest {  
+message FilesBatchWriteRequest {  
     repeated FileWriteData files = 1;  
     required int64 req_id = 2;  
     required int32 seq_id = 3;  
@@ -239,6 +239,6 @@ message FileWriteData {
     required bytes content = 2;  
 }  
   
-message BatchFilesWriteResponse {  
+message FilesBatchWriteResponse {  
     repeated bool results = 1;  
 }
