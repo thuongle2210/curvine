@@ -28,6 +28,7 @@ pub struct WriteContext {
     pub block_size: i64,
 }
 impl Default for WriteContext {
+    #[inline(always)]
     fn default() -> Self {
         Self {
             block: ExtendedBlock::default(),

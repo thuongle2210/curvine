@@ -36,7 +36,7 @@ pub struct BatchBlockWriterRemote {
 }
 
 impl BatchBlockWriterRemote {
-    pub async fn new_batch(
+    pub async fn new(
         fs_context: &FsContext,
         blocks: Vec<ExtendedBlock>,
         worker_address: WorkerAddress,

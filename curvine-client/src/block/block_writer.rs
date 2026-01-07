@@ -256,13 +256,13 @@ impl BatchWriterAdapter {
         let adapter = if short_circuit {
             println!("DEBUG, at WriterAdapter::new_batch(): choose BatchBlockWriterLocal");
             let writer =
-                BatchBlockWriterLocal::new_batch(fs_context, blocks, worker_addr.clone(), 0)
+                BatchBlockWriterLocal::new(fs_context, blocks, worker_addr.clone(), 0)
                     .await?;
             BatchLocal(writer)
         } else {
             println!("DEBUG, at WriterAdapter::new_batch(): choose BatchBlockWriterRemote");
             let writer =
-                BatchBlockWriterRemote::new_batch(&fs_context, blocks, worker_addr.clone(), 0)
+                BatchBlockWriterRemote::new(&fs_context, blocks, worker_addr.clone(), 0)
                     .await?;
             BatchRemote(writer)
         };

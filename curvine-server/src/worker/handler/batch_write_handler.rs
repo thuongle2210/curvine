@@ -369,18 +369,8 @@ impl BatchWriteHandler {
             // Reuse existing write method
 
 
-            // Use raw pointers for direct access
-            let dummy_file = LocalFile::default();
-            let dummy_context = WriteContext::default();
-
-
-            let mut file = dummy_file;
-            let mut context = dummy_context;
             println!("DEBUG: at write_batch, at before swap: {:?}", self.file);
-            // std::mem::swap(&mut self.file.as_mut().unwrap()[i], &mut file);
             let file = std::mem::replace(&mut self.file.as_mut().unwrap()[i], LocalFile::default());
-
-
             let context = std::mem::replace(
                 &mut self.context.as_mut().unwrap()[i],
                 WriteContext::default(),

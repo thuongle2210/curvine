@@ -37,7 +37,7 @@ impl std::fmt::Debug for BatchBlockWriterLocal {
 }
 
 impl BatchBlockWriterLocal {
-    pub async fn new_batch(
+    pub async fn new(
         fs_context: Arc<FsContext>,
         blocks: Vec<ExtendedBlock>,
         worker_address: WorkerAddress,
