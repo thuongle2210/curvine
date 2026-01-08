@@ -26,15 +26,15 @@ use std::sync::Arc;
 #[test]
 fn test_mount_write_cache() {
     // Check if UFS configuration is available, if not, skip the test
-    if env::var("UFS_TEST_PATH").is_err() {
-        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
-        println!(
-            "   Set UFS_TEST_PATH and UFS_TEST_PROPERTIES environment variables to run this test"
-        );
-        println!("   Example: export UFS_TEST_PATH=hdfs://127.0.0.1:9000");
-        println!("   Example: export UFS_TEST_PROPERTIES=\"hdfs.namenode=hdfs://127.0.0.1:9000,hdfs.user=root\"");
-        return;
-    }
+    // if env::var("UFS_TEST_PATH").is_err() {
+    //     println!("⚠️  UFS_TEST_PATH is not set, skipping test");
+    //     println!(
+    //         "   Set UFS_TEST_PATH and UFS_TEST_PROPERTIES environment variables to run this test"
+    //     );
+    //     println!("   Example: export UFS_TEST_PATH=hdfs://127.0.0.1:9000");
+    //     println!("   Example: export UFS_TEST_PROPERTIES=\"hdfs.namenode=hdfs://127.0.0.1:9000,hdfs.user=root\"");
+    //     return;
+    // }
 
     let testing = Testing::default();
     let rt = Arc::new(AsyncRuntime::single());
@@ -165,11 +165,14 @@ async fn verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
 }
 
 async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
+    println!("mount action....");
     let ufs_base = env::var("UFS_TEST_PATH").unwrap();
 
     let dir = format!("write_cache_{:?}", write_type);
     let ufs_path = Path::from_str(format!("{}/{}", ufs_base, dir)).unwrap();
     let cv_path = Path::from_str(format!("/{}", dir)).unwrap();
+    println!("ufs_path: {:?}", ufs_path);
+    println!("cv_path: {:?}", cv_path);
 
     let mut opts_builder = MountOptionsBuilder::new().write_type(write_type);
 
