@@ -184,6 +184,10 @@ pub struct ProtobufSerializer;
 impl ProtobufSerializer {
     const VERSION_PREFIX: u8 = 0x01;
 
+    pub fn is_valid_protobuf_version(bytes: &[u8]) -> bool {
+        bytes[0] == Self::VERSION_PREFIX && !bytes.is_empty()
+    }
+
     /// Serialize a protobuf Message type directly (most efficient)  
     pub fn serialize_message<T: Message>(&self, value: &T) -> CommonResult<Vec<u8>> {
         let mut buf = Vec::with_capacity(value.encoded_len() + 1);
@@ -198,7 +202,7 @@ impl ProtobufSerializer {
             return err_box!("Empty bytes for protobuf deserialization");
         }
 
-        if bytes[0] != Self::VERSION_PREFIX {
+        if !Self::is_valid_protobuf_version(bytes) {
             return err_box!(
                 "Invalid protobuf version prefix: expected {}, got {}",
                 Self::VERSION_PREFIX,
@@ -251,35 +255,6 @@ impl Serializer for ProtobufSerializer {
 
     fn name(&self) -> &'static str {
         "protobuf"
-    }
-}
-
-/// Generic serializable value enum for static dispatch  
-pub enum SerializableValue<T> {
-    /// Standard serde-compatible type  
-    Serde(T),
-    /// Protobuf message type  
-    Proto(T),
-}
-
-impl<T> SerializableValue<T>
-where
-    T: serde::Serialize + Message + Default,
-{
-    pub fn serialize_with(&self, serializer: &SerializerImpl) -> CommonResult<Vec<u8>> {
-        match (self, serializer) {
-            // Serde value with any serializer
-            (SerializableValue::Serde(v), SerializerImpl::Bincode(s)) => s.serialize(v),
-            (SerializableValue::Serde(v), SerializerImpl::Json(s)) => s.serialize(v),
-            (SerializableValue::Serde(v), SerializerImpl::Protobuf(s)) => s.serialize(v),
-
-            // Proto value - use optimized protobuf path when available
-            (SerializableValue::Proto(v), SerializerImpl::Protobuf(s)) => s.serialize_message(v),
-            (SerializableValue::Proto(v), _) => {
-                // Fall back to serde for non-protobuf serializers
-                serializer.serialize(v)
-            }
-        }
     }
 }
 

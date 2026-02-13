@@ -26,6 +26,7 @@ use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
     MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
+use curvine_common::utils::{ProtobufSerializer, SerializerImpl};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{LocalTime, TimeSpent};
@@ -52,7 +53,9 @@ impl FsDir {
     ) -> FsResult<Self> {
         let db_conf = conf.meta_rocks_conf();
 
-        let store = RocksInodeStore::new(db_conf, conf.format_master)?;
+        // Choose serializer
+        let serializer = SerializerImpl::Protobuf(ProtobufSerializer);
+        let store = RocksInodeStore::new(db_conf, conf.format_master, serializer)?;
         let state = InodeStore::new(store, ttl_bucket_list);
         let (last_inode_id, root_dir) = state.create_blank_tree()?;
 

@@ -19,6 +19,7 @@ use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
 use curvine_common::state::{BlockLocation, CommitBlock, FileLock, MountInfo};
+use curvine_common::utils::{ProtobufSerializer, SerializerImpl};
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
@@ -538,13 +539,15 @@ impl InodeStore {
         // The database points to a temporary directory.
         let tmp_path = Utils::temp_file();
         let tmp_conf = DBConf::new(tmp_path);
-        self.store = Arc::new(RocksInodeStore::new(tmp_conf, false)?);
+        let serializer = SerializerImpl::Protobuf(ProtobufSerializer);
+        self.store = Arc::new(RocksInodeStore::new(tmp_conf, false, serializer)?);
 
         // Delete the original file and move the checkpoint to the data directory.
         FileUtils::delete_path(&conf.data_dir, true)?;
         FileUtils::copy_dir(path.as_ref(), &conf.data_dir)?;
 
-        self.store = Arc::new(RocksInodeStore::new(conf, false)?);
+        let serializer = SerializerImpl::Protobuf(ProtobufSerializer);
+        self.store = Arc::new(RocksInodeStore::new(conf, false, serializer)?);
         Ok(())
     }
 

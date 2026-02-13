@@ -14,6 +14,7 @@
 
 use curvine_common::rocksdb::DBConf;
 use curvine_common::state::BlockLocation;
+use curvine_common::utils::{ProtobufSerializer, SerializerImpl};
 use curvine_server::master::meta::inode::{InodeDir, InodeFile, InodeView, ROOT_INODE_ID};
 use curvine_server::master::meta::store::RocksInodeStore;
 use orpc::CommonResult;
@@ -50,7 +51,8 @@ fn test_inode_path_components_parsing() {
 #[test]
 fn test_rocks_inode_store_add_delete_child_and_iterator() -> CommonResult<()> {
     let conf = DBConf::default();
-    let db = RocksInodeStore::new(conf, true)?;
+    let serializer = SerializerImpl::Protobuf(ProtobufSerializer);
+    let db = RocksInodeStore::new(conf, true, serializer)?;
 
     let mut batch = db.new_batch();
     batch.add_child(ROOT_INODE_ID, "c", 3)?;
@@ -94,7 +96,8 @@ fn test_rocks_inode_store_add_delete_child_and_iterator() -> CommonResult<()> {
 #[test]
 fn test_rocks_block_store_add_delete_location_operations() -> CommonResult<()> {
     let conf = DBConf::default();
-    let db = RocksInodeStore::new(conf, true)?;
+    let serializer = SerializerImpl::Protobuf(ProtobufSerializer);
+    let db = RocksInodeStore::new(conf, true, serializer)?;
 
     let mut batch = db.new_batch();
     batch.add_location(101, &BlockLocation::with_id(1))?;
@@ -130,7 +133,8 @@ fn test_rocks_block_store_add_delete_location_operations() -> CommonResult<()> {
 #[test]
 fn test_delete_all_block_locations_for_specific_worker() -> CommonResult<()> {
     let conf = DBConf::default();
-    let db = RocksInodeStore::new(conf, true)?;
+    let serializer = SerializerImpl::Protobuf(ProtobufSerializer);
+    let db = RocksInodeStore::new(conf, true, serializer)?;
 
     // Setup: Add locations for multiple blocks and workers
     let mut batch = db.new_batch();

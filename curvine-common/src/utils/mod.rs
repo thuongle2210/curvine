@@ -16,9 +16,9 @@ mod proto_utils;
 pub use self::proto_utils::ProtoUtils;
 
 mod serde_utils;
-pub use self::serde_utils::ProtobufSerializer;
-pub use self::serde_utils::SerdeUtils;
-pub use self::serde_utils::SerializerImpl;
+pub use self::serde_utils::{
+    BincodeSerializer, ProtobufSerializer, SerdeUtils, Serializer, SerializerImpl,
+};
 
 pub mod display;
 mod rpc_utils;

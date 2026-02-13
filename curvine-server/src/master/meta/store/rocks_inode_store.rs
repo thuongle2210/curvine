@@ -17,12 +17,15 @@ use crate::master::meta::LockMeta;
 use curvine_common::proto::InodeViewProto;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, FileLock, MountInfo};
-use curvine_common::utils::ProtobufSerializer;
-use curvine_common::utils::SerdeUtils as Serde;
+use curvine_common::utils::Serializer;
+use curvine_common::utils::SerializerImpl;
+use curvine_common::utils::{BincodeSerializer, ProtobufSerializer, SerdeUtils as Serde};
 use orpc::CommonResult;
 use rocksdb::{DBIteratorWithThreadMode, WriteBatchWithTransaction, DB};
+
 pub struct RocksInodeStore {
     pub(crate) db: DBEngine,
+    serializer: SerializerImpl,
 }
 
 impl RocksInodeStore {
@@ -35,7 +38,7 @@ impl RocksInodeStore {
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
 
-    pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
+    pub fn new(conf: DBConf, format: bool, serializer: SerializerImpl) -> CommonResult<Self> {
         let conf = conf
             .add_cf(Self::CF_INODES)
             .add_cf(Self::CF_EDGES)
@@ -43,7 +46,7 @@ impl RocksInodeStore {
             .add_cf(Self::CF_LOCATION)
             .add_cf(Self::CF_COMMON);
         let db = DBEngine::new(conf, format)?;
-        Ok(Self { db })
+        Ok(Self { db, serializer })
     }
 
     pub fn get_child_ids(
@@ -82,7 +85,7 @@ impl RocksInodeStore {
     }
 
     pub fn new_batch(&self) -> InodeWriteBatch<'_> {
-        InodeWriteBatch::new(&self.db)
+        InodeWriteBatch::new(&self.db, &self.serializer)
     }
 
     pub fn inodes_iter(&self) -> CommonResult<RocksIterator<'_>> {
@@ -102,10 +105,27 @@ impl RocksInodeStore {
             None => Ok(None),
 
             Some(v) => {
-                let serializer = ProtobufSerializer;
-                let proto = serializer.deserialize_message::<InodeViewProto>(&v)?;
-                let inode = InodeView::from_proto(proto);
-                // let inode: InodeView = Serde::deserialize(&v)?;
+                let inode = match &self.serializer {
+                    SerializerImpl::Protobuf(s) => {
+                        // Use optimized protobuf path
+                        if ProtobufSerializer::is_valid_protobuf_version(&v) {
+                            // Protobuf format (has version prefix)
+                            let proto = s.deserialize_message::<InodeViewProto>(&v)?;
+                            InodeView::from_proto(proto)
+                        } else {
+                            println!(
+                                "Curvine enable dual reading, get inode from legacy bincode format"
+                            );
+                            // Legacy bincode format (no prefix)
+                            let serializer = BincodeSerializer;
+                            serializer.deserialize::<InodeView>(&v)?
+                        }
+                    }
+                    _ => {
+                        // Use generic serde deserialization for bincode/json
+                        self.serializer.deserialize(&v)?
+                    }
+                };
                 Ok(Some(inode))
             }
         }
@@ -239,13 +259,15 @@ impl Iterator for InodeChildrenIter<'_> {
 pub struct InodeWriteBatch<'a> {
     db: &'a DBEngine,
     batch: WriteBatchWithTransaction<false>,
+    serializer: &'a SerializerImpl,
 }
 
 impl<'a> InodeWriteBatch<'a> {
-    pub fn new(db: &'a DBEngine) -> Self {
+    pub fn new(db: &'a DBEngine, serializer: &'a SerializerImpl) -> Self {
         Self {
             db,
             batch: WriteBatchWithTransaction::<false>::default(),
+            serializer,
         }
     }
 
@@ -284,10 +306,18 @@ impl<'a> InodeWriteBatch<'a> {
     pub fn write_inode(&mut self, inode: &InodeView) -> CommonResult<()> {
         println!("Inode is written: {:?}", inode);
         let key = RocksUtils::i64_to_bytes(inode.id());
-        let serializer = ProtobufSerializer;
-        let proto = inode.clone().to_proto();
-        let value = serializer.serialize_message(&proto)?;
-        // let value = Serde::serialize(inode)?;
+
+        // test legacy serialization format
+        // let serializer = BincodeSerializer;
+        // let value = serializer.serialize::<InodeView>(inode)?;
+
+        let value = match &self.serializer {
+            SerializerImpl::Protobuf(s) => {
+                let proto = inode.clone().to_proto();
+                s.serialize_message(&proto)?
+            }
+            _ => self.serializer.serialize(inode)?,
+        };
 
         self.put_cf(RocksInodeStore::CF_INODES, key, value)
     }
