@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_common::proto::AclFeatureProto;
 use serde::{Deserialize, Serialize};
-
 // File and directory permission control.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AclFeature {
@@ -30,6 +30,21 @@ impl AclFeature {
             owner: "".to_string(),
             group: "".to_string(),
             mode,
+        }
+    }
+    pub fn acl_feature_to_pb(acl: AclFeature) -> AclFeatureProto {
+        AclFeatureProto {
+            mode: acl.mode,
+            owner: acl.owner,
+            group: acl.group,
+        }
+    }
+
+    pub fn acl_feature_from_pb(proto: AclFeatureProto) -> AclFeature {
+        Self {
+            mode: proto.mode,
+            owner: proto.owner,
+            group: proto.group,
         }
     }
 }

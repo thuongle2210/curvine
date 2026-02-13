@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_common::proto::WriteFeatureProto;
 use orpc::common::Utils;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -27,6 +28,17 @@ impl WriteFeature {
         let mut clients = HashSet::new();
         clients.insert(client_name);
         Self { clients }
+    }
+    pub fn write_feature_to_pb(write: WriteFeature) -> WriteFeatureProto {
+        WriteFeatureProto {
+            clients: write.clients.into_iter().collect(),
+        }
+    }
+
+    pub fn write_feature_from_pb(proto: WriteFeatureProto) -> WriteFeature {
+        Self {
+            clients: proto.clients.into_iter().collect(),
+        }
     }
 }
 

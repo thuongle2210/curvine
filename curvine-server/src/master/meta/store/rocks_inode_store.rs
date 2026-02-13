@@ -14,12 +14,13 @@
 
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
+use curvine_common::proto::InodeViewProto;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, FileLock, MountInfo};
+use curvine_common::utils::ProtobufSerializer;
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use rocksdb::{DBIteratorWithThreadMode, WriteBatchWithTransaction, DB};
-
 pub struct RocksInodeStore {
     pub(crate) db: DBEngine,
 }
@@ -101,7 +102,10 @@ impl RocksInodeStore {
             None => Ok(None),
 
             Some(v) => {
-                let inode: InodeView = Serde::deserialize(&v)?;
+                let serializer = ProtobufSerializer;
+                let proto = serializer.deserialize_message::<InodeViewProto>(&v)?;
+                let inode = InodeView::from_proto(proto);
+                // let inode: InodeView = Serde::deserialize(&v)?;
                 Ok(Some(inode))
             }
         }
@@ -278,8 +282,13 @@ impl<'a> InodeWriteBatch<'a> {
 
     // Add an inode.
     pub fn write_inode(&mut self, inode: &InodeView) -> CommonResult<()> {
+        println!("Inode is written: {:?}", inode);
         let key = RocksUtils::i64_to_bytes(inode.id());
-        let value = Serde::serialize(inode)?;
+        let serializer = ProtobufSerializer;
+        let proto = inode.clone().to_proto();
+        let value = serializer.serialize_message(&proto)?;
+        // let value = Serde::serialize(inode)?;
+
         self.put_cf(RocksInodeStore::CF_INODES, key, value)
     }
 

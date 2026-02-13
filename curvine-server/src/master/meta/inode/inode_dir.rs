@@ -18,7 +18,9 @@ use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
+use curvine_common::proto::InodeDirProto;
 use curvine_common::state::{MkdirOpts, StoragePolicy};
+use curvine_common::utils::ProtoUtils;
 use glob::Pattern;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
@@ -130,6 +132,31 @@ impl InodeDir {
 
     pub fn add_dir_child(&mut self, name: &str, dir: InodeDir) -> CommonResult<InodePtr> {
         self.add_child(Dir(name.to_string(), dir))
+    }
+
+    pub fn inode_dir_to_pb(dir: InodeDir) -> InodeDirProto {
+        InodeDirProto {
+            id: dir.id,
+            parent_id: dir.parent_id,
+            mtime: dir.mtime,
+            atime: dir.atime,
+            nlink: dir.nlink,
+            storage_policy: ProtoUtils::storage_policy_to_pb(dir.storage_policy),
+            features: DirFeature::dir_feature_to_pb(dir.features),
+        }
+    }
+
+    pub fn inode_dir_from_pb(proto: InodeDirProto) -> InodeDir {
+        InodeDir {
+            id: proto.id,
+            parent_id: proto.parent_id,
+            mtime: proto.mtime,
+            atime: proto.atime,
+            nlink: proto.nlink,
+            storage_policy: ProtoUtils::storage_policy_from_pb(proto.storage_policy),
+            features: DirFeature::dir_feature_from_pb(proto.features),
+            children: InodeChildren::new_map(), // Children not serialized
+        }
     }
 }
 

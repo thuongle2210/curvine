@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::feature::{AclFeature, WriteFeature};
+use curvine_common::proto::FileFeatureProto;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -81,6 +82,22 @@ impl FileFeature {
     pub fn set_user(&mut self, user: impl Into<String>, group: impl Into<String>) {
         self.acl.owner = user.into();
         self.acl.group = group.into();
+    }
+
+    pub fn file_feature_to_pb(features: FileFeature) -> FileFeatureProto {
+        FileFeatureProto {
+            x_attr: features.x_attr,
+            file_write: features.file_write.map(WriteFeature::write_feature_to_pb),
+            acl: AclFeature::acl_feature_to_pb(features.acl),
+        }
+    }
+
+    pub fn file_feature_from_pb(proto: FileFeatureProto) -> FileFeature {
+        Self {
+            x_attr: proto.x_attr,
+            file_write: proto.file_write.map(WriteFeature::write_feature_from_pb),
+            acl: AclFeature::acl_feature_from_pb(proto.acl),
+        }
     }
 }
 

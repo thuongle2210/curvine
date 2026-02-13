@@ -14,14 +14,17 @@
 
 #![allow(clippy::large_enum_variant)]
 
-use crate::master::meta::feature::AclFeature;
+use crate::master::meta::feature::{AclFeature, FileFeature};
 use crate::master::meta::inode::ttl_types::TtlConfig;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
+use crate::master::meta::BlockMeta;
 use core::panic;
+use curvine_common::proto::{inode_view_proto, InodeFileProto, InodeViewProto};
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy};
+use curvine_common::utils::ProtoUtils;
 use curvine_common::utils::SerdeUtils;
 use orpc::common::Utils;
 use orpc::{err_box, CommonResult};
@@ -494,6 +497,89 @@ impl InodeView {
         }
 
         res
+    }
+
+    pub fn to_proto(self) -> InodeViewProto {
+        match self {
+            InodeView::File(name, file) => InodeViewProto {
+                name,
+                inode_type: Some(inode_view_proto::InodeType::File(Self::inode_file_to_pb(
+                    file,
+                ))),
+            },
+            InodeView::Dir(name, dir) => InodeViewProto {
+                name,
+                inode_type: Some(inode_view_proto::InodeType::Dir(InodeDir::inode_dir_to_pb(
+                    dir,
+                ))),
+            },
+            InodeView::FileEntry(name, id) => InodeViewProto {
+                name,
+                inode_type: Some(inode_view_proto::InodeType::FileEntryId(id)),
+            },
+        }
+    }
+
+    /// Convert protobuf message to InodeView  
+    pub fn from_proto(proto: InodeViewProto) -> Self {
+        match proto.inode_type {
+            Some(inode_view_proto::InodeType::File(file)) => {
+                InodeView::File(proto.name, Self::inode_file_from_pb(file))
+            }
+            Some(inode_view_proto::InodeType::Dir(dir)) => {
+                InodeView::Dir(proto.name, InodeDir::inode_dir_from_pb(dir))
+            }
+            Some(inode_view_proto::InodeType::FileEntryId(id)) => {
+                InodeView::FileEntry(proto.name, id)
+            }
+            None => panic!("InodeViewProto missing inode_type"),
+        }
+    }
+
+    fn inode_file_to_pb(file: InodeFile) -> InodeFileProto {
+        InodeFileProto {
+            id: file.id,
+            parent_id: file.parent_id,
+            file_type: file.file_type.into(),
+            mtime: file.mtime,
+            atime: file.atime,
+            len: file.len,
+            block_size: file.block_size,
+            replicas: file.replicas as u32,
+            storage_policy: ProtoUtils::storage_policy_to_pb(file.storage_policy),
+            blocks: file
+                .blocks
+                .into_iter()
+                .map(BlockMeta::block_meta_to_pb)
+                .collect(),
+            nlink: file.nlink,
+            next_seq: file.next_seq,
+            target: file.target,
+            features: FileFeature::file_feature_to_pb(file.features),
+        }
+    }
+
+    fn inode_file_from_pb(proto: InodeFileProto) -> InodeFile {
+        InodeFile {
+            id: proto.id,
+            parent_id: proto.parent_id,
+            file_type: FileType::from(proto.file_type),
+            mtime: proto.mtime,
+            atime: proto.atime,
+            len: proto.len,
+            block_size: proto.block_size,
+            replicas: proto.replicas as u16,
+            storage_policy: ProtoUtils::storage_policy_from_pb(proto.storage_policy),
+            blocks: proto
+                .blocks
+                .into_iter()
+                .map(BlockMeta::block_meta_from_pb)
+                .collect(),
+            nlink: proto.nlink,
+            next_seq: proto.next_seq,
+            target: proto.target,
+            features: FileFeature::file_feature_from_pb(proto.features),
+        }
     }
 }
 

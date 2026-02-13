@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{BlockLocation, CommitBlock, FileAllocOpts, WorkerAddress};
+use curvine_common::proto::BlockMetaProto;
+use curvine_common::{
+    state::{BlockLocation, CommitBlock, FileAllocOpts, WorkerAddress},
+    utils::ProtoUtils,
+};
 use serde::{Deserialize, Serialize};
 
 #[allow(unused)]
@@ -101,5 +105,41 @@ impl BlockMeta {
         let id_a = a.map(|x| x.id);
         let id_b = b.map(|x| x.block_id);
         id_a == id_b
+    }
+    pub fn block_meta_to_pb(meta: BlockMeta) -> BlockMetaProto {
+        BlockMetaProto {
+            id: meta.id,
+            len: meta.len,
+            replicas: meta.replicas as u32,
+            locs: meta
+                .locs
+                .map(|vec| {
+                    vec.into_iter()
+                        .map(ProtoUtils::block_location_to_pb)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            alloc_opts: meta.alloc_opts.map(ProtoUtils::file_alloc_opts_to_pb),
+        }
+    }
+
+    pub fn block_meta_from_pb(proto: BlockMetaProto) -> BlockMeta {
+        Self {
+            id: proto.id,
+            len: proto.len,
+            replicas: proto.replicas as u16,
+            locs: if proto.locs.is_empty() {
+                None
+            } else {
+                Some(
+                    proto
+                        .locs
+                        .into_iter()
+                        .map(ProtoUtils::block_location_from_pb)
+                        .collect(),
+                )
+            },
+            alloc_opts: proto.alloc_opts.map(ProtoUtils::file_alloc_opts_from_pb),
+        }
     }
 }

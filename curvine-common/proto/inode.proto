@@ -1,0 +1,74 @@
+syntax = "proto2";  
+package proto;  
+  
+option java_package = "io.curvine.proto";  
+option java_multiple_files = true;  
+option java_outer_classname = "InodeProto";  
+
+import "common.proto";  
+
+  
+message BlockMetaProto {  
+    required int64 id = 1;  
+    required int64 len = 2; 
+    required uint32 replicas = 3;  
+    optional FileAllocOptsProto alloc_opts = 4;  
+    repeated BlockLocationProto locs = 5;  
+}  
+  
+message FileFeatureProto {  
+    map<string, bytes> x_attr = 1;  
+    optional WriteFeatureProto file_write = 2;  
+    required AclFeatureProto acl = 3;  
+}  
+  
+message WriteFeatureProto {  
+    repeated string clients = 1;  
+} 
+  
+message AclFeatureProto {  
+    required uint32 mode = 1;  
+    required string owner = 2;  
+    required string group = 3;  
+}  
+  
+message DirFeatureProto {  
+    required AclFeatureProto acl = 1;  
+    map<string, bytes> x_attr = 2;  
+}  
+
+message InodeViewProto {  
+    required string name = 1;  
+    oneof inode_type {  
+        InodeFileProto file = 2;  
+        InodeDirProto dir = 3;  
+        int64 file_entry_id = 4;  
+    }  
+}  
+  
+message InodeFileProto {  
+    required int64 id = 1;  
+    required int64 parent_id = 2;  
+    required FileTypeProto file_type = 3;  
+    required int64 mtime = 4;  
+    required int64 atime = 5;  
+    required int64 len = 6;  
+    required int64 block_size = 7;  
+    required uint32 replicas = 8;  
+    required StoragePolicyProto storage_policy = 9;  
+    repeated BlockMetaProto blocks = 10;  
+    required uint32 nlink = 11;  
+    required uint32 next_seq = 12;  
+    optional string target = 13;  
+    required FileFeatureProto features = 14;  
+}  
+  
+message InodeDirProto {  
+    required int64 id = 1;  
+    required int64 parent_id = 2;  
+    required int64 mtime = 3;  
+    required int64 atime = 4;  
+    required uint32 nlink = 5;  
+    required StoragePolicyProto storage_policy = 6;  
+    required DirFeatureProto features = 7;  
+}
