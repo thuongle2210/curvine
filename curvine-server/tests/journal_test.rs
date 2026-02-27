@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use curvine_server::master::journal::JournalEntry;
 
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
 #[test]
@@ -160,6 +161,69 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     Ok(())
 }
 
+#[test]  
+fn test_missing_request_idempotency_causes_duplicate_operations() -> CommonResult<()> {  
+    Logger::default();  
+    Master::init_test_metrics();  
+  
+    let port1 = NetUtils::get_available_port();  
+    let port2 = NetUtils::get_available_port();  
+  
+    let mut conf = ClusterConf::default();  
+    conf.journal.writer_flush_batch_size = 1;  
+    conf.journal.writer_flush_batch_ms = 10;  
+    conf.journal.raft_tick_interval_ms = 100;  
+    conf.journal.journal_addrs = vec![  
+        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),  
+        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),  
+    ];  
+    let worker = WorkerInfo::default();  
+  
+    conf.change_test_meta_dir("idempotency-test-1");  
+    conf.journal.rpc_port = port1;  
+    let js1 = JournalSystem::from_conf(&conf).unwrap();  
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);  
+    fs1.add_test_worker(worker.clone());  
+      
+    // Get filesystem reference BEFORE starting  
+    let fs1_clone = js1.fs();  
+  
+    conf.change_test_meta_dir("idempotency-test-2");  
+    conf.journal.rpc_port = port2;  
+    let js2 = JournalSystem::from_conf(&conf).unwrap();  
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);  
+    fs2.add_test_worker(worker.clone());  
+      
+    // Get filesystem reference BEFORE starting  
+    let fs2_clone = js2.fs();  
+  
+    js1.start_blocking()?;  // js1 is moved here  
+    js2.start_blocking()?;  // js2 is moved here  
+  
+    // Wait for leader election  
+    thread::sleep(Duration::from_secs(2));  
+  
+    // Use the cloned filesystem references  
+    let result1 = fs1_clone.mkdir("/test/duplicate", true);  
+    assert!(result1.is_ok());  
+  
+    thread::sleep(Duration::from_millis(100));  
+  
+    let result2 = fs1_clone.mkdir("/test/duplicate", true);  
+      
+    thread::sleep(Duration::from_secs(2));  
+      
+    // Access entries through the cloned filesystem  
+    let entries = fs1_clone.fs_dir.read().take_entries();  
+      
+    let mkdir_count = entries.iter().filter(|e| {  
+        matches!(e, JournalEntry::Mkdir(_))  
+    }).count();  
+      
+    assert_eq!(mkdir_count, 1, "Expected only 1 mkdir entry, but found {}", mkdir_count);  
+  
+    Ok(())  
+}
 fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let address = ClientAddress::default();
     /************* Master node execution log **************/

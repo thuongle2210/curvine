@@ -24,7 +24,9 @@ use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{CommonError, CommonResult};
 use std::sync::Arc;
-
+use orpc::common::Logger;
+use std::time::Duration;
+use orpc::client::RpcClient;
 // Cluster functional unit test.
 
 #[test]
@@ -95,4 +97,47 @@ async fn write(fs: &CurvineFileSystem, path: &Path) -> CommonResult<FileBlocks> 
 
     let locs = fs.get_block_locations(path).await?;
     Ok(locs)
+}
+
+#[test]  
+fn test_master_rpc_port_race_condition() -> CommonResult<()> {  
+    Logger::default();  
+      
+    let testing = Testing::builder()  
+        .default()  
+        .masters(3)  // Multiple masters increase race condition likelihood  
+        .workers(1)  
+        .mutate_conf(|conf| {  
+            // Reduce Raft tick interval to speed up leader election  
+            conf.journal.raft_tick_interval_ms = 50;  
+        })  
+        .build()?;  
+      
+    // Repeatedly start cluster and immediately try to connect  
+    for iteration in 0..10 {  
+        println!("Iteration {}", iteration);  
+          
+        let cluster = testing.start_cluster()?;  
+        let conf = testing.get_active_cluster_conf()?;  
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());  
+          
+        // Try to connect immediately after cluster reports ready  
+        // This should expose the race condition where Raft is ready  
+        // but RPC port isn't listening yet  
+        let result = rt.block_on(async {  
+            let addr = conf.master_addr();  
+            let client_conf = conf.client_rpc_conf();  
+              
+            // Attempt connection with minimal delay  
+            tokio::time::sleep(Duration::from_millis(10)).await;  
+            RpcClient::with_raw(&addr, &client_conf).await  
+        });  
+          
+        if result.is_err() {  
+            println!("❌ Bug reproduced at iteration {}: RPC port not listening", iteration);  
+            return Err(CommonError::from("RPC port race condition detected"));  
+        }  
+    }  
+      
+    Ok(())  
 }

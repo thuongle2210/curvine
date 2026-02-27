@@ -24,6 +24,12 @@ pub struct MkdirEntry {
     pub(crate) dir: InodeDir,
 }
 
+impl MkdirEntry {  
+    pub fn path(&self) -> &str {  
+        &self.path  
+    }  
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct CreateFileEntry {
     pub(crate) op_ms: u64,
