@@ -911,7 +911,6 @@ dependencies = [
  "curvine-common",
  "curvine-tracing-appender",
  "dashmap",
- "futures",
  "fxhash",
  "libc",
  "log",
@@ -1055,7 +1054,6 @@ dependencies = [
  "curvine-server",
  "curvine-tracing-appender",
  "curvine-ufs",
- "futures",
  "log",
  "once_cell",
  "orpc",
@@ -1082,7 +1080,6 @@ name = "curvine-ufs"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "async-trait",
  "bytes",
  "cc",

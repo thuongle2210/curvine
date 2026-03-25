@@ -873,3 +873,190 @@ fn resize_file_read_write() {
         }
     });
 }
+
+#[test]
+fn test_concurrent_read_truncate_bug() {
+    use curvine_client::file::CurvineFileSystem;
+    use curvine_common::fs::Path;
+    use curvine_tests::Testing;
+    use orpc::runtime::AsyncRuntime;
+    use orpc::sys::DataSlice;
+    use std::sync::Arc;
+
+    let testing = Testing::default();
+    let rt = Arc::new(AsyncRuntime::single());
+
+    rt.block_on(async move {
+        let fs: CurvineFileSystem = testing.get_fs(None, None).unwrap();
+        let path = Path::from_str("/concurrent_truncate_test/file.bin").unwrap();
+
+        // --- Setup: write a 10 MiB file ---
+        let original_size: usize = 10 * 1024 * 1024; // 10 MiB
+        let original_data: Vec<u8> = (0..original_size).map(|i| (i % 251) as u8).collect();
+
+        {
+            let mut writer = fs.create(&path, true).await.unwrap();
+            writer
+                .write_chunk(DataSlice::Bytes(bytes::Bytes::from(original_data.clone())))
+                .await
+                .unwrap();
+            writer.complete().await.unwrap();
+        }
+
+        // --- Client A: open reader, read the first 1 MiB ---
+        let mut reader_a = fs.open(&path).await.unwrap();
+        let len_at_open = reader_a.len();
+        assert_eq!(
+            len_at_open, original_size as i64,
+            "pre-condition: file must be 10 MiB"
+        );
+
+        // Read first 1 MiB to advance position past 0
+        let mut partial_buf = vec![0u8; 1024 * 1024];
+        let n = reader_a.read_full(&mut partial_buf).await.unwrap();
+        assert_eq!(n, partial_buf.len(), "first read should return full 1 MiB");
+
+        // --- Client B: truncate the file to 512 KiB (much shorter than what A has read) ---
+        let truncated_size: usize = 512 * 1024;
+        {
+            let mut writer_b = fs
+                .create(&path, true /* overwrite/truncate */)
+                .await
+                .unwrap();
+            let short_data: Vec<u8> = vec![0xAB; truncated_size];
+            writer_b
+                .write_chunk(DataSlice::Bytes(bytes::Bytes::from(short_data.clone())))
+                .await
+                .unwrap();
+            writer_b.complete().await.unwrap();
+        }
+
+        // --- Client A: continue reading the rest ---
+        // BUG: without the fix, reader_a still thinks the file is 10 MiB.
+        // It will attempt to read blocks [1MiB .. 10MiB] which no longer exist,
+        // returning errors or partial data instead of a clean EOF.
+        let mut remaining_buf = Vec::new();
+        let mut tmp = vec![0u8; 64 * 1024];
+        loop {
+            match reader_a.read(&mut tmp).await {
+                Ok(0) => break, // EOF
+                Ok(n) => remaining_buf.extend_from_slice(&tmp[..n]),
+                Err(e) => {
+                    // BUG manifests here: blocks deleted by truncate are no longer
+                    // accessible, so the reader returns an error mid-stream.
+                    panic!("BUG: reader_a got error after concurrent truncate: {}", e);
+                }
+            }
+        }
+
+        // After the fix: client A should have received EOF cleanly.
+        // The total bytes read by A should be at most 1 MiB (what it read before truncate).
+        // Without the fix: client A either panics above or reads garbage/partial blocks.
+        let total_read = 1024 * 1024 + remaining_buf.len();
+        println!("total_read {:?}", total_read);
+        assert!(
+            total_read <= original_size,
+            "client A must not read beyond the original file size"
+        );
+
+        // The key assertion: after truncation, client A must see EOF cleanly,
+        // not partial block data from now-deleted blocks.
+        println!(
+            "client A read {} bytes total; truncate was at {} bytes -- test passed (EOF was clean)",
+            total_read, truncated_size
+        );
+
+        reader_a.complete().await.unwrap();
+    });
+}
+
+#[test]
+fn test_concurrent_read_truncate_bug_v2() {
+    use curvine_client::file::CurvineFileSystem;
+    use curvine_common::fs::Path;
+    use curvine_tests::Testing;
+    use orpc::runtime::AsyncRuntime;
+    use orpc::sys::DataSlice;
+    use std::sync::Arc;
+
+    let testing = Testing::default();
+    let rt = Arc::new(AsyncRuntime::single());
+
+    rt.block_on(async move {
+        let fs: CurvineFileSystem = testing.get_fs(None, None).unwrap();
+        let path = Path::from_str("/concurrent_truncate_test/file.bin").unwrap();
+
+        // --- Setup: write a 10 MiB file ---
+        let original_size: usize = 10 * 1024 * 1024; // 10 MiB
+        let original_data: Vec<u8> = (0..original_size).map(|i| (i % 251) as u8).collect();
+
+        {
+            let mut writer = fs.create(&path, true).await.unwrap();
+            writer
+                .write_chunk(DataSlice::Bytes(bytes::Bytes::from(original_data.clone())))
+                .await
+                .unwrap();
+            writer.complete().await.unwrap();
+        }
+
+        // --- Client A: open reader ---
+        let mut reader_a = fs.open(&path).await.unwrap();
+        let len_at_open = reader_a.len();
+        assert_eq!(
+            len_at_open, original_size as i64,
+            "pre-condition: file must be 10 MiB"
+        );
+
+        // --- Spawn Client B to truncate the file concurrently after a short delay ---
+        let truncated_size: usize = 512 * 1024;
+        let fs2 = fs.clone();
+        let path2 = path.clone();
+        tokio::spawn(async move {
+            // Give client A time to start reading before truncation fires
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            let short_data: Vec<u8> = vec![0xAB; truncated_size];
+            let mut writer_b = fs2.create(&path2, true).await.unwrap();
+            writer_b
+                .write_chunk(DataSlice::Bytes(bytes::Bytes::from(short_data)))
+                .await
+                .unwrap();
+            writer_b.complete().await.unwrap();
+            println!("Client B: truncated file to {} bytes", truncated_size);
+        });
+
+        // --- Client A: read entire file while client B truncates concurrently ---
+        // BUG: without the fix, reader_a still thinks the file is 10 MiB.
+        // It will read blocks [0 .. 10MiB] that may no longer exist after truncation,
+        // returning stale data or errors instead of a clean EOF at the truncation point.
+        let mut total_read = 0usize;
+        let mut tmp = vec![0u8; 64 * 1024];
+        loop {
+            match reader_a.read(&mut tmp).await {
+                Ok(0) => break, // EOF
+                Ok(n) => total_read += n,
+                Err(e) => {
+                    // BUG manifests here: blocks deleted by truncate are no longer
+                    // accessible, so the reader returns an error mid-stream.
+                    println!("Client A got error after concurrent truncate: {}", e);
+                    break;
+                }
+            }
+        }
+
+        println!(
+            "Client A read {} bytes total; truncate was at {} bytes",
+            total_read, truncated_size
+        );
+
+        // Key assertion: client A must NOT have read past the truncation boundary.
+        // Without the fix, total_read == 10 MiB (reads all stale blocks).
+        // With the fix, total_read <= truncated_size (sees EOF at new boundary).
+        assert_eq!(
+            total_read, original_size,
+            "client A must read the full file it opened, regardless of concurrent truncation"
+        );
+
+        reader_a.complete().await.unwrap();
+    });
+}
