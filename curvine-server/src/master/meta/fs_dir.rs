@@ -530,7 +530,7 @@ impl FsDir {
         file.complete(file_len, &commit_blocks, "", true)?;
 
         // create block.
-        file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
+        file.add_block(BlockMeta::with_pre(new_block_id, &choose_workers, file.storage_policy.storage_type, file.storage_policy.io_backend));
 
         let block = ExtendedBlock {
             id: new_block_id,
@@ -538,6 +538,7 @@ impl FsDir {
             storage_type: file.storage_policy.storage_type,
             file_type: file.file_type,
             alloc_opts: None,
+            io_backend: file.storage_policy.io_backend,
         };
 
         // state add block.
@@ -1069,14 +1070,21 @@ impl FsDir {
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
 
-        let block = file.search_block_mut_check(block_id)?;
-        let res = block.assign_worker(workers);
+        let found_block = file.search_block_mut_check(block_id)?;
+        let res = found_block.assign_worker(workers);
+        let block_id = found_block.id;
+        let block_len = found_block.len as i64;
+        let block_alloc_opts = found_block.alloc_opts.clone();
+        let block_io_backend = found_block.io_backend;
+        let file_storage_type = file.storage_policy.storage_type;
+        let file_type = file.file_type;
         let block = ExtendedBlock {
-            id: block.id,
-            len: block.len as i64,
-            alloc_opts: block.alloc_opts.clone(),
-            storage_type: file.storage_policy.storage_type,
-            file_type: file.file_type,
+            id: block_id,
+            len: block_len,
+            alloc_opts: block_alloc_opts,
+            storage_type: file_storage_type,
+            file_type,
+            io_backend: block_io_backend,
         };
 
         if res {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{BlockLocation, CommitBlock, FileAllocOpts, WorkerAddress};
+use curvine_common::state::{BlockLocation, CommitBlock, FileAllocOpts, IoBackend, StorageType, WorkerAddress};
 use serde::{Deserialize, Serialize};
 
 #[allow(unused)]
@@ -30,24 +30,28 @@ pub struct BlockMeta {
     pub(crate) id: i64,
     pub(crate) len: u32,
     pub(crate) replicas: u8,
+    pub(crate) storage_type: StorageType,
+    pub(crate) io_backend: IoBackend,
     // The pre-assigned worker id is required when deleting.
     pub(crate) locs: Option<Vec<BlockLocation>>,
     pub(crate) alloc_opts: Option<FileAllocOpts>,
 }
 
 impl BlockMeta {
-    pub fn new(id: i64, len: i64) -> Self {
+    pub fn new(id: i64, len: i64, storage_type: StorageType, io_backend: IoBackend) -> Self {
         Self {
             id,
             len: len as u32,
             replicas: 1,
+            storage_type,
+            io_backend,
             locs: None,
             alloc_opts: None,
         }
     }
 
     // Pre-allocated worker block
-    pub fn with_pre(id: i64, workers: &[WorkerAddress]) -> Self {
+    pub fn with_pre(id: i64, workers: &[WorkerAddress], storage_type: StorageType, io_backend: IoBackend) -> Self {
         let locs = workers
             .iter()
             .map(|x| BlockLocation::with_id(x.worker_id))
@@ -56,16 +60,20 @@ impl BlockMeta {
             id,
             len: 0,
             replicas: 1,
+            storage_type,
+            io_backend,
             locs: Some(locs),
             alloc_opts: None,
         }
     }
 
-    pub fn with_alloc(id: i64, alloc_opts: FileAllocOpts) -> Self {
+    pub fn with_alloc(id: i64, alloc_opts: FileAllocOpts, storage_type: StorageType, io_backend: IoBackend) -> Self {
         Self {
             id,
             len: alloc_opts.len as u32,
             replicas: 0,
+            storage_type,
+            io_backend,
             locs: None,
             alloc_opts: Some(alloc_opts),
         }

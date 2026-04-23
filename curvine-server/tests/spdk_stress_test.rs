@@ -5,7 +5,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
 };
-use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+use curvine_common::state::{ExtendedBlock, FileType, IoBackend, StorageType};
 use curvine_common::utils::ProtoUtils;
 use curvine_server::worker::Worker;
 use orpc::common::Utils;
@@ -32,7 +32,7 @@ fn get_worker() -> &'static ClusterConf {
 
         conf.worker.rpc_port = NetUtils::hold_available_port();
         conf.worker.web_port = NetUtils::hold_available_port();
-        conf.worker.data_dir = vec!["[SPDK]/tmp/curvine-spdk-stress".into()];
+        conf.worker.data_dir = vec!["[SSD/SPDK]/tmp/curvine-spdk-stress".into()];
 
         let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap();
         let trsvcid: u16 = std::env::var("SPDK_TARGET_PORT")
@@ -80,7 +80,7 @@ fn write_block(
     conf: &ClusterConf,
 ) -> CommonResult<(u64, Duration)> {
     let block_size = (chunk_size as i64) * (num_chunks as i64);
-    let block = ExtendedBlock::new(id, block_size, StorageType::Spdk, FileType::File);
+    let block = ExtendedBlock::new(id, block_size, StorageType::Ssd, FileType::File);
 
     let open_req = BlockWriteRequest {
         block: ProtoUtils::extend_block_to_pb(block.clone()),

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{FileType, StoragePolicy, TtlAction};
+use crate::state::{FileType, StoragePolicy, TtlAction, IoBackend};
 use orpc::common::LocalTime;
 use orpc::ternary;
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,7 @@ pub struct FileStatus {
     pub file_type: FileType,
     pub x_attr: HashMap<String, Vec<u8>>,
     pub storage_policy: StoragePolicy,
+    pub io_backend: IoBackend,
 
     // ACL permission control
     pub mode: u32,

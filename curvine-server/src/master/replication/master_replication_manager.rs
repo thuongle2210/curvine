@@ -19,7 +19,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     ReportBlockReplicationRequest, SubmitBlockReplicationRequest, SubmitBlockReplicationResponse,
 };
-use curvine_common::state::{BlockLocation, WorkerAddress};
+use curvine_common::state::{BlockLocation, IoBackend, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 use log::{error, info, warn};
 use orpc::client::ClientFactory;
@@ -249,7 +249,7 @@ impl MasterReplicationManager {
                     info!("Successfully replicated {}", block_id);
                     let dir = self.fs.fs_dir.write();
                     let location =
-                        BlockLocation::new(entry.1.target_worker.worker_id, storage_type.into());
+                        BlockLocation::new(entry.1.target_worker.worker_id, storage_type.into(), IoBackend::Kernel);
                     dir.add_block_location(block_id, location)?;
                 } else {
                     error!(

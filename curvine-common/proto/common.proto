@@ -15,6 +15,12 @@ enum StorageTypeProto {
     STORAGE_TYPE_PROTO_SPDK = 5;
 }
 
+// Define the I/O backend.
+enum IoBackendProto {
+    IO_BACKEND_PROTO_KERNEL = 0;
+    IO_BACKEND_PROTO_SPDK = 1;
+}
+
 // ttl Expiry Strategy.
 enum TtlActionProto {
     TTL_ACTION_PROTO_NONE = 0;
@@ -46,10 +52,11 @@ enum StorageStateProto {
 // File storage policy
 message StoragePolicyProto {
     required StorageTypeProto storage_type = 1 [default = STORAGE_TYPE_PROTO_DISK];
-    required int64 ttl_ms = 2 [default = 0];
-    required TtlActionProto ttl_action = 3 [default = TTL_ACTION_PROTO_NONE];
-    required int64 ufs_mtime = 4;
-    required StorageStateProto state = 5 [default = STORAGE_STATE_PROTO_CV];
+    required IoBackendProto io_backend = 2 [default = IO_BACKEND_PROTO_KERNEL];
+    required int64 ttl_ms = 3 [default = 0];
+    required TtlActionProto ttl_action = 4 [default = TTL_ACTION_PROTO_NONE];
+    required int64 ufs_mtime = 5;
+    required StorageStateProto state = 6 [default = STORAGE_STATE_PROTO_CV];
 }
 
 message FileStatusProto {
@@ -68,11 +75,12 @@ message FileStatusProto {
 
     map<string, bytes> x_attr = 13;
     required StoragePolicyProto storage_policy = 14;
-    required string owner = 15;
-    required string group = 16;
-    required uint32 mode = 17;
-    optional string target = 18;
-    required uint32 nlink = 19;
+    required IoBackendProto io_backend = 15 [default = IO_BACKEND_PROTO_KERNEL];
+    required string owner = 16;
+    required string group = 17;
+    required uint32 mode = 18;
+    optional string target = 19;
+    required uint32 nlink = 20;
 }
 
 // Describe the worker address information.
@@ -100,7 +108,8 @@ message ExtendedBlockProto {
     required int64 block_size = 2;
     required StorageTypeProto storage_type = 3;
     required FileTypeProto file_type = 4;
-    optional FileAllocOptsProto alloc_opts = 5;
+    required IoBackendProto io_backend = 5 [default = IO_BACKEND_PROTO_KERNEL];
+    optional FileAllocOptsProto alloc_opts = 6;
 }
 
 message LocatedBlockProto {
@@ -131,8 +140,9 @@ message StorageInfoProto {
     required int64 non_fs_used = 7;
     required int64 reserved_bytes = 8 [default = 0];
     required StorageTypeProto storage_type = 9 [default = STORAGE_TYPE_PROTO_DISK];
-    required int64 block_num = 10;
-    required string dir_path = 11 [default = ""];
+    required IoBackendProto io_backend = 10 [default = IO_BACKEND_PROTO_KERNEL];
+    required int64 block_num = 11;
+    required string dir_path = 12 [default = ""];
 }
 
 // Represents a customer service address.
@@ -146,6 +156,7 @@ message ClientAddressProto {
 message BlockLocationProto {
     required uint32 worker_id = 1;
     required StorageTypeProto storage_type = 2;
+    required IoBackendProto io_backend = 3 [default = IO_BACKEND_PROTO_KERNEL];
 }
 
 message CommitBlockProto {

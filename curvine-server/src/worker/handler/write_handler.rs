@@ -17,7 +17,7 @@ use crate::worker::handler::WriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::{BlockWriteResponse, DataHeaderProto};
-use curvine_common::state::{ExtendedBlock, FileAllocMode};
+use curvine_common::state::{ExtendedBlock, FileAllocMode, IoBackend};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
@@ -130,6 +130,7 @@ impl WriteHandler {
             off: context.off,
             block_size: context.block_size,
             storage_type: meta.storage_type().into(),
+            io_backend: meta.io_backend().into(),
             pipeline_status: None,
         };
 

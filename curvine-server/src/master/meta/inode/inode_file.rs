@@ -215,13 +215,17 @@ impl InodeFile {
     pub fn reopen(&mut self, client_name: impl AsRef<str>) -> Option<ExtendedBlock> {
         self.features.set_writing(client_name.as_ref().to_string());
         self.storage_policy.detach_ufs();
+        let file_storage_type = self.storage_policy.storage_type;
+        let _file_io_backend = self.storage_policy.io_backend;
+        let file_type = self.file_type;
         if let Some(last_block) = self.get_block_mut(-1) {
             let blk = ExtendedBlock {
                 id: last_block.id,
                 len: last_block.len as i64,
                 alloc_opts: last_block.alloc_opts.clone(),
-                storage_type: self.storage_policy.storage_type,
-                file_type: self.file_type,
+                storage_type: file_storage_type,
+                file_type,
+                io_backend: last_block.io_backend,
             };
             Some(blk)
         } else {
@@ -430,7 +434,7 @@ impl InodeFile {
             } else {
                 // No block found, create new block
                 let new_block_id = self.next_block_id()?;
-                self.add_block(BlockMeta::with_alloc(new_block_id, block_opts));
+                self.add_block(BlockMeta::with_alloc(new_block_id, block_opts, self.storage_policy.storage_type, self.storage_policy.io_backend));
             }
             start += block_size;
         }

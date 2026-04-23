@@ -14,7 +14,7 @@
 
 use crate::conf::ClientConf;
 use crate::fs::Path;
-use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction};
+use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction, IoBackend};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::common::DurationUnit;
 use orpc::{err_box, CommonError, CommonResult};
@@ -68,6 +68,7 @@ pub struct MountInfo {
     pub ttl_action: TtlAction,
     pub read_verify_ufs: bool,
     pub storage_type: Option<StorageType>,
+    pub io_backend: Option<IoBackend>,
     pub block_size: Option<i64>,
     pub replicas: Option<i32>,
     pub write_type: WriteType,
@@ -169,20 +170,21 @@ impl MountInfo {
             properties.remove(k);
         }
 
-        MountInfo {
-            cv_path: self.cv_path,
-            ufs_path: self.ufs_path,
-            mount_id: self.mount_id,
-            properties,
-            ttl_ms: mnt_opt.ttl_ms.unwrap_or(self.ttl_ms),
-            ttl_action: mnt_opt.ttl_action.unwrap_or(self.ttl_action),
-            read_verify_ufs: mnt_opt.read_verify_ufs,
-            storage_type: mnt_opt.storage_type.or(self.storage_type),
-            block_size: mnt_opt.block_size.or(self.block_size),
-            replicas: mnt_opt.replicas.or(self.replicas),
-            write_type: self.write_type,
-            provider: mnt_opt.provider.or(self.provider),
-        }
+         MountInfo {
+             cv_path: self.cv_path,
+             ufs_path: self.ufs_path,
+             mount_id: self.mount_id,
+             properties,
+             ttl_ms: mnt_opt.ttl_ms.unwrap_or(self.ttl_ms),
+             ttl_action: mnt_opt.ttl_action.unwrap_or(self.ttl_action),
+             read_verify_ufs: mnt_opt.read_verify_ufs,
+             storage_type: mnt_opt.storage_type.or(self.storage_type),
+             io_backend: mnt_opt.io_backend.or(self.io_backend),
+             block_size: mnt_opt.block_size.or(self.block_size),
+             replicas: mnt_opt.replicas.or(self.replicas),
+             write_type: self.write_type,
+             provider: mnt_opt.provider.or(self.provider),
+         }
     }
 }
 
@@ -194,6 +196,7 @@ pub struct MountOptions {
     pub ttl_action: Option<TtlAction>,
     pub read_verify_ufs: bool,
     pub storage_type: Option<StorageType>,
+    pub io_backend: Option<IoBackend>,
     pub block_size: Option<i64>,
     pub replicas: Option<i32>,
     pub remove_properties: Vec<String>,
@@ -213,20 +216,21 @@ impl MountOptions {
             WriteType::FsMode => TtlAction::Free,
         };
 
-        MountInfo {
-            cv_path: cv_path.to_string(),
-            ufs_path: ufs_path.to_string(),
-            mount_id,
-            properties: self.add_properties,
-            ttl_ms: self.ttl_ms.unwrap_or(0),
-            ttl_action,
-            read_verify_ufs: self.read_verify_ufs,
-            storage_type: self.storage_type,
-            block_size: self.block_size,
-            replicas: self.replicas,
-            write_type: self.write_type,
-            provider: self.provider,
-        }
+         MountInfo {
+             cv_path: cv_path.to_string(),
+             ufs_path: ufs_path.to_string(),
+             mount_id,
+             properties: self.add_properties,
+             ttl_ms: self.ttl_ms.unwrap_or(0),
+             ttl_action,
+             read_verify_ufs: self.read_verify_ufs,
+             storage_type: self.storage_type,
+             io_backend: self.io_backend,
+             block_size: self.block_size,
+             replicas: self.replicas,
+             write_type: self.write_type,
+             provider: self.provider,
+         }
     }
 }
 
@@ -238,6 +242,7 @@ pub struct MountOptionsBuilder {
     ttl_action: Option<TtlAction>,
     read_verify_ufs: bool,
     storage_type: Option<StorageType>,
+    io_backend: Option<IoBackend>,
     block_size: Option<i64>,
     replicas: Option<i32>,
     remove_properties: Vec<String>,
@@ -299,6 +304,11 @@ impl MountOptionsBuilder {
         self
     }
 
+    pub fn io_backend(mut self, io_backend: IoBackend) -> Self {
+        self.io_backend = Some(io_backend);
+        self
+    }
+
     pub fn block_size(mut self, block_size: i64) -> Self {
         self.block_size = Some(block_size);
         self
@@ -332,6 +342,7 @@ impl MountOptionsBuilder {
             ttl_action: self.ttl_action,
             read_verify_ufs: self.read_verify_ufs,
             storage_type: self.storage_type,
+            io_backend: self.io_backend,
             block_size: self.block_size,
             replicas: self.replicas,
             remove_properties: self.remove_properties,

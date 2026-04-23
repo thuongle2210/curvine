@@ -32,7 +32,8 @@ message BlockWriteResponse {
     required int64 off = 3;
     required int64 block_size = 4;
     required StorageTypeProto storage_type = 5;
-    optional PipelineStatus pipeline_status = 6;
+    required IoBackendProto io_backend = 6 [default = IO_BACKEND_PROTO_KERNEL];
+    optional PipelineStatus pipeline_status = 7;
 }
 
 message BlockReadRequest {
@@ -51,6 +52,7 @@ message BlockReadResponse {
     required int64 len = 2;
     optional string path = 3;
     required StorageTypeProto storage_type = 4;
+    required IoBackendProto io_backend = 5 [default = IO_BACKEND_PROTO_KERNEL];
 }
 
 message DataHeaderProto {

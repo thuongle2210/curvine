@@ -17,7 +17,7 @@
 use crate::block::block_writer::WriterAdapter::{Local, Remote};
 use crate::block::{BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
-use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, StorageType, WorkerAddress};
+use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, StorageType, IoBackend, WorkerAddress};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
 use orpc::err_box;
@@ -114,7 +114,7 @@ impl WriterAdapter {
         // SPDK bypasses kernel — no local path for writes
         let short_circuit = conf.short_circuit
             && fs_context.is_local_worker(worker_addr)
-            && located_block.block.storage_type != StorageType::Spdk;
+            && located_block.block.io_backend != IoBackend::Spdk;
 
         let adapter = if short_circuit {
             let writer = BlockWriterLocal::new(
@@ -282,6 +282,7 @@ impl BlockWriter {
             .map(|x| BlockLocation {
                 worker_id: x.worker_id,
                 storage_type: self.locate.block.storage_type,
+                io_backend: self.locate.io_backend
             })
             .collect();
 

@@ -16,7 +16,7 @@ use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemo
 use crate::block::{BatchBlockWriterLocal, BatchBlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::fs::Path;
-use curvine_common::state::{CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress};
+use curvine_common::state::{CommitBlock, ExtendedBlock, LocatedBlock, StorageType, IoBackend, WorkerAddress};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
 use orpc::err_box;
@@ -66,7 +66,7 @@ impl BatchWriterAdapter {
         // SPDK bypasses kernel — no local path. Disable short-circuit if any block uses SPDK.
         let has_spdk = located_blocks
             .iter()
-            .any(|lb| lb.block.storage_type == StorageType::Spdk);
+            .any(|lb| lb.block.io_backend == IoBackend::Spdk);
         let short_circuit =
             conf.short_circuit && fs_context.is_local_worker(worker_addr) && !has_spdk;
 

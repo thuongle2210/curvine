@@ -4,7 +4,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
 };
-use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+use curvine_common::state::{ExtendedBlock, FileType, StorageType, IoBackend};
 use curvine_common::utils::ProtoUtils;
 use curvine_server::worker::Worker;
 use orpc::common::Utils;
@@ -25,7 +25,7 @@ fn start_spdk_worker() -> ClusterConf {
     let mut conf = ClusterConf::default();
     conf.worker.rpc_port = NetUtils::hold_available_port();
     conf.worker.web_port = NetUtils::hold_available_port();
-    conf.worker.data_dir = vec!["[SPDK]/tmp/curvine-spdk-test".to_owned()];
+    conf.worker.data_dir = vec!["[SSD/SPDK]/tmp/curvine-spdk-test".to_owned()];
     let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap();
     let trsvcid: u16 = std::env::var("SPDK_TARGET_PORT")
         .unwrap()
@@ -61,7 +61,7 @@ fn start_spdk_worker() -> ClusterConf {
 }
 fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     let block_size = (CHUNK_SIZE * LOOP_NUM) as i64;
-    let block = ExtendedBlock::new(id, block_size, StorageType::Spdk, FileType::File);
+    let block = ExtendedBlock::new(id, block_size, StorageType::Ssd, FileType::File);
 
     let request = BlockWriteRequest {
         block: ProtoUtils::extend_block_to_pb(block),
@@ -92,8 +92,8 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     );
     assert_eq!(
         StorageType::from(response.storage_type),
-        StorageType::Spdk,
-        "Response storage_type should be Spdk"
+        StorageType::Ssd,
+        "Response storage_type should be Ssd"
     );
 
     seq_id += 1;
@@ -112,7 +112,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         seq_id += 1;
     }
 
-    let block = ExtendedBlock::new(id, block_size, StorageType::Spdk, FileType::File);
+    let block = ExtendedBlock::new(id, block_size, StorageType::Ssd, FileType::File);
     let complete_request = BlockWriteRequest {
         block: ProtoUtils::extend_block_to_pb(block),
         off: 0,
@@ -159,11 +159,16 @@ fn spdk_block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         rep.path.is_none(),
         "SPDK blocks must not return a short-circuit path"
     );
-    assert_eq!(
-        StorageType::from(rep.storage_type),
-        StorageType::Spdk,
-        "Response storage_type should be Spdk"
-    );
+        assert_eq!(
+            StorageType::from(rep.storage_type),
+            StorageType::Ssd,
+            "Response storage_type should be Ssd"
+        );
+        assert_eq!(
+            IoBackend::from(rep.io_backend),
+            IoBackend::Spdk,
+            "Response io_backend should be Spdk"
+        );
 
     let mut start = 0;
     let mut check_sum: u64 = 0;
@@ -219,7 +224,7 @@ fn test_spdk_worker_end_to_end() -> CommonResult<()> {
     {
         let block_id = Utils::req_id().abs();
         let block_size = (CHUNK_SIZE * 10) as i64;
-        let block = ExtendedBlock::new(block_id, block_size, StorageType::Spdk, FileType::File);
+        let block = ExtendedBlock::new(block_id, block_size, StorageType::Ssd, FileType::File);
 
         let request = BlockWriteRequest {
             block: ProtoUtils::extend_block_to_pb(block),

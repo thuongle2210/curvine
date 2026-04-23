@@ -15,7 +15,7 @@
 use crate::worker::block::BlockMeta;
 use crate::worker::storage::{BlockDataset, Dataset};
 use curvine_common::conf::ClusterConf;
-use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType, IoBackend};
 use log::error;
 use orpc::common::FileUtils;
 use orpc::{err_box, CommonResult};
@@ -95,14 +95,14 @@ impl BlockStore {
         };
         state.decrement_blocks_to_delete();
         let dir_id = meta.dir_id();
-        let is_spdk = meta.storage_type() == StorageType::Spdk;
+        let is_spdk = meta.io_backend() == IoBackend::Spdk;
 
         // SPDK: free bdev offset + persist metadata while holding write lock.
         if is_spdk {
             if let Ok(dir) = state.find_dir(dir_id) {
                 dir.state.offset_alloc.free(id);
             }
-            state.spdk_delete(id, StorageType::Spdk);
+            state.spdk_delete(id, IoBackend::Spdk);
         }
         drop(state);
 
@@ -146,6 +146,7 @@ impl BlockStore {
                 available: item.available(),
                 reserved_bytes: item.reserved_bytes(),
                 storage_type: item.storage_type(),
+                io_backend: item.io_backend(),
                 block_num: state.num_blocks() as i64,
                 dir_path: item.path_str().to_string(),
             };

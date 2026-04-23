@@ -15,7 +15,7 @@
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{Dataset, DirList, SpdkMetaStore, StorageVersion, VfsDir};
 use curvine_common::conf::{ClusterConf, WorkerDataDir};
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::state::{ExtendedBlock, StorageType, IoBackend};
 use indexmap::map::Values;
 use log::{info, warn};
 use orpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
@@ -71,7 +71,7 @@ impl VfsDataset {
                 info!("Delete(format) data dir {}", storage_path);
             }
 
-            if data_dir.storage_type == StorageType::Spdk {
+            if data_dir.io_backend == IoBackend::Spdk {
                 has_spdk = true;
             }
 
@@ -89,9 +89,9 @@ impl VfsDataset {
         }
 
         if has_spdk {
-            let mut seen: HashMap<String, u32> = HashMap::new();
-            for dir in dir_list.dir_iter() {
-                if dir.storage_type() == StorageType::Spdk {
+             let mut seen: HashMap<String, u32> = HashMap::new();
+                 for dir in dir_list.dir_iter() {
+                     if dir.io_backend() == IoBackend::Spdk {
                     if let Some(bdev) = dir.state.bdev_name.as_ref() {
                         if let Some(prev_id) = seen.insert(bdev.clone(), dir.id()) {
                             return orpc::err_box!(
@@ -132,7 +132,7 @@ impl VfsDataset {
     fn initialize(&mut self) {
         let spent = TimeSpent::new();
         for dir in self.dir_list.dir_iter() {
-            let blocks = if dir.storage_type() == StorageType::Spdk {
+            let blocks = if dir.io_backend() == IoBackend::Spdk {
                 // SPDK dirs: restore from RocksDB
                 match &self.spdk_meta {
                     Some(store) => dir.scan_spdk_blocks(store).unwrap(),
@@ -190,7 +190,7 @@ impl VfsDataset {
     }
     /// Persist one SPDK block's metadata to RocksDB. No-op if no SPDK store.
     fn spdk_put(&self, meta: &BlockMeta) {
-        if meta.storage_type() != StorageType::Spdk {
+        if meta.io_backend() != IoBackend::Spdk {
             return;
         }
         if let Some(ref store) = self.spdk_meta {
@@ -212,9 +212,9 @@ impl VfsDataset {
         }
     }
 
-    /// Remove one SPDK block's metadata from RocksDB. No-op if no SPDK store.
-    pub(crate) fn spdk_delete(&self, block_id: i64, storage_type: StorageType) {
-        if storage_type != StorageType::Spdk {
+/// Remove one SPDK block's metadata from RocksDB. No-op if no SPDK store.
+    pub(crate) fn spdk_delete(&self, block_id: i64, io_backend: IoBackend) {
+        if io_backend != IoBackend::Spdk {
             return;
         }
         if let Some(ref store) = self.spdk_meta {
@@ -331,8 +331,8 @@ impl Dataset for VfsDataset {
             Some(v) => v,
         };
 
-        let dir_id = meta.dir_id();
-        let is_spdk = meta.storage_type() == StorageType::Spdk;
+         let dir_id = meta.dir_id();
+         let is_spdk = meta.io_backend() == IoBackend::Spdk;
         // SPDK: no filesystem file - nothing to delete.
         if !is_spdk {
             let file = meta.get_block_path()?;
@@ -341,7 +341,7 @@ impl Dataset for VfsDataset {
         let dir = self.find_dir(dir_id)?;
 
         if is_spdk {
-            self.spdk_delete(block.id, meta.storage_type());
+            self.spdk_delete(block.id, meta.io_backend());
             dir.state.offset_alloc.free(block.id);
         }
         dir.release_space(meta.is_final(), meta.actual_len);
@@ -431,17 +431,19 @@ mod test {
         let st = Arc::new(DirState {
             dir_id: 1,
             base_path: PathBuf::from("/tmp/spdk"),
-            storage_type: StorageType::Spdk,
-            bdev_name: Some("nvme0".into()),
-            bdev_capacity: 1 << 30,
-            offset_alloc: DirState::new_offset_alloc(StorageType::Spdk, 1 << 30, 4096),
+            storage_type: StorageType::Disk,
+            io_backend: IoBackend::Spdk,
+             bdev_name: Some("nvme0".into()),
+             bdev_capacity: 1 << 30,
+             offset_alloc: DirState::new_offset_alloc(IoBackend::Spdk, 1 << 30, 4096),
         });
         let vfs = VfsDir {
             version: StorageVersion::with_cluster("t"),
             stats: FsStats::new("/tmp"),
             active_dir: PathBuf::from("/tmp/a"),
             staging_dir: PathBuf::from("/tmp/s"),
-            storage_type: StorageType::Spdk,
+            storage_type: StorageType::Disk,
+            io_backend: IoBackend::Spdk,
             conf_capacity: 1 << 30,
             reserved_bytes: 0,
             final_bytes: AtomicLong::new(0),
@@ -457,16 +459,18 @@ mod test {
             dir: st,
             actual_len: 4096,
             bdev_offset: 0,
+            io_backend: IoBackend::Spdk,
         };
         ds.block_map.insert(1, meta);
-        let ok = ds
-            .abort_block(&ExtendedBlock::new(
-                1,
-                4096,
-                StorageType::Spdk,
-                FileType::File,
-            )?)
-            .is_ok();
+         let ok = ds
+             .abort_block(&ExtendedBlock::new(
+                 1,
+                 4096,
+                 StorageType::Disk,
+                 FileType::File,
+                 IoBackend::Spdk,
+             )?)
+             .is_ok();
         assert!(ok && ds.block_map.get(&1).is_none());
         Ok(())
     }

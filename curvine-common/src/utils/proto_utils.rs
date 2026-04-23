@@ -18,6 +18,7 @@ use orpc::{try_err, CommonResult};
 use prost::bytes::BytesMut;
 use prost::Message;
 use std::fmt::Debug;
+use crate::state::IoBackend;
 
 pub struct ProtoUtils;
 
@@ -33,6 +34,7 @@ impl ProtoUtils {
             available: item.available,
             reserved_bytes: item.reserved_bytes,
             storage_type: item.storage_type.into(),
+            io_backend: item.io_backend.into(),
             block_num: item.block_num,
             dir_path: item.dir_path,
         }
@@ -49,6 +51,7 @@ impl ProtoUtils {
             available: item.available,
             reserved_bytes: item.reserved_bytes,
             storage_type: StorageType::from(item.storage_type),
+            io_backend: IoBackend::from(item.io_backend),
             block_num: item.block_num,
             dir_path: item.dir_path,
         }
@@ -108,6 +111,7 @@ impl ProtoUtils {
             len: block.block_size,
             storage_type: StorageType::from(block.storage_type),
             file_type: FileType::from(block.file_type),
+            io_backend: IoBackend::from(block.io_backend),
             alloc_opts: block.alloc_opts.map(Self::file_alloc_opts_from_pb),
         }
     }
@@ -118,6 +122,7 @@ impl ProtoUtils {
             block_size: block.len,
             storage_type: block.storage_type.into(),
             file_type: block.file_type.into(),
+            io_backend: block.io_backend.into(),
             alloc_opts: block.alloc_opts.map(Self::file_alloc_opts_to_pb),
         }
     }
@@ -126,6 +131,7 @@ impl ProtoUtils {
         BlockLocation {
             worker_id: locations.worker_id,
             storage_type: StorageType::from(locations.storage_type),
+            io_backend: IoBackend::from(locations.io_backend),
         }
     }
 
@@ -133,6 +139,7 @@ impl ProtoUtils {
         BlockLocationProto {
             worker_id: locations.worker_id,
             storage_type: locations.storage_type.into(),
+            io_backend: locations.io_backend.into(),
         }
     }
 
@@ -197,6 +204,7 @@ impl ProtoUtils {
     pub fn storage_policy_to_pb(policy: StoragePolicy) -> StoragePolicyProto {
         StoragePolicyProto {
             storage_type: policy.storage_type.into(),
+            io_backend: policy.io_backend.into(),
             ttl_ms: policy.ttl_ms,
             ttl_action: policy.ttl_action.into(),
             ufs_mtime: policy.ufs_mtime,
@@ -207,6 +215,7 @@ impl ProtoUtils {
     pub fn storage_policy_from_pb(policy: StoragePolicyProto) -> StoragePolicy {
         StoragePolicy {
             storage_type: StorageType::from(policy.storage_type),
+            io_backend: IoBackend::from(policy.io_backend),
             ttl_ms: policy.ttl_ms,
             ttl_action: TtlAction::from(policy.ttl_action),
             ufs_mtime: policy.ufs_mtime,
@@ -214,7 +223,7 @@ impl ProtoUtils {
         }
     }
 
-    pub fn file_status_to_pb(status: FileStatus) -> FileStatusProto {
+pub fn file_status_to_pb(status: FileStatus) -> FileStatusProto {
         FileStatusProto {
             id: status.id,
             path: status.path,
@@ -230,16 +239,16 @@ impl ProtoUtils {
             file_type: status.file_type.into(),
             x_attr: status.x_attr,
             storage_policy: Self::storage_policy_to_pb(status.storage_policy),
-
+            io_backend: status.io_backend.into(),
             owner: status.owner,
             group: status.group,
             mode: status.mode,
-            target: status.target,
-            nlink: status.nlink,
-        }
-    }
+             target: status.target,
+             nlink: status.nlink,
+         }
+     }
 
-    pub fn file_status_from_pb(status: FileStatusProto) -> FileStatus {
+     pub fn file_status_from_pb(status: FileStatusProto) -> FileStatus {
         FileStatus {
             id: status.id,
             path: status.path,
@@ -255,11 +264,12 @@ impl ProtoUtils {
             file_type: FileType::from(status.file_type),
             x_attr: status.x_attr,
             storage_policy: Self::storage_policy_from_pb(status.storage_policy),
+            io_backend: IoBackend::from(status.io_backend),
             owner: status.owner,
             group: status.group,
             mode: status.mode,
-            nlink: status.nlink,
             target: status.target,
+            nlink: status.nlink,
         }
     }
 
@@ -397,7 +407,6 @@ impl ProtoUtils {
                 }
             }
         }
-
         vec
     }
 
@@ -550,6 +559,7 @@ impl ProtoUtils {
             ttl_action: info.ttl_action.into(),
             read_verify_ufs: info.read_verify_ufs,
             storage_type: info.storage_type.map(|v| v.into()),
+            io_backend: info.io_backend.map(|v| v.into()),
             block_size: info.block_size,
             replicas: info.replicas,
             write_type: info.write_type.into(),
@@ -567,6 +577,7 @@ impl ProtoUtils {
             ttl_action: info.ttl_action.into(),
             read_verify_ufs: info.read_verify_ufs,
             storage_type: info.storage_type.map(|x| x.into()),
+            io_backend: info.io_backend.map(|x| x.into()),
             block_size: info.block_size,
             replicas: info.replicas,
             write_type: WriteType::from(info.write_type),
@@ -582,6 +593,7 @@ impl ProtoUtils {
             ttl_action: opts.ttl_action.map(|v| v.into()),
             read_verify_ufs: opts.read_verify_ufs,
             storage_type: opts.storage_type.map(|v| v.into()),
+            io_backend: opts.io_backend.map(|v| v.into()),
             block_size: opts.block_size,
             replicas: opts.replicas,
             remove_properties: opts.remove_properties,
@@ -598,6 +610,7 @@ impl ProtoUtils {
             ttl_action: opts.ttl_action.map(TtlAction::from),
             read_verify_ufs: opts.read_verify_ufs,
             storage_type: opts.storage_type.map(StorageType::from),
+            io_backend: opts.io_backend.map(IoBackend::from),
             block_size: opts.block_size,
             replicas: opts.replicas,
             remove_properties: opts.remove_properties,

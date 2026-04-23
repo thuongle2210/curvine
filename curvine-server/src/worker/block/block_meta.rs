@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::storage::{DirState, VfsDir, ACTIVE_DIR, STAGING_DIR};
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::state::{ExtendedBlock, StorageType, IoBackend};
 use once_cell::sync::Lazy;
 use orpc::common::{ByteUnit, FileUtils};
 use orpc::io::{BlockDevice, IOResult, LocalFile};
@@ -73,6 +73,8 @@ pub struct BlockMeta {
     pub(crate) actual_len: i64,
     /// SPDK bdev byte offset
     pub(crate) bdev_offset: i64,
+    /// I/O backend for this block
+    pub(crate) io_backend: IoBackend,
 }
 
 impl BlockMeta {
@@ -84,6 +86,7 @@ impl BlockMeta {
             dir: dir.state.clone(),
             actual_len: block_size,
             bdev_offset: 0,
+            io_backend: dir.io_backend(),
         }
     }
 
@@ -114,6 +117,7 @@ impl BlockMeta {
                     dir: dir.state.clone(),
                     actual_len,
                     bdev_offset: 0,
+                    io_backend: dir.io_backend(),
                 };
 
                 Ok(meta)
@@ -136,6 +140,7 @@ impl BlockMeta {
             dir: meta.dir.clone(),
             actual_len,
             bdev_offset: meta.bdev_offset,
+            io_backend: meta.io_backend,
         };
 
         Ok(meta)
@@ -149,6 +154,7 @@ impl BlockMeta {
             dir: Arc::new(DirState::default()),
             actual_len: 0,
             bdev_offset: 0,
+            io_backend: IoBackend::Kernel,
         }
     }
 
@@ -161,6 +167,7 @@ impl BlockMeta {
             dir: meta.dir.clone(),
             actual_len: committed_len,
             bdev_offset: meta.bdev_offset,
+            io_backend: meta.io_backend,
         }
     }
 
@@ -242,9 +249,9 @@ impl BlockMeta {
     }
 
     pub fn create_writer(&self, off: i64, overwrite: bool) -> IOResult<BlockDevice> {
-        match self.storage_type() {
+        match self.io_backend() {
             #[cfg(feature = "spdk")]
-            StorageType::Spdk => {
+            IoBackend::Spdk => {
                 let bdev_name = self.get_bdev_name()?;
                 let abs_offset = self.bdev_offset + off;
                 let max_len = 0.max(self.len - off);
@@ -267,9 +274,9 @@ impl BlockMeta {
     }
 
     pub fn create_reader(&self, offset: u64) -> IOResult<BlockDevice> {
-        match self.storage_type() {
+        match self.io_backend() {
             #[cfg(feature = "spdk")]
-            StorageType::Spdk => {
+            IoBackend::Spdk => {
                 let bdev_name = self.get_bdev_name()?;
                 let abs_offset = self.bdev_offset as u64 + offset;
                 let max_len = 0.max(self.len - offset as i64);
@@ -309,6 +316,10 @@ impl BlockMeta {
         self.dir.storage_type
     }
 
+    pub fn io_backend(&self) -> IoBackend {
+        self.io_backend
+    }
+
     pub fn base_path(&self) -> &Path {
         self.dir.base_path.as_path()
     }
@@ -333,10 +344,11 @@ mod test {
         let dir = Arc::new(DirState {
             dir_id: 1,
             base_path: PathBuf::from("/nonexistent/spdk/path"),
-            storage_type: StorageType::Spdk,
+            storage_type: StorageType::Disk,
+            io_backend: IoBackend::Spdk,
             bdev_name: Some("NVMe_test_n1".to_string()),
             bdev_capacity: 1024 * 1024 * 1024,
-            offset_alloc: DirState::new_offset_alloc(StorageType::Spdk, 1024 * 1024 * 1024, 4096),
+            offset_alloc: DirState::new_offset_alloc(IoBackend::Spdk, 1024 * 1024 * 1024, 4096),
         });
         BlockMeta {
             id,
@@ -345,6 +357,7 @@ mod test {
             dir,
             actual_len: block_size,
             bdev_offset: 0,
+            io_backend: IoBackend::Spdk,
         }
     }
     #[test]
@@ -373,6 +386,7 @@ mod test {
             dir,
             actual_len: 100,
             bdev_offset: 0,
+            io_backend: IoBackend::Kernel,
         };
         let path = meta.get_block_path()?;
         LocalFile::write_string(&path, &"data", true)?;

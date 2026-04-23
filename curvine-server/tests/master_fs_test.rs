@@ -665,6 +665,7 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
         locations: vec![BlockLocation {
             worker_id: b1.locs[0].worker_id,
             storage_type: Default::default(),
+            io_backend: Default::default(),
         }],
     };
 
@@ -711,6 +712,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
         locations: vec![BlockLocation {
             worker_id: b1.locs[0].worker_id,
             storage_type: Default::default(),
+            io_backend: Default::default(),
         }],
     };
 

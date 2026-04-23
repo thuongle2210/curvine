@@ -19,7 +19,7 @@ use crate::worker::replication::worker_replication_manager::WorkerReplicationMan
 use crate::worker::task::TaskManager;
 use crate::worker::WorkerMetrics;
 use curvine_common::conf::ClusterConf;
-use curvine_common::state::{HeartbeatStatus, WorkerAddress};
+use curvine_common::state::{HeartbeatStatus, WorkerAddress, IoBackend};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
@@ -127,15 +127,15 @@ impl Worker {
                     );
                     // Validate: each data_dir needs one bdev (dir_id % num_bdevs)
                     let num_spdk_dirs = conf
-                        .worker
-                        .data_dir
-                        .iter()
-                        .filter(|d| {
-                            WorkerDataDir::from_str(d)
-                                .map(|dd| dd.storage_type == StorageType::Spdk)
-                                .unwrap_or(false)
-                        })
-                        .count();
+                         .worker
+                         .data_dir
+                         .iter()
+                         .filter(|d| {
+                             WorkerDataDir::from_str(d)
+                                 .map(|dd| dd.io_backend == IoBackend::Spdk)
+                                 .unwrap_or(false)
+                         })
+                         .count();
                     let num_bdevs = env.bdevs().len();
                     if num_spdk_dirs > num_bdevs {
                         return orpc::err_box!(

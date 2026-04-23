@@ -48,6 +48,59 @@ pub enum StorageType {
     Spdk = 5,
 }
 
+#[repr(i32)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    Hash,
+    IntoPrimitive,
+    FromPrimitive,
+    ValueEnum,
+)]
+pub enum IoBackend {
+    #[num_enum(default)]
+    Kernel = 0,
+    Spdk = 1,
+}
+
+impl IoBackend {
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            IoBackend::Kernel => "KERNEL",
+            IoBackend::Spdk => "SPDK",
+        }
+    }
+
+    pub fn from_str_name(value: &str) -> Self {
+        Self::try_from(value).unwrap_or(IoBackend::Kernel)
+    }
+}
+
+impl TryFrom<&str> for IoBackend {
+    type Error = CommonError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let typ = match value.to_uppercase().as_str() {
+            "KERNEL" => Self::Kernel,
+            "SPDK" => Self::Spdk,
+            _ => return err_box!("invalid io backend: {}", value),
+        };
+
+        Ok(typ)
+    }
+}
+
+impl Default for IoBackend {
+    fn default() -> Self {
+        IoBackend::Kernel
+    }
+}
+
 impl StorageType {
     pub fn as_str_name(&self) -> &'static str {
         match self {
@@ -101,6 +154,7 @@ pub struct StorageInfo {
     pub available: i64,
     pub reserved_bytes: i64,
     pub storage_type: StorageType,
+    pub io_backend: IoBackend,
     pub block_num: i64,
     pub dir_path: String,
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{StorageType, TtlAction};
+use crate::state::{StorageType, TtlAction, IoBackend};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,7 @@ pub enum StorageState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoragePolicy {
     pub storage_type: StorageType,
+    pub io_backend: IoBackend,
     pub ttl_ms: i64,
     pub ttl_action: TtlAction,
     pub ufs_mtime: i64,
@@ -118,6 +119,7 @@ impl Default for StoragePolicy {
     fn default() -> Self {
         Self {
             storage_type: StorageType::Disk,
+            io_backend: IoBackend::Kernel,
             ttl_ms: 0,
             ttl_action: TtlAction::None,
             ufs_mtime: 0,

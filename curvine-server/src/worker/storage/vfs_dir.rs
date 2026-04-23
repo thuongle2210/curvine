@@ -17,7 +17,7 @@ use crate::worker::storage::{
     DirState, StorageVersion, ACTIVE_DIR, DEFAULT_BLOCK_ALIGN, STAGING_DIR,
 };
 use curvine_common::conf::WorkerDataDir;
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::state::{ExtendedBlock, IoBackend, StorageType};
 use log::*;
 use orpc::common::{ByteUnit, FileUtils};
 use orpc::io::LocalFile;
@@ -62,7 +62,7 @@ impl VfsDir {
         let staging_dir = stats.path().join(STAGING_DIR);
 
         // SPDK: skip filesystem (no local dir, version file, or filesystem checks).
-        if conf.storage_type != StorageType::Spdk {
+        if conf.io_backend != IoBackend::Spdk {
             FileUtils::create_dir(&active_dir, true)?;
             FileUtils::create_dir(&staging_dir, true)?;
             stats.check_dir()?;
@@ -73,20 +73,20 @@ impl VfsDir {
 
         // SPDK: resolve bdev name from global SpdkEnv (one bdev per data_dir)
         #[cfg(feature = "spdk")]
-        let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::Spdk {
+        let bdev_name: Option<(String, i64)> = if conf.io_backend == IoBackend::Spdk {
             use orpc::io::spdk_env::SpdkEnv;
             let env = SpdkEnv::global().ok_or_else(|| {
-                orpc::err_msg!(
-                    "StorageType::Spdk dir '{}' requires SPDK environment, but it is not initialized",
-                    conf.path
-                )
+                 orpc::err_msg!(
+                     "IoBackend::Spdk dir '{}' requires SPDK environment, but it is not initialized",
+                     conf.path
+                 )
             })?;
             let names = env.bdev_names();
             if names.is_empty() {
-                return orpc::err_box!(
-                    "StorageType::Spdk dir '{}' but no bdevs discovered from SPDK targets",
-                    conf.path
-                );
+                 return orpc::err_box!(
+                     "IoBackend::Spdk dir '{}' but no bdevs discovered from SPDK targets",
+                     conf.path
+                 );
             }
             let idx = version.dir_id as usize % names.len();
             let name = names[idx].clone();
@@ -101,9 +101,9 @@ impl VfsDir {
             None
         };
         #[cfg(not(feature = "spdk"))]
-        let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::Spdk {
+        let bdev_name: Option<(String, i64)> = if conf.io_backend == IoBackend::Spdk {
             return orpc::err_box!(
-                "StorageType::Spdk is not available. Compile with --features spdk"
+                "IoBackend::Spdk is not available. Compile with --features spdk"
             );
         } else {
             None
@@ -126,10 +126,11 @@ impl VfsDir {
             dir_id: version.dir_id,
             base_path: stats.path().to_path_buf(),
             storage_type: conf.storage_type,
+            io_backend: conf.io_backend,
             bdev_name: bdev_name_str,
             bdev_capacity,
             offset_alloc: super::DirState::new_offset_alloc(
-                conf.storage_type,
+                conf.io_backend,
                 bdev_capacity,
                 bdev_block_size,
             ),
@@ -171,8 +172,8 @@ impl VfsDir {
     }
 
     pub fn capacity(&self) -> i64 {
-        // SPDK: use bdev capacity (fs returns 0 for non-existent path)
-        if self.storage_type == StorageType::Spdk {
+        // SPDK io_backend: use bdev capacity (fs returns 0 for non-existent path)
+        if self.io_backend() == IoBackend::Spdk {
             let bdev_cap = self.state.bdev_capacity;
             return if self.conf_capacity <= 0 {
                 bdev_cap
@@ -191,8 +192,8 @@ impl VfsDir {
     }
 
     pub fn available(&self) -> i64 {
-        // SPDK: available = capacity - used - reserved (fs returns 0)
-        if self.storage_type == StorageType::Spdk {
+        // SPDK io_backend: available = capacity - used - reserved (fs returns 0)
+        if self.io_backend() == IoBackend::Spdk {
             let capacity = self.capacity();
             let fs_used = self.fs_used();
             let reserved_bytes = self.reserved_bytes;
@@ -210,8 +211,8 @@ impl VfsDir {
     }
 
     pub fn non_fs_used(&self) -> i64 {
-        // SPDK: no filesystem overhead
-        if self.storage_type == StorageType::Spdk {
+        // SPDK io_backend: no filesystem overhead
+        if self.io_backend() == IoBackend::Spdk {
             return 0;
         }
         let v = self.stats.used_space() as i64 - self.fs_used();
@@ -240,6 +241,10 @@ impl VfsDir {
 
     pub fn storage_type(&self) -> StorageType {
         self.storage_type
+    }
+
+    pub fn io_backend(&self) -> IoBackend {
+        self.state.io_backend
     }
 
     pub fn device_id(&self) -> u64 {
@@ -305,7 +310,7 @@ impl VfsDir {
 
     pub fn create_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let mut meta = BlockMeta::with_tmp(block, self);
-        if self.storage_type == StorageType::Spdk {
+        if self.io_backend() == IoBackend::Spdk {
             // Allocate a non-overlapping offset range on the bdev for this block.
             let offset = self
                 .state
@@ -326,7 +331,7 @@ impl VfsDir {
     }
 
     pub fn finalize_block(&self, meta: &BlockMeta, committed_len: i64) -> CommonResult<BlockMeta> {
-        if self.storage_type == StorageType::Spdk {
+        if self.io_backend() == IoBackend::Spdk {
             // SPDK: skip metadata stat (use in-memory BlockMeta)
             return Ok(BlockMeta::with_final_spdk(meta, committed_len));
         }
@@ -336,8 +341,8 @@ impl VfsDir {
 
     // Scan all blocks in the directory
     pub fn scan_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
-        // SPDK bdevs don't store blocks on the filesystem — nothing to scan
-        if self.storage_type == StorageType::Spdk {
+        // SPDK io_backend: bdevs don't store blocks on the filesystem — nothing to scan
+        if self.io_backend() == IoBackend::Spdk {
             // SPDK: loaded via scan_spdk_blocks() in VfsDataset
             return Ok(vec![]);
         }
@@ -399,6 +404,7 @@ impl VfsDir {
                 dir: self.state.clone(),
                 actual_len: rec.len,
                 bdev_offset: rec.offset,
+                io_backend: self.io_backend(),
             };
             blocks.push(block);
         }
@@ -413,12 +419,12 @@ impl VfsDir {
     }
 
     pub fn check_dir(&self) -> CommonResult<()> {
-        if self.storage_type == StorageType::Spdk {
+        if self.io_backend() == IoBackend::Spdk {
             return Ok(());
         }
         self.stats.check_dir()
     }
-
+    
     pub fn can_allocate(&self, stg_type: StorageType, block_size: i64) -> bool {
         (stg_type == StorageType::Disk || stg_type == self.storage_type)
             && !self.is_failed()
@@ -466,7 +472,7 @@ mod test {
     use crate::worker::storage::StorageVersion;
     use crate::worker::storage::DEFAULT_BLOCK_ALIGN;
     use curvine_common::conf::WorkerDataDir;
-    use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::state::{ExtendedBlock, IoBackend, StorageType};
     use orpc::common::{ByteUnit, FileUtils};
     use orpc::io::LocalFile;
     use orpc::sync::AtomicLong;
@@ -477,31 +483,33 @@ mod test {
     use std::sync::Arc;
 
     fn spdk_state(p: &str, cap: i64) -> Arc<DirState> {
-        Arc::new(DirState {
-            dir_id: 1,
-            base_path: PathBuf::from(p),
-            storage_type: StorageType::Spdk,
-            bdev_name: Some("nvme0".into()),
-            bdev_capacity: cap,
-            offset_alloc: DirState::new_offset_alloc(StorageType::Spdk, cap, 4096),
-        })
+         Arc::new(DirState {
+             dir_id: 1,
+             base_path: PathBuf::from(p),
+             storage_type: StorageType::Spdk,
+             io_backend: IoBackend::Spdk,
+             bdev_name: Some("nvme0".into()),
+             bdev_capacity: cap,
+             offset_alloc: DirState::new_offset_alloc(IoBackend::Spdk, cap, 4096),
+         })
     }
 
-    fn spdk_dir(p: &str, st: Arc<DirState>, conf: i64) -> VfsDir {
-        VfsDir {
-            version: StorageVersion::with_cluster("t"),
-            stats: FsStats::new(p),
-            active_dir: PathBuf::from(p).join("a"),
-            staging_dir: PathBuf::from(p).join("s"),
-            storage_type: StorageType::Spdk,
-            conf_capacity: conf,
-            reserved_bytes: 0,
-            final_bytes: AtomicLong::new(0),
-            tmp_bytes: AtomicLong::new(0),
-            state: st,
-            check_failed: Arc::new(AtomicBool::new(false)),
-        }
-    }
+     fn spdk_dir(p: &str, st: Arc<DirState>, conf: i64) -> VfsDir {
+         VfsDir {
+             version: StorageVersion::with_cluster("t"),
+             stats: FsStats::new(p),
+             active_dir: PathBuf::from(p).join("a"),
+             staging_dir: PathBuf::from(p).join("s"),
+             storage_type: StorageType::Spdk,
+             io_backend: IoBackend::Spdk,
+             conf_capacity: conf,
+             reserved_bytes: 0,
+             final_bytes: AtomicLong::new(0),
+             tmp_bytes: AtomicLong::new(0),
+             state: st,
+             check_failed: Arc::new(AtomicBool::new(false)),
+         }
+     }
 
     fn local_state(p: &str) -> Arc<DirState> {
         Arc::new(DirState {
@@ -590,6 +598,7 @@ mod test {
             dir: st,
             actual_len: 4096,
             bdev_offset: 0,
+            io_backend: IoBackend::Spdk,
         };
         let r = dir.finalize_block(&meta, 2048)?;
         assert_eq!(r.len, 2048);

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{FileAllocOpts, FileStatus, FileType, StorageType, WorkerAddress};
+use crate::state::{FileAllocOpts, FileStatus, FileType, StorageType, IoBackend, WorkerAddress};
 use crate::FsResult;
 use orpc::common::{ByteUnit, FastHashMap};
 use orpc::{err_box, CommonResult};
@@ -24,18 +24,20 @@ use std::ops::{Deref, Range};
 pub struct BlockLocation {
     pub worker_id: u32,
     pub storage_type: StorageType,
+    pub io_backend: IoBackend,
 }
 
 impl BlockLocation {
-    pub fn new(id: u32, storage_type: StorageType) -> Self {
+    pub fn new(id: u32, storage_type: StorageType, io_backend: IoBackend) -> Self {
         Self {
             worker_id: id,
             storage_type,
+            io_backend,
         }
     }
 
     pub fn with_id(id: u32) -> Self {
-        Self::new(id, StorageType::Disk)
+        Self::new(id, StorageType::Disk, IoBackend::Kernel)
     }
 }
 
@@ -51,7 +53,7 @@ impl From<&LocatedBlock> for CommitBlock {
         let locations: Vec<BlockLocation> = located_block
             .locs
             .iter()
-            .map(|x| BlockLocation::new(x.worker_id, located_block.storage_type))
+            .map(|x| BlockLocation::new(x.worker_id, located_block.block.storage_type, located_block.block.io_backend))
             .collect();
 
         Self {
@@ -69,6 +71,7 @@ pub struct ExtendedBlock {
     pub storage_type: StorageType,
     pub file_type: FileType,
     pub alloc_opts: Option<FileAllocOpts>,
+    pub io_backend: IoBackend,
 }
 
 impl ExtendedBlock {
@@ -79,6 +82,7 @@ impl ExtendedBlock {
             storage_type,
             file_type,
             alloc_opts: None,
+            io_backend: IoBackend::Kernel,  // Default to Kernel for backward compatibility
         }
     }
 
@@ -95,6 +99,7 @@ impl ExtendedBlock {
             storage_type,
             file_type,
             alloc_opts,
+            io_backend: IoBackend::Kernel,  // Default to Kernel for backward compatibility
         }
     }
 

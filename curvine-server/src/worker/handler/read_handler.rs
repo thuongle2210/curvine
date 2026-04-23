@@ -17,7 +17,7 @@ use crate::worker::handler::ReadContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::{BlockReadResponse, DataHeaderProto};
-use curvine_common::state::StorageType;
+use curvine_common::state::{StorageType, IoBackend};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
@@ -84,7 +84,7 @@ impl ReadHandler {
         }
 
         // Check short-circuit before open. SPDK has no filesystem path.
-        let is_short_circuit = context.short_circuit && meta.storage_type() != StorageType::Spdk;
+        let is_short_circuit = context.short_circuit && meta.io_backend() != IoBackend::Spdk;
         let (label, path, file) = if is_short_circuit {
             let path = meta.get_block_file()?;
             ("local", path, None)
@@ -116,6 +116,7 @@ impl ReadHandler {
             len: meta.len,
             path: ternary!(is_short_circuit, Some(path), None),
             storage_type: meta.storage_type().into(),
+            io_backend: meta.io_backend().into(),
         };
 
         let _ = mem::replace(&mut self.file, file);

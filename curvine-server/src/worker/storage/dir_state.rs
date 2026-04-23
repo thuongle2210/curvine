@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::StorageType;
+use curvine_common::state::{StorageType, IoBackend};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -22,6 +22,7 @@ pub struct DirState {
     pub(crate) dir_id: u32,
     pub(crate) base_path: PathBuf,
     pub(crate) storage_type: StorageType,
+    pub(crate) io_backend: IoBackend,
     #[cfg(feature = "spdk")]
     pub(crate) bdev_name: Option<String>,
     #[cfg(not(feature = "spdk"))]
@@ -35,11 +36,11 @@ impl DirState {
     /// Create an offset allocator appropriate for the storage type.
     /// SPDK dirs get a real allocator with bdev capacity; local dirs get a dummy.
     pub fn new_offset_alloc(
-        storage_type: StorageType,
+        io_backend: IoBackend,
         bdev_capacity: i64,
         bdev_block_size: i64,
     ) -> BdevOffsetAllocator {
-        if storage_type == StorageType::Spdk {
+        if io_backend == IoBackend::Spdk {
             BdevOffsetAllocator::new(bdev_capacity, bdev_block_size)
         } else {
             BdevOffsetAllocator::default()

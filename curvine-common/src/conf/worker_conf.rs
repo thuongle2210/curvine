@@ -15,7 +15,7 @@
 #![allow(clippy::should_implement_trait)]
 
 use crate::conf::ClusterConf;
-use crate::state::StorageType;
+use crate::state::{StorageType, IoBackend};
 use orpc::common::{ByteUnit, DurationUnit, FileUtils, LogConf, Utils};
 use orpc::io::SpdkConf;
 use orpc::{err_box, CommonResult};
@@ -25,22 +25,24 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct WorkerDataDir {
     pub storage_type: StorageType,
+    pub io_backend: IoBackend,
     pub capacity: u64,
     pub path: String,
 }
 
 impl WorkerDataDir {
-    pub fn new(storage_type: StorageType, capacity: u64, path: &str) -> Self {
+    pub fn new(storage_type: StorageType, io_backend: IoBackend, capacity: u64, path: &str) -> Self {
         let path = FileUtils::absolute_path_string(path).unwrap();
         Self {
             storage_type,
+            io_backend,
             capacity,
             path,
         }
     }
 
     fn with_path(path: &str) -> Self {
-        Self::new(StorageType::Disk, 0, path)
+        Self::new(StorageType::Disk, IoBackend::Kernel, 0, path)
     }
 
     fn is_alphabetic(str: &str) -> bool {
@@ -56,42 +58,83 @@ impl WorkerDataDir {
         StorageType::from_str_name(str)
     }
 
-    pub fn from_str(str: &str) -> CommonResult<Self> {
-        let re = Regex::new(r"^\[([\w:]*)\](.+)$")?;
-        let caps = match re.captures(str) {
-            None => return Ok(Self::with_path(str)),
-            Some(v) => v,
-        };
-
-        let prefix = caps.get(1).map_or("", |m| m.as_str());
-        let path = caps.get(2).map_or("", |m| m.as_str());
-        let arr = prefix.split(":").collect::<Vec<&str>>();
-
-        if prefix.is_empty() || arr.is_empty() {
-            // /dir
-            return Ok(Self::with_path(str));
-        };
-
-        let (stg_type, capacity) = if arr.len() == 1 {
-            if Self::is_alphabetic(arr[0]) {
-                //[HDD]/dir
-                (arr[0], "0")
-            } else {
-                //[20GB]/dir
-                ("disk", arr[0])
-            }
-        } else if arr.len() == 2 {
-            //[HDD:20GB]/dir
-            (arr[0], arr[1])
-        } else {
-            return err_box!("Incorrect data format {}", str);
-        };
-
-        Ok(Self::new(
-            Self::parse_stg_type(stg_type),
-            ByteUnit::from_str(capacity)?.as_byte(),
-            path,
-        ))
+    pub fn from_str(str: &str) -> CommonResult<Self> {  
+        let re = Regex::new(r"^\[([\w/:]*)\](.+)$")?;  
+        let caps = match re.captures(str) {  
+            None => return Ok(Self::with_path(str)),  
+            Some(v) => v,  
+        };  
+    
+        let prefix = caps.get(1).map_or("", |m| m.as_str());  
+        let path = caps.get(2).map_or("", |m| m.as_str());  
+    
+        if prefix.is_empty() {  
+            return Ok(Self::with_path(str));  
+        }
+    
+        // Split by '/' to separate storage_type from data_protocol  
+        let (type_part, protocol) = if let Some(slash_pos) = prefix.find('/') {  
+            let tp = &prefix[..slash_pos];  
+            let proto_and_rest = &prefix[slash_pos + 1..];  
+            // proto_and_rest might contain ':' for capacity, e.g. "SPDK:1GB"  
+            // But capacity is after the protocol, so split protocol part by ':'  
+            (tp, proto_and_rest)  
+        } else {  
+            (prefix, "")  
+        };  
+    
+        // Split type_part or protocol by ':' for capacity  
+        // Format: [TYPE/PROTO:CAP] or [TYPE:CAP] or [TYPE/PROTO] or [TYPE]  
+        let (stg_str, proto_str, cap_str) = if !protocol.is_empty() {  
+            // Has '/': type_part is storage type, protocol may have ':capacity'  
+            let proto_parts: Vec<&str> = protocol.split(':').collect();  
+            if proto_parts.len() == 1 {  
+                (type_part, proto_parts[0], "0")  
+            } else if proto_parts.len() == 2 {  
+                (type_part, proto_parts[0], proto_parts[1])  
+            } else {  
+                return err_box!("Incorrect data format {}", str);  
+            }  
+        } else {  
+            // No '/': original format [TYPE] or [TYPE:CAP] or [CAP]  
+            let arr: Vec<&str> = type_part.split(':').collect();  
+            if arr.len() == 1 {  
+                if Self::is_alphabetic(arr[0]) {  
+                    (arr[0], "", "0")  
+                } else {  
+                    ("disk", "", arr[0])  
+                }  
+            } else if arr.len() == 2 {  
+                (arr[0], "", arr[1])  
+            } else {  
+                return err_box!("Incorrect data format {}", str);  
+            }  
+        };  
+    
+        // Parse storage type — reject "SPDK" as a storage type  
+        let storage_type = Self::parse_stg_type(stg_str);  
+    
+        // Parse data protocol  
+        let io_backend = if proto_str.is_empty() {  
+            IoBackend::Kernel  
+        } else {  
+            IoBackend::try_from(proto_str)?  
+        };  
+    
+        // Validate: SPDK is not a storage type  
+        if stg_str.eq_ignore_ascii_case("SPDK") {  
+            return err_box!(  
+                "SPDK is a data protocol, not a storage type. Use [SSD/SPDK]{} instead",  
+                path  
+            );  
+        }  
+    
+        Ok(Self {  
+            storage_type,  
+            io_backend,  
+            capacity: ByteUnit::from_str(cap_str)?.as_byte(),  
+            path: FileUtils::absolute_path_string(path).unwrap(),  
+        })  
     }
 
     pub fn storage_path<T: AsRef<str>>(&self, cluster_id: T) -> String {

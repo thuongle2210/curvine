@@ -20,7 +20,7 @@ use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use core::panic;
-use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction};
+use curvine_common::state::{FileStatus, FileType, IoBackend, SetAttrOpts, StoragePolicy, TtlAction};
 use curvine_common::utils::SerdeUtils;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
@@ -502,6 +502,7 @@ impl InodeView {
             mode: acl.mode,
             nlink: self.nlink(),
             target: None,
+            io_backend: IoBackend::Kernel,
         };
 
         match self {

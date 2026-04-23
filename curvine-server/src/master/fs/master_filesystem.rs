@@ -472,12 +472,15 @@ impl MasterFilesystem {
         // If it has been allocated, return that block
         if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
             let locs = fs_dir.get_block_locations(next.id)?;
+            let file_storage_type = file.storage_policy.storage_type;
+            let file_type = file.file_type;
             let extend_block = ExtendedBlock {
                 id: next.id,
                 len: next.len(),
-                storage_type: file.storage_policy.storage_type,
-                file_type: file.file_type,
+                storage_type: file_storage_type,
+                file_type,
                 alloc_opts: next.alloc_opts.clone(),
+                io_backend: next.io_backend,
             };
 
             return self.create_locate_block(path, extend_block, &locs);
@@ -558,6 +561,7 @@ impl MasterFilesystem {
                 storage_type: file.storage_policy.storage_type,
                 file_type: file.file_type,
                 alloc_opts: meta.alloc_opts.clone(),
+                io_backend: meta.io_backend,
             };
 
             let lc = try_option!(
@@ -702,7 +706,7 @@ impl MasterFilesystem {
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
-            let loc = BlockLocation::new(list.worker_id, item.storage_type);
+            let loc = BlockLocation::new(list.worker_id, item.storage_type, IoBackend::Kernel);
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
                     let exists = match exists {
