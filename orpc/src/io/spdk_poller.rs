@@ -61,11 +61,16 @@ impl IoCompletion {
     }
 
     /// Called by C callback on completion.
-    pub fn complete(&self, status: i32) {
+    /// Returns true if this call actually completed the I/O (first call wins).
+    pub fn complete(&self, status: i32) -> bool {
         let mut inner = self.inner.lock().unwrap();
+        if inner.done {
+            return false;
+        }
         inner.done = true;
         inner.status = status;
         self.cond.notify_one();
+        true
     }
 
     /// Block until complete or timeout. Returns NVMe status.
@@ -150,6 +155,10 @@ impl SpdkPoller {
     fn poller_loop(rx: crossbeam::channel::Receiver<IoRequest>, shutdown: Arc<AtomicBool>) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
         let mut inflight: HashMap<usize, Arc<std::sync::atomic::AtomicUsize>> = HashMap::new();
+        let mut pending_completions: HashMap<
+            usize,
+            Vec<(Arc<IoCompletion>, Arc<std::sync::atomic::AtomicUsize>)>,
+        > = HashMap::new();
 
         // Verify curvine_async_ctx buffer fits the C struct.
         debug_assert!(
@@ -168,9 +177,19 @@ impl SpdkPoller {
             // Use try_recv when active_qpairs is non-empty; only block when idle.
             match rx.recv_timeout(std::time::Duration::from_micros(100)) {
                 Ok(req) => {
-                    Self::submit_one(&req, &mut active_qpairs, &mut inflight);
+                    Self::submit_one(
+                        &req,
+                        &mut active_qpairs,
+                        &mut inflight,
+                        &mut pending_completions,
+                    );
                     while let Ok(req) = rx.try_recv() {
-                        Self::submit_one(&req, &mut active_qpairs, &mut inflight);
+                        Self::submit_one(
+                            &req,
+                            &mut active_qpairs,
+                            &mut inflight,
+                            &mut pending_completions,
+                        );
                     }
                 }
                 Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
@@ -178,16 +197,52 @@ impl SpdkPoller {
             }
 
             // Poll active qpairs for completions
-            // TODO: treat poll failure as fatal; Because rc < 0 silently drops qpair, stranding in-flight completions forever.
+            let mut failed_qpairs: Vec<usize> = Vec::new();
             active_qpairs.retain(|&qpair| {
                 let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
                 if rc < 0 {
-                    error!("qpair poll error: {}", rc);
+                    error!("qpair {:p} poll error: rc={}", qpair, rc);
+                    failed_qpairs.push(qpair as usize);
                     return false;
                 }
                 let key = qpair as usize;
                 inflight
                     .get(&key)
+                    .map_or(false, |c| c.load(Ordering::Acquire) > 0)
+            });
+
+            // Force-complete all outstanding requests on failed qpairs
+            for key in &failed_qpairs {
+                if let Some(completions) = pending_completions.remove(key) {
+                    let count = completions.len();
+                    for (completion, bdev_inflight) in completions {
+                        if completion.complete(-libc::EIO) {
+                            if let Some(inflight_counter) = inflight.get(key) {
+                                inflight_counter.fetch_sub(1, Ordering::Release);
+                            }
+                            bdev_inflight.fetch_sub(1, Ordering::Release);
+                        }
+                    }
+                    error!(
+                        "Force-completed {} outstanding I/O(s) on failed qpair 0x{:x} with EIO",
+                        count, key
+                    );
+                }
+                inflight.remove(key);
+            }
+
+            if !failed_qpairs.is_empty() {
+                error!(
+                    "Fatal: {} qpair(s) failed, triggering poller shutdown",
+                    failed_qpairs.len()
+                );
+                shutdown.store(true, Ordering::Release);
+            }
+
+            // Clean up tracking for qpairs that went idle (all I/Os completed normally)
+            pending_completions.retain(|key, _| {
+                inflight
+                    .get(key)
                     .map_or(false, |c| c.load(Ordering::Acquire) > 0)
             });
         }
@@ -200,6 +255,10 @@ impl SpdkPoller {
         req: &IoRequest,
         active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
         inflight: &mut HashMap<usize, Arc<std::sync::atomic::AtomicUsize>>,
+        pending_completions: &mut HashMap<
+            usize,
+            Vec<(Arc<IoCompletion>, Arc<std::sync::atomic::AtomicUsize>)>,
+        >,
     ) {
         let qpair = match &req.op {
             IoOp::Read { qpair, .. } => *qpair,
@@ -279,6 +338,10 @@ impl SpdkPoller {
 
         // Track active qpair and bump inflight count
         inflight_counter.fetch_add(1, Ordering::Release);
+        pending_completions
+            .entry(key)
+            .or_default()
+            .push((req.completion.clone(), req.bdev_inflight.clone()));
         if !active_qpairs.contains(&qpair) {
             active_qpairs.push(qpair);
         }
