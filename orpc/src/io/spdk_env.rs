@@ -920,12 +920,12 @@ impl SpdkEnv {
         let trtype = match subsystem.trtype.to_lowercase().as_str() {
             "rdma" => spdk_ffi::SPDK_NVME_TRANSPORT_RDMA,
             "tcp" => spdk_ffi::SPDK_NVME_TRANSPORT_TCP,
-            _ => return err_box!("unsupported transport type: {}", target.trtype),
+            _ => return err_box!("unsupported transport type: {}", subsystem.trtype),
         };
-        let adrfam = match target.adrfam.to_lowercase().as_str() {
+        let adrfam = match subsystem.adrfam.to_lowercase().as_str() {
             "ipv4" => spdk_ffi::SPDK_NVMF_ADRFAM_IPV4,
             "ipv6" => spdk_ffi::SPDK_NVMF_ADRFAM_IPV6,
-            _ => return err_box!("unsupported address family: {}", target.adrfam),
+            _ => return err_box!("unsupported address family: {}", subsystem.adrfam),
         };
         unsafe {
             // Verify our opaque buffers are large enough for the installed SPDK version.
@@ -958,24 +958,24 @@ impl SpdkEnv {
             // Build controller opts via C helpers
             let mut opts: spdk_ffi::spdk_nvme_ctrlr_opts = std::mem::zeroed();
             spdk_ffi::curvine_spdk_ctrlr_get_default_opts(&mut opts);
-            if target.io_queues > 0 {
-                spdk_ffi::curvine_spdk_ctrlr_opts_set_num_io_queues(&mut opts, target.io_queues);
+            if subsystem.io_queues > 0 {
+                spdk_ffi::curvine_spdk_ctrlr_opts_set_num_io_queues(&mut opts, subsystem.io_queues);
             }
-            if target.keep_alive_timeout_ms > 0 {
+            if subsystem.keep_alive_timeout_ms > 0 {
                 spdk_ffi::curvine_spdk_ctrlr_opts_set_keep_alive_timeout_ms(
                     &mut opts,
-                    target.keep_alive_timeout_ms as u32,
+                    subsystem.keep_alive_timeout_ms as u32,
                 );
             }
-            if !target.hostnqn.is_empty() {
-                let hostnqn = CString::new(target.hostnqn.as_str())
+            if !subsystem.hostnqn.is_empty() {
+                let hostnqn = CString::new(subsystem.hostnqn.as_str())
                     .map_err(|e| err_msg!(format!("invalid hostnqn: {}", e)))?;
                 spdk_ffi::curvine_spdk_ctrlr_opts_set_hostnqn(&mut opts, hostnqn.as_ptr());
             }
             // Connect
             let ctrlr = spdk_ffi::curvine_spdk_nvme_connect(&mut trid, &mut opts);
             if ctrlr.is_null() {
-                return err_box!("spdk_nvme_connect failed for target {}", target.endpoint());
+                return err_box!("spdk_nvme_connect failed for {}", subsystem.endpoint());
             }
             // Enumerate active namespaces
             let num_ns = spdk_ffi::spdk_nvme_ctrlr_get_num_ns(ctrlr);
@@ -991,7 +991,7 @@ impl SpdkEnv {
                 let sector_size = spdk_ffi::spdk_nvme_ns_get_sector_size(ns);
                 let num_sectors = spdk_ffi::spdk_nvme_ns_get_num_sectors(ns);
                 let size_bytes = sector_size as u64 * num_sectors;
-                let name = format!("NVMe_{}_{}_n{}", target.traddr, target.trsvcid, nsid);
+                let name = format!("NVMe_{}_{}_n{}", subsystem.traddr, subsystem.trsvcid, nsid);
                 info!(
                     "  Discovered ns {}: size={}B, sector_size={}, sectors={}",
                     nsid, size_bytes, sector_size, num_sectors
@@ -1001,7 +1001,7 @@ impl SpdkEnv {
                     size_bytes,
                     block_size: sector_size,
                     num_blocks: num_sectors,
-                    target_endpoint: target.endpoint(),
+                    target_endpoint: subsystem.endpoint(),
                     ctrlr: ctrlr as usize,
                     ns: ns as usize,
                     nsid,
@@ -1010,7 +1010,7 @@ impl SpdkEnv {
             if bdevs.is_empty() {
                 warn!(
                     "Controller {} has no active namespaces, detaching controller",
-                    target.endpoint()
+                    subsystem.endpoint()
                 );
                 unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
             }

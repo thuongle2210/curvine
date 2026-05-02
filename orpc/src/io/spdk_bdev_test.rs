@@ -24,8 +24,7 @@ fn test_spdk_conf() -> SpdkConf {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4420);
-    let subnqn =
-        std::env::var("SPDK_TARGET_NQN").unwrap_or("nqn.2024-01.io.curvine:test".to_string());
+    let subnqn = std::env::var("SPDK_SUBNQN").unwrap_or("nqn.2024-01.io.curvine:test".to_string());
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or("tcp".to_string());
 
     SpdkConf {

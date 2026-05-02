@@ -39,7 +39,7 @@ fn get_worker() -> &'static ClusterConf {
             .unwrap()
             .parse()
             .expect("SPDK_TARGET_PORT must be a valid u16");
-        let subnqn = std::env::var("SPDK_TARGET_NQN").unwrap();
+        let subnqn = std::env::var("SPDK_SUBNQN").unwrap();
         let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
 
         let hugepage_mb: u32 = std::env::var("SPDK_HUGEPAGE_MB")
