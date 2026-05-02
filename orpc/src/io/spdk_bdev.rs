@@ -740,7 +740,7 @@ mod test {
         let subnqn = std::env::var("SPDK_TARGET_NQN")
             .unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
         let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
-        conf.targets = vec![crate::io::spdk_env::NvmeTarget {
+        conf.subsystems = vec![crate::io::spdk_env::NvmeSubsystem {
             traddr,
             trsvcid,
             subnqn,

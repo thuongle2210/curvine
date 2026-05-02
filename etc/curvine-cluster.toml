@@ -23,8 +23,15 @@ journal_dir = "testing/journal"
 # Worker configuration
 [worker]
 dir_reserved = "0"
+
+# with spdk_disk data dir
+# NVMe subsystems (explicit namespace binding via datadir prefix)
+# Format: [SPDK_DISK:SIZE|SUBNQN|NSID]/path
+
 data_dir = [
     "[DISK]testing/data",
+    "[SPDK_DISK|nqn.2024-01.io.curvine:subsystem1|1]/mnt/nvme1/data",
+    "[SPDK_DISK:10GB|nqn.2024-01.io.curvine:subsystem2|1]/mnt/nvme2/data",
 ]
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
 enable_s3_gateway = false
@@ -51,23 +58,26 @@ dma_pool_size = "64MB"
 block_align = 0  
 
 
-# NVMe-oF targets  
-[[worker.spdk_disk.targets]]  
+# NVMe-oF subsystems  
+[[worker.spdk_disk.subsystems]]  
 trtype = "rdma"  
 adrfam = "ipv4"  
 traddr = "192.168.1.100"  
 trsvcid = 4420  
 subnqn = "nqn.2024-01.io.curvine:subsystem1"  
+controller_count = 2
 hostnqn = ""  
 io_queues = 0  
 keep_alive_timeout_ms = 0  
-  
-[[worker.spdk_disk.targets]]  
+
+[[worker.spdk_disk.subsystems]]  
 trtype = "rdma"  
 adrfam = "ipv4"  
 traddr = "192.168.1.101"  
 trsvcid = 4420  
 subnqn = "nqn.2024-01.io.curvine:subsystem2"
+controller_count = 3
+
 
 # Customer service configuration.
 [client]

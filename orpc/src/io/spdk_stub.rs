@@ -2,11 +2,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
-pub struct NvmeTarget {
+pub struct NvmeSubsystem {
     pub trtype: String,
     pub traddr: String,
     pub trsvcid: u16,
     pub subnqn: String,
+    pub controller_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -18,7 +19,8 @@ pub struct SpdkConf {
     pub hugepage_str: String,
     pub reactor_mask: String,
     pub shm_id: i32,
-    pub targets: Vec<NvmeTarget>,
+    #[serde(default)]
+    pub subsystems: Vec<NvmeSubsystem>,
     pub io_queue_depth: u32,
     pub io_queue_requests: u32,
     #[serde(alias = "io_timeout", default)]

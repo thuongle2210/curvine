@@ -144,7 +144,7 @@ impl Worker {
                             "Configuration has {} SPDK data_dir entries but only {} bdev(s) \
                              were discovered. Multiple dirs would map to the same NVMe \
                              namespace, causing data corruption. Either reduce SPDK data_dir \
-                             entries or add more NVMe-oF targets.",
+                              entries or add more NVMe-oF subsystems.",
                             num_spdk_dirs,
                             num_bdevs
                         );

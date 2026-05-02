@@ -57,7 +57,7 @@ impl QpairPool {
             return err_box!(
                 "QpairPool: failed to allocate I/O qpair for ctrlr {:p}. \
                  This may indicate qpair exhaustion under high concurrency. \
-                 Check NvmeTarget.io_queues configuration.",
+                 Check NvmeSubsystem.io_queues configuration.",
                 ctrlr
             );
         }
@@ -143,10 +143,10 @@ impl Display for SpdkEnvState {
     }
 }
 
-/// Remote NVMe-oF target
+/// NVMe subsystem (remote NVMe-oF subsystem identified by subnqn)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
-pub struct NvmeTarget {
+pub struct NvmeSubsystem {
     pub trtype: String,             // "rdma" or "tcp"
     pub adrfam: String,             // "ipv4" or "ipv6"
     pub traddr: String,             // target IP
@@ -155,9 +155,10 @@ pub struct NvmeTarget {
     pub hostnqn: String,            // empty = auto-generated
     pub io_queues: u32,             // 0 = default
     pub keep_alive_timeout_ms: u64, // 0 = use global
+    pub controller_count: u32,      // Number of controllers for this subsystem (default 1)
 }
 
-impl NvmeTarget {
+impl NvmeSubsystem {
     pub fn new(traddr: &str, trsvcid: u16, subnqn: &str) -> Self {
         Self {
             traddr: traddr.to_string(),
@@ -170,20 +171,26 @@ impl NvmeTarget {
     /// Validate required fields
     pub fn validate(&self) -> CommonResult<()> {
         if self.traddr.is_empty() {
-            return err_box!("NvmeTarget: traddr cannot be empty");
+            return err_box!("NvmeSubsystem: traddr cannot be empty");
         }
         if self.trsvcid == 0 {
-            return err_box!("NvmeTarget: trsvcid cannot be 0");
+            return err_box!("NvmeSubsystem: trsvcid cannot be 0");
         }
         if self.subnqn.is_empty() {
-            return err_box!("NvmeTarget: subnqn cannot be empty");
+            return err_box!("NvmeSubsystem: subnqn cannot be empty");
         }
         let valid_trtype = ["rdma", "tcp"];
         if !valid_trtype.contains(&self.trtype.to_lowercase().as_str()) {
             return err_box!(
-                "NvmeTarget: invalid trtype '{}', expected one of {:?}",
+                "NvmeSubsystem: invalid trtype '{}', expected one of {:?}",
                 self.trtype,
                 valid_trtype
+            );
+        }
+        if self.controller_count == 0 {
+            return err_box!(
+                "NvmeSubsystem: controller_count must be >= 1, got {}",
+                self.controller_count
             );
         }
         Ok(())
@@ -198,7 +205,7 @@ impl NvmeTarget {
     }
 }
 
-impl Default for NvmeTarget {
+impl Default for NvmeSubsystem {
     fn default() -> Self {
         Self {
             trtype: "rdma".to_string(),
@@ -209,11 +216,12 @@ impl Default for NvmeTarget {
             hostnqn: String::new(),
             io_queues: 0,
             keep_alive_timeout_ms: 0,
+            controller_count: 1, // Default: 1 controller per subsystem
         }
     }
 }
 
-impl Display for NvmeTarget {
+impl Display for NvmeSubsystem {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.endpoint())
     }
@@ -239,7 +247,7 @@ pub struct SpdkConf {
     #[serde(default)]
     pub mem_channel: u32, // 0 = auto-detect
     #[serde(default)]
-    pub targets: Vec<NvmeTarget>,
+    pub subsystems: Vec<NvmeSubsystem>,
     #[serde(default)]
     pub io_queue_depth: u32,
     #[serde(default)]
@@ -290,8 +298,8 @@ impl SpdkConf {
             return Ok(());
         }
 
-        if self.targets.is_empty() {
-            return err_box!("SpdkConf: enabled=true but no targets configured");
+        if self.subsystems.is_empty() {
+            return err_box!("SpdkConf: enabled=true but no subsystems configured");
         }
 
         // Validate reactor_mask is valid hex
@@ -306,7 +314,7 @@ impl SpdkConf {
             );
         }
 
-        // Validate hugepage from source string (skip field is 0 after deserialization)
+        // Validate hugepage
         let hugepage_mb = if self.hugepage_mb > 0 {
             self.hugepage_mb
         } else {
@@ -329,6 +337,7 @@ impl SpdkConf {
             );
         }
 
+        // Validate I/O parameters
         if self.io_queue_depth == 0 {
             return err_box!("SpdkConf: io_queue_depth must be > 0");
         }
@@ -341,24 +350,25 @@ impl SpdkConf {
             );
         }
 
-        for (i, target) in self.targets.iter().enumerate() {
-            target.validate().map_err(|e| {
-                let msg = format!("SpdkConf: targets[{}]: {}", i, e);
+        // Validate subsystems
+        for (i, subsystem) in self.subsystems.iter().enumerate() {
+            subsystem.validate().map_err(|e| {
+                let msg = format!("SpdkConf: subsystems[{}]: {}", i, e);
                 err_msg!(msg)
             })?;
-            if target.keep_alive_timeout_ms > 0
-                && target.keep_alive_timeout_ms < self.poll_interval_ms
+            if subsystem.keep_alive_timeout_ms > 0
+                && subsystem.keep_alive_timeout_ms < self.poll_interval_ms
             {
                 return err_box!(
-                    "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be >= poll_interval_ms ({})",
+                    "SpdkConf: subsystems[{}]: keep_alive_timeout_ms ({}) must be >= poll_interval_ms ({})",
                     i,
-                    target.keep_alive_timeout_ms,
+                    subsystem.keep_alive_timeout_ms,
                     self.poll_interval_ms
                 );
             }
         }
 
-        // Validate poller interval is reasonable
+        // Validate poller interval
         if self.poll_interval_ms == 0 {
             return err_box!("SpdkConf: poll_interval_ms must be > 0");
         }
@@ -384,7 +394,7 @@ impl Default for SpdkConf {
             reactor_mask: "0x1".to_string(),
             shm_id: -1,
             mem_channel: 0,
-            targets: vec![],
+            subsystems: vec![],
             io_queue_depth: 128,
             io_queue_requests: 512,
             io_timeout_str: "30s".to_string(),
@@ -404,11 +414,11 @@ impl Display for SpdkConf {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SpdkConf(enabled={}, hugepage={}MB, reactor_mask={}, targets={})",
+            "SpdkConf(enabled={}, hugepage={}MB, reactor_mask={}, subsystems={})",
             self.enabled,
             self.hugepage_mb,
             self.reactor_mask,
-            self.targets.len()
+            self.subsystems.len()
         )
     }
 }
@@ -422,9 +432,10 @@ pub struct BdevInfo {
     pub size_bytes: u64, // total size in bytes
     pub block_size: u32, // typically 512 or 4096
     pub num_blocks: u64,
-    pub target_endpoint: String,
-    pub ctrlr: usize, // raw pointer for SpdkBdev
-    pub ns: usize,    // raw pointer for SpdkBdev
+    pub target_endpoint: String, // trtype://traddr:trsvcid/subnqn
+    pub ctrlr: usize,            // raw pointer for SpdkBdev
+    pub ns: usize,               // raw pointer for SpdkBdev
+    pub nsid: u32,               // namespace ID (1-based)
 }
 
 impl Display for BdevInfo {
@@ -545,11 +556,11 @@ impl SpdkEnv {
         }
 
         info!(
-            "SPDK env init: app_name={}, hugepage={}MB, reactor_mask={}, targets={}",
+            "SPDK env init: app_name={}, hugepage={}MB, reactor_mask={}, subsystems={}",
             self.conf.app_name,
             self.conf.hugepage_mb,
             self.conf.reactor_mask,
-            self.conf.targets.len()
+            self.conf.subsystems.len()
         );
 
         // Phase 1: Initialize SPDK environment (hugepages, DPDK, reactors)
@@ -557,11 +568,11 @@ impl SpdkEnv {
 
         // Phase 2: Attach NVMe-oF controllers and discover bdevs
         let mut all_bdevs = Vec::new();
-        for (i, target) in self.conf.targets.iter().enumerate() {
+        for (i, target) in self.conf.subsystems.iter().enumerate() {
             match self.attach_controller(target) {
                 Ok(bdevs) => {
                     info!(
-                        "Target[{}] {}: discovered {} bdev(s): [{}]",
+                        "Subsystem[{}] {}: discovered {} bdev(s): [{}]",
                         i,
                         target.endpoint(),
                         bdevs.len(),
@@ -574,7 +585,12 @@ impl SpdkEnv {
                     all_bdevs.extend(bdevs);
                 }
                 Err(e) => {
-                    error!("Target[{}] {} attach failed: {}", i, target.endpoint(), e);
+                    error!(
+                        "Subsystem[{}] {} attach failed: {}",
+                        i,
+                        target.endpoint(),
+                        e
+                    );
                     // Continue to next target — partial success is acceptable
                 }
             }
@@ -585,14 +601,14 @@ impl SpdkEnv {
             self.env_fini();
             return err_box!(
                 "SpdkEnv::init() failed: no bdevs discovered from {} target(s)",
-                self.conf.targets.len()
+                self.conf.subsystems.len()
             );
         }
 
         info!(
             "SPDK env initialized: {} bdev(s) from {} target(s)",
             all_bdevs.len(),
-            self.conf.targets.len()
+            self.conf.subsystems.len()
         );
 
         self.bdevs = all_bdevs;
@@ -699,9 +715,9 @@ impl SpdkEnv {
         &self.conf
     }
 
-    /// Number of configured targets.
-    pub fn target_count(&self) -> usize {
-        self.conf.targets.len()
+    /// Number of configured subsystems.
+    pub fn subsystem_count(&self) -> usize {
+        self.conf.subsystems.len()
     }
 
     /// Names of all discovered bdevs.
@@ -717,6 +733,41 @@ impl SpdkEnv {
     /// Look up a bdev by name.
     pub fn get_bdev(&self, name: &str) -> Option<&BdevInfo> {
         self.bdevs.iter().find(|b| b.name == name)
+    }
+
+    /// Look up a bdev by subsystem NQN and namespace ID.
+    /// Returns the first matching bdev, or None if not found.
+    pub fn get_bdev_by_nsid(&self, subnqn: &str, nsid: u32) -> Option<&BdevInfo> {
+        self.bdevs.iter().find(|b| {
+            // Extract subnqn from target_endpoint (format: trtype://traddr:trsvcid/subnqn)
+            b.target_endpoint.ends_with(&format!("/{}", subnqn)) && b.nsid == nsid
+        })
+    }
+
+    /// Validate that all expected namespaces (from worker data_dir config) are present.
+    /// Called after init() to detect namespace mismatches.
+    /// Returns error listing missing (subnqn, nsid) pairs.
+    pub fn validate_namespaces(&self, expected: &[(String, u32)]) -> CommonResult<()> {
+        let mut missing = Vec::new();
+        for (subnqn, nsid) in expected {
+            if self.get_bdev_by_nsid(subnqn, *nsid).is_none() {
+                missing.push(format!("{}:{}", subnqn, nsid));
+            }
+        }
+        if !missing.is_empty() {
+            return err_box!(
+                "SpdkEnv: namespaces not found: [{}]. \
+                 Verify SPDK target namespaces match datadir config. \
+                 Discovered bdevs: [{}]",
+                missing.join(", "),
+                self.bdevs
+                    .iter()
+                    .map(|b| format!("{}:{}", b.target_endpoint, b.nsid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Ok(())
     }
 
     /// Total capacity across all bdevs, in bytes.
@@ -857,16 +908,16 @@ impl SpdkEnv {
         Ok(())
     }
 
-    fn attach_controller(&self, target: &NvmeTarget) -> CommonResult<Vec<BdevInfo>> {
+    fn attach_controller(&self, subsystem: &NvmeSubsystem) -> CommonResult<Vec<BdevInfo>> {
         use std::ffi::CString;
-        info!("Attaching NVMe-oF controller: {}", target.endpoint());
-        let traddr = CString::new(target.traddr.as_str())
+        info!("Attaching NVMe-oF controller: {}", subsystem.endpoint());
+        let traddr = CString::new(subsystem.traddr.as_str())
             .map_err(|e| err_msg!(format!("invalid traddr: {}", e)))?;
-        let trsvcid = CString::new(target.trsvcid.to_string())
+        let trsvcid = CString::new(subsystem.trsvcid.to_string())
             .map_err(|e| err_msg!(format!("invalid trsvcid: {}", e)))?;
-        let subnqn = CString::new(target.subnqn.as_str())
+        let subnqn = CString::new(subsystem.subnqn.as_str())
             .map_err(|e| err_msg!(format!("invalid subnqn: {}", e)))?;
-        let trtype = match target.trtype.to_lowercase().as_str() {
+        let trtype = match subsystem.trtype.to_lowercase().as_str() {
             "rdma" => spdk_ffi::SPDK_NVME_TRANSPORT_RDMA,
             "tcp" => spdk_ffi::SPDK_NVME_TRANSPORT_TCP,
             _ => return err_box!("unsupported transport type: {}", target.trtype),
@@ -953,6 +1004,7 @@ impl SpdkEnv {
                     target_endpoint: target.endpoint(),
                     ctrlr: ctrlr as usize,
                     ns: ns as usize,
+                    nsid,
                 });
             }
             if bdevs.is_empty() {
@@ -1001,9 +1053,9 @@ impl Display for SpdkEnv {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SpdkEnv(state={:?}, targets={}, bdevs={}, capacity={})",
+            "SpdkEnv(state={:?}, subsystems={}, bdevs={}, capacity={})",
             self.state(),
-            self.conf.targets.len(),
+            self.conf.subsystems.len(),
             self.bdevs.len(),
             self.total_capacity()
         )

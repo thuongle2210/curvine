@@ -1,7 +1,7 @@
 use crate::common::Utils;
 use crate::io::block_io::BlockIO;
 use crate::io::spdk_bdev::SpdkBdev;
-use crate::io::spdk_env::{NvmeTarget, SpdkConf, SpdkEnv, SpdkEnvState};
+use crate::io::spdk_env::{NvmeSubsystem, SpdkConf, SpdkEnv, SpdkEnvState};
 use crate::sys::DataSlice;
 use bytes::BytesMut;
 use std::sync::Once;
@@ -37,7 +37,7 @@ fn test_spdk_conf() -> SpdkConf {
             .unwrap_or(256),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
 
-        targets: vec![NvmeTarget {
+        subsystems: vec![NvmeSubsystem {
             traddr,
             trsvcid,
             subnqn,

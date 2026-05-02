@@ -10,7 +10,7 @@ use curvine_common::utils::ProtoUtils;
 use curvine_server::worker::Worker;
 use orpc::common::Utils;
 use orpc::io::net::NetUtils;
-use orpc::io::{NvmeTarget, SpdkConf};
+use orpc::io::{NvmeSubsystem, SpdkConf};
 use orpc::message::{Builder, RequestStatus};
 use orpc::sys::DataSlice::Buffer;
 use orpc::CommonResult;
@@ -53,7 +53,7 @@ fn get_worker() -> &'static ClusterConf {
             hugepage_str: format!("{}MB", hugepage_mb),
             hugepage_mb,
             reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or_else(|_| "0x2".to_string()),
-            targets: vec![NvmeTarget {
+            subsystems: vec![NvmeSubsystem {
                 traddr,
                 trsvcid,
                 subnqn,
