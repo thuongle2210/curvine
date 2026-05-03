@@ -86,18 +86,23 @@ impl VfsDir {
             // Require explicit SUBNQN+NSID from config
             let subnqn = conf.subnqn.as_ref().ok_or_else(|| {
                 orpc::err_msg!(
-                    "SPDK dir '{}' missing SUBNQN in prefix. Use format: [SPDK_DISK:SIZE|SUBNQN|NSID]/path",
+                    "SPDK dir '{}' missing SUBNQN in prefix. Use format: [SPDK_DISK:SIZE|SUBNQN|NSID|CTRLR_IDX]/path",
                     conf.path
                 )
             })?;
             let nsid = conf.nsid.ok_or_else(|| {
                 orpc::err_msg!(
-                    "SPDK dir '{}' missing NSID in prefix. Use format: [SPDK_DISK:SIZE|SUBNQN|NSID]/path",
+                    "SPDK dir '{}' missing NSID in prefix. Use format: [SPDK_DISK:SIZE|SUBNQN|NSID|CTRLR_IDX]/path",
                     conf.path
                 )
             })?;
 
-            let bdev_info = env.get_bdev_by_nsid(subnqn, nsid);
+            // Use specific controller if configured, otherwise use selection strategy
+            let bdev_info = if let Some(ctrlr_idx) = conf.ctrlr_idx {
+                env.get_bdev_by_nsid_and_ctrlr(subnqn, nsid, ctrlr_idx)
+            } else {
+                env.get_bdev_by_nsid(subnqn, nsid)
+            };
             match bdev_info {
                 Some(bdev) => {
                     info!(
@@ -107,13 +112,18 @@ impl VfsDir {
                     Some((bdev.name.clone(), bdev.size_bytes as i64))
                 }
                 None => {
+                    let ctrlr_msg = if let Some(ctrlr_idx) = conf.ctrlr_idx {
+                        format!(" controller_idx={}", ctrlr_idx)
+                    } else {
+                        " (using controller selection strategy)".to_string()
+                    };
                     return orpc::err_box!(
-                        "SPDK dir '{}': no bdev found for subnqn='{}', nsid={}. \
+                        "SPDK dir '{}': no bdev found for subnqn='{}', nsid={}{}. \
                          Verify that:\n\
                          1. The namespace exists on the target subsystem\n\
-                         2. The datadir prefix uses correct format: [SPDK_DISK:SIZE|SUBNQN|NSID]/path\n\
+                         2. The datadir prefix uses correct format: [SPDK_DISK:SIZE|SUBNQN|NSID|CTRLR_IDX]/path\n\
                          3. The SPDK target is accessible and initialized",
-                        conf.path, subnqn, nsid
+                        conf.path, subnqn, nsid, ctrlr_msg
                     );
                 }
             }

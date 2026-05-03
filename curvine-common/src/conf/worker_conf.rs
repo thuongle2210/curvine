@@ -27,9 +27,10 @@ pub struct WorkerDataDir {
     pub storage_type: StorageType,
     pub capacity: u64,
     pub path: String,
-    // SPDK-specific: explicit namespace binding
+    // SPDK-specific: explicit namespace + controller binding
     pub subnqn: Option<String>,
     pub nsid: Option<u32>,
+    pub ctrlr_idx: Option<u32>, // Specific controller index (0-based), None = use controller selection strategy
 }
 
 impl WorkerDataDir {
@@ -41,6 +42,7 @@ impl WorkerDataDir {
             path,
             subnqn: None,
             nsid: None,
+            ctrlr_idx: None,
         }
     }
 
@@ -105,12 +107,14 @@ impl WorkerDataDir {
         ))
     }
 
-    /// Parse SPDK prefix format: [SPDK_DISK:SIZE|SUBNQN|NSID] or [SPDK_DISK|SUBNQN|NSID]
+    /// Parse SPDK prefix format:
+    /// - [SPDK_DISK:SIZE|SUBNQN|NSID] or [SPDK_DISK|SUBNQN|NSID] (no ctrlr_idx, use selection strategy)
+    /// - [SPDK_DISK:SIZE|SUBNQN|NSID|CTRLR_IDX] (with specific controller index)
     fn parse_spdk_prefix(prefix: &str, path: &str, full_str: &str) -> CommonResult<Self> {
         let parts: Vec<&str> = prefix.split('|').collect();
-        if parts.len() != 3 {
+        if parts.len() != 3 && parts.len() != 4 {
             return err_box!(
-                "SPDK prefix must be [SPDK_DISK:SIZE|SUBNQN|NSID] or [SPDK_DISK|SUBNQN|NSID], got '{}' in '{}'",
+                "SPDK prefix must be [SPDK_DISK:SIZE|SUBNQN|NSID] or [SPDK_DISK:SIZE|SUBNQN|NSID|CTRLR_IDX], got '{}' in '{}'",
                 prefix,
                 full_str
             );
@@ -119,6 +123,17 @@ impl WorkerDataDir {
         let type_size = parts[0];
         let subnqn = parts[1];
         let nsid_str = parts[2];
+        let ctrlr_idx = if parts.len() == 4 {
+            Some(parts[3].parse::<u32>().map_err(|_| {
+                err_msg!(
+                    "Invalid controller index '{}' in SPDK prefix '{}'",
+                    parts[3],
+                    full_str
+                )
+            })?)
+        } else {
+            None
+        };
 
         // Validate SUBNQN is not empty
         if subnqn.is_empty() {
@@ -154,6 +169,7 @@ impl WorkerDataDir {
             path: FileUtils::absolute_path_string(path).unwrap(),
             subnqn: Some(subnqn.to_string()),
             nsid: Some(nsid),
+            ctrlr_idx,
         })
     }
 

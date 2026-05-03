@@ -890,6 +890,27 @@ impl SpdkEnv {
         Some(&self.bdevs[idx])
     }
 
+    /// Look up a bdev by subsystem NQN, namespace ID, and specific controller index.
+    /// Returns None if not found.
+    pub fn get_bdev_by_nsid_and_ctrlr(
+        &self,
+        subnqn: &str,
+        nsid: u32,
+        ctrlr_idx: u32,
+    ) -> Option<&BdevInfo> {
+        let key = (subnqn.to_string(), nsid);
+        let indices = self.bdev_groups.get(&key)?;
+
+        // Find bdev with matching ctrlr_idx
+        for &idx in indices {
+            if self.bdevs[idx].ctrlr_idx == ctrlr_idx {
+                return Some(&self.bdevs[idx]);
+            }
+        }
+
+        None
+    }
+
     /// Validate that all expected namespaces (from worker data_dir config) are present.
     /// Called after init() to detect namespace mismatches.
     /// Returns error listing missing (subnqn, nsid) pairs.
