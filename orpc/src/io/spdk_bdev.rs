@@ -28,6 +28,8 @@ pub struct SpdkIoChannel {
     pub poller_tx: crossbeam::channel::Sender<crate::io::spdk_poller::IoRequest>,
     /// Eventfd for waking poller on new I/O
     pub eventfd: std::sync::Arc<nix::sys::eventfd::EventFd>,
+    /// Poller ID for unregister on drop
+    pub poller_id: usize,
 }
 unsafe impl Send for SpdkIoChannel {}
 unsafe impl Sync for SpdkIoChannel {}
@@ -221,12 +223,13 @@ impl SpdkBdev {
                     return Err(e.into());
                 }
             };
-            let poller_tx = env.poller_sender(); // Get sender from SpdkEnv
-            let eventfd = env.poller_eventfd(); // Get eventfd for wake signaling
+            // Get poller for this controller (1:1 mapping)
+            let (poller_tx, eventfd, poller_id) = env.get_poller(info.ctrlr_idx as usize);
             let io_channel = SpdkIoChannel {
                 qpair,
                 poller_tx,
                 eventfd,
+                poller_id,
             };
             let io_timeout_us = env.conf().io_timeout_us;
             Ok(Self {
@@ -696,7 +699,8 @@ impl Drop for SpdkBdev {
         // Return qpair to pool and release handle.
         if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
             // Unregister qpair from poller before returning it to pool to avoid use-after-free
-            let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
+            let unregistered =
+                env.unregister_qpair_from_poller(self.io_channel.poller_id, self.io_channel.qpair);
             if unregistered {
                 env.release_qpair(self.ctrlr, self.io_channel.qpair);
             } else {
@@ -737,10 +741,10 @@ mod test {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(4420);
-        let subnqn = std::env::var("SPDK_TARGET_NQN")
-            .unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
+        let subnqn =
+            std::env::var("SPDK_SUBNQN").unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
         let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
-        conf.targets = vec![crate::io::spdk_env::NvmeTarget {
+        conf.subsystems = vec![crate::io::spdk_env::NvmeSubsystem {
             traddr,
             trsvcid,
             subnqn,

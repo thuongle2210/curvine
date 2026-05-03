@@ -45,7 +45,7 @@ mod spdk_conf;
 mod tests {
     use crate::conf::{ClusterConf, WorkerDataDir};
     use crate::state::StorageType;
-    use orpc::common::ByteUnit;
+    use orpc::common::{ByteUnit, FileUtils};
 
     #[test]
     fn cluster() {
@@ -69,6 +69,28 @@ mod tests {
             (
                 "[MEM:1GB]/disk",
                 WorkerDataDir::new(StorageType::Mem, ByteUnit::GB, "/disk"),
+            ),
+            // SPDK with size: [SPDK_DISK:SIZE|SUBNQN|NSID]
+            (
+                "[SPDK_DISK:100GB|nqn.2026-04.com.example:subsystem1|1]/mnt/nvme1/data",
+                WorkerDataDir {
+                    storage_type: StorageType::SpdkDisk,
+                    capacity: ByteUnit::GB * 100,
+                    path: FileUtils::absolute_path_string("/mnt/nvme1/data").unwrap(),
+                    subnqn: Some("nqn.2026-04.com.example:subsystem1".to_string()),
+                    nsid: Some(1),
+                },
+            ),
+            // SPDK without size: [SPDK_DISK|SUBNQN|NSID]
+            (
+                "[SPDK_DISK|nqn.2026-04.com.example:subsystem2|2]/mnt/nvme2/data",
+                WorkerDataDir {
+                    storage_type: StorageType::SpdkDisk,
+                    capacity: 0,
+                    path: FileUtils::absolute_path_string("/mnt/nvme2/data").unwrap(),
+                    subnqn: Some("nqn.2026-04.com.example:subsystem2".to_string()),
+                    nsid: Some(2),
+                },
             ),
         ];
 

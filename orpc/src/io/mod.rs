@@ -30,13 +30,16 @@ pub use self::block_io::{BlockDevice, BlockIO};
 pub mod spdk_env;
 
 #[cfg(feature = "spdk")]
-pub use spdk_env::{BdevInfo, NvmeTarget, SpdkConf};
+pub use spdk_env::{
+    BdevInfo, ControllerSelectionStrategy, NvmeSubsystem, RandomController, RoundRobinController,
+    SpdkConf,
+};
 
 #[cfg(not(feature = "spdk"))]
 pub mod spdk_stub;
 
 #[cfg(not(feature = "spdk"))]
-pub use spdk_stub::{BdevInfo, NvmeTarget, SpdkConf};
+pub use spdk_stub::{BdevInfo, NvmeSubsystem, SpdkConf};
 
 #[cfg(all(test, feature = "spdk"))]
 mod spdk_bdev_test;
@@ -51,6 +54,8 @@ pub use spdk_bdev::SpdkBdev;
 
 #[cfg(feature = "spdk")]
 pub mod spdk_poller;
+#[cfg(feature = "spdk")]
+pub use spdk_poller::SpdkPoller;
 
 #[cfg(not(feature = "spdk"))]
 pub mod spdk_poller_stub;

@@ -1,17 +1,14 @@
-#![cfg(feature = "spdk")]
-
-//! SPDK I/O poller thread - handles NVMe submit/poll on dedicated thread.
-use crate::io::spdk_ffi;
-/// Qpairs not thread-safe: submit + poll must on same thread.
-/// Single poller to demonstrate the correctness work.
-/// Uses eventfd for instant wake on new I/O submission.
-/// TODO: shard to multiple pollers (one per controller).
-///
+//! SPDK I/O poller — handles NVMe submit/poll on dedicated thread.
+//! One poller per controller (1:1 mapping).
+//! Uses eventfd for instant wake on new I/O submission.
+//!
 /// ## Disconnect Detection
 /// Detected via periodic keep-alive poll every 1s while idle (~1s latency).
 /// TODO: SPDK fabric eventfd for immediate detection.
+use crate::io::spdk_ffi;
 use log::{error, info};
 use nix::sys::eventfd::{EfdFlags, EventFd};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,9 +16,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-const EVENTSZ: usize = std::mem::size_of::<u64>();
+const EVENT_SZ: usize = std::mem::size_of::<u64>();
 
-/// I/O operation submitted to the poller thread.
+// I/O operation submitted to poller thread
 pub enum IoOp {
     Read {
         ns: *mut spdk_ffi::spdk_nvme_ns,
@@ -107,7 +104,7 @@ impl IoCompletion {
     }
 }
 
-/// Request sent from handler threads to the poller.
+// Request sent from handler threads to the poller
 pub struct IoRequest {
     pub op: IoOp,
     pub completion: Arc<IoCompletion>,
@@ -118,9 +115,9 @@ pub struct IoRequest {
 // SAFETY: exclusive ownership - blocks until completion.
 unsafe impl Send for IoRequest {}
 
-/// Poller states
+// Poller states
 enum PollerState {
-    /// Active processing I/O - try_recv loop
+    /// Active processing I/O — try_recv loop
     Active,
     /// Idle, blocked on eventfd waiting for work
     Idle,
@@ -128,6 +125,7 @@ enum PollerState {
 
 /// Poller thread handle.
 pub struct SpdkPoller {
+    ctrlr_id: usize,
     /// Channel sender for I/O submissions
     tx: Option<crossbeam::channel::Sender<IoRequest>>,
     /// Eventfd for instant wake signaling
@@ -137,8 +135,8 @@ pub struct SpdkPoller {
 }
 
 impl SpdkPoller {
-    /// Spawn a new poller thread with given poll interval (in ms).
-    pub fn start(poll_interval_ms: u64) -> Self {
+    /// Spawn a new poller thread.
+    pub fn start(ctrlr_id: usize, poll_interval_ms: u64) -> Self {
         let (tx, rx) = crossbeam::channel::unbounded::<IoRequest>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -150,18 +148,24 @@ impl SpdkPoller {
         let eventfd_arc = Arc::new(eventfd);
 
         let handle = std::thread::Builder::new()
-            .name("spdk-poller".to_string())
+            .name(format!("spdk-poller-{}", ctrlr_id))
             .spawn(move || {
                 Self::poller_loop(rx, shutdown_clone, eventfd_raw, poll_interval_ms);
             })
             .expect("Failed to spawn SPDK poller thread");
 
         Self {
+            ctrlr_id,
             tx: Some(tx),
             eventfd: eventfd_arc,
             shutdown,
             handle: Some(handle),
         }
+    }
+
+    /// Get the controller ID this poller handles.
+    pub fn ctrlr_id(&self) -> usize {
+        self.ctrlr_id
     }
 
     /// Get sender for SpdkBdev to hold.
@@ -170,13 +174,13 @@ impl SpdkPoller {
     }
 
     /// Get eventfd for signaling new I/O
-    pub fn eventfd(&self) -> RawFd {
-        self.eventfd.as_raw_fd()
+    pub fn eventfd(&self) -> Arc<EventFd> {
+        self.eventfd.clone()
     }
 
-    /// Get eventfd as Arc for sharing with multiple bdevs
-    pub fn eventfd_arc(&self) -> Arc<EventFd> {
-        self.eventfd.clone()
+    /// Get raw eventfd
+    pub fn eventfd_raw(&self) -> RawFd {
+        self.eventfd.as_raw_fd()
     }
 
     /// Unregister qpair from poller, blocking until removed to prevent UAF.
@@ -192,6 +196,9 @@ impl SpdkPoller {
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
             let _ = self.eventfd.write(1);
+            // // Use eventfd_write via libc to avoid AsFd trait issues
+            // // libc::eventfd_write expects fd as c_int (i32)
+            // let _ = unsafe { libc::eventfd_write(self.eventfd_raw(), 1) };
             match ack_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(()) => true,
                 Err(_) => {
@@ -208,6 +215,8 @@ impl SpdkPoller {
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         let _ = self.eventfd.write(1); // Wake poll(eventfd, timeout) so shutdown is observed promptly
+                                       // // Use libc::eventfd_write to avoid AsFd trait issues
+                                       // let _ = unsafe { libc::eventfd_write(self.eventfd_raw(), 1) };
         self.tx.take(); // Drop sender to disconnect the channel during shutdown
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -233,6 +242,7 @@ impl SpdkPoller {
 
         // Poll interval for keep-alive check (parameterized to detect disconnects)
         let poll_interval = poll_interval_ms as i32;
+
         loop {
             // Check shutdown first
             if shutdown.load(Ordering::Acquire) && rx.is_empty() && active_qpairs.is_empty() {
@@ -290,9 +300,9 @@ impl SpdkPoller {
                 match result {
                     n if n > 0 => {
                         // Eventfd signaled - drain it
-                        let mut buf = [0u8; EVENTSZ];
+                        let mut buf = [0u8; EVENT_SZ];
                         let _ = unsafe {
-                            libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENTSZ)
+                            libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENT_SZ)
                         };
 
                         // Drain any pending channel data
@@ -340,7 +350,7 @@ impl SpdkPoller {
     /// Handle unregister request, remove qpair from active set and ack.
     fn handle_unregister(req: &IoRequest, active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>) {
         if let IoOp::UnregisterQpair { qpair, ack } = &req.op {
-            active_qpairs.retain(|&qp| qp != *qpair);
+            active_qpairs.retain(|qp| *qp != *qpair);
             let _ = ack.send(());
         }
     }
@@ -429,11 +439,18 @@ impl SpdkPoller {
     }
 }
 
-/// C callback context. Heap-allocated for SPDK to hold pointer.
+impl Drop for SpdkPoller {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// C callback context.
+/// TODO: use object pool to avoid per-I/O heap allocation
 struct CallbackCtx {
     completion: Arc<IoCompletion>,
     async_ctx: spdk_ffi::curvine_async_ctx,
-    bdev_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    bdev_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// C callback invoked by SPDK when NVMe command completes.
@@ -441,10 +458,4 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     let ctx = Box::from_raw(cb_arg as *mut CallbackCtx);
     ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
     ctx.completion.complete(status);
-}
-
-impl Drop for SpdkPoller {
-    fn drop(&mut self) {
-        self.stop();
-    }
 }

@@ -10,7 +10,77 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
+
+/// Controller selection strategy for distributing I/O across multiple controllers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ControllerSelectionStrategy {
+    /// Always use the first controller for a given (subnqn, nsid)
+    First,
+    /// Round-robin across available controllers for the same (subnqn, nsid).
+    RoundRobin(RoundRobinController),
+    /// Randomly select a controller for each bdev lookup.
+    Random(RandomController),
+}
+
+impl Default for ControllerSelectionStrategy {
+    fn default() -> Self {
+        ControllerSelectionStrategy::First
+    }
+}
+
+impl ControllerSelectionStrategy {
+    pub fn name(&self) -> &str {
+        match self {
+            ControllerSelectionStrategy::First => "First",
+            ControllerSelectionStrategy::RoundRobin(_) => "RoundRobin",
+            ControllerSelectionStrategy::Random(_) => "Random",
+        }
+    }
+}
+
+/// Round-robin state: tracks next index per (subnqn, nsid) group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoundRobinController {
+    next: HashMap<(String, u32), usize>,
+}
+
+impl RoundRobinController {
+    pub fn new() -> Self {
+        Self {
+            next: HashMap::new(),
+        }
+    }
+
+    /// Select next controller index for the given (subnqn, nsid) group.
+    pub fn select(&mut self, key: &(String, u32), group_size: usize) -> usize {
+        let entry = self.next.entry(key.clone()).or_insert(0);
+        let selected = *entry;
+        *entry = (*entry + 1) % group_size;
+        selected
+    }
+}
+
+/// Random selection state: Xorshift64
+#[derive(Clone, Debug, PartialEq)]
+pub struct RandomController {
+    seed: u64,
+}
+
+impl RandomController {
+    pub fn new() -> Self {
+        Self { seed: 42 }
+    }
+
+    /// Select a random controller index using Xorshift64 (shift + xor only).
+    pub fn select(&mut self, group_size: usize) -> usize {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 7;
+        self.seed ^= self.seed << 17;
+        (self.seed as usize) % group_size
+    }
+}
 
 // Qpair pool - reuse NVMe qpairs across handles
 /// Lazy allocate, cache on release
@@ -57,7 +127,7 @@ impl QpairPool {
             return err_box!(
                 "QpairPool: failed to allocate I/O qpair for ctrlr {:p}. \
                  This may indicate qpair exhaustion under high concurrency. \
-                 Check NvmeTarget.io_queues configuration.",
+                 Check NvmeSubsystem.io_queues configuration.",
                 ctrlr
             );
         }
@@ -143,10 +213,10 @@ impl Display for SpdkEnvState {
     }
 }
 
-/// Remote NVMe-oF target
+/// NVMe subsystem (remote NVMe-oF subsystem identified by subnqn)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
-pub struct NvmeTarget {
+pub struct NvmeSubsystem {
     pub trtype: String,             // "rdma" or "tcp"
     pub adrfam: String,             // "ipv4" or "ipv6"
     pub traddr: String,             // target IP
@@ -155,9 +225,10 @@ pub struct NvmeTarget {
     pub hostnqn: String,            // empty = auto-generated
     pub io_queues: u32,             // 0 = default
     pub keep_alive_timeout_ms: u64, // 0 = use global
+    pub controller_count: u32,      // Number of controllers for this subsystem (default 1)
 }
 
-impl NvmeTarget {
+impl NvmeSubsystem {
     pub fn new(traddr: &str, trsvcid: u16, subnqn: &str) -> Self {
         Self {
             traddr: traddr.to_string(),
@@ -170,20 +241,26 @@ impl NvmeTarget {
     /// Validate required fields
     pub fn validate(&self) -> CommonResult<()> {
         if self.traddr.is_empty() {
-            return err_box!("NvmeTarget: traddr cannot be empty");
+            return err_box!("NvmeSubsystem: traddr cannot be empty");
         }
         if self.trsvcid == 0 {
-            return err_box!("NvmeTarget: trsvcid cannot be 0");
+            return err_box!("NvmeSubsystem: trsvcid cannot be 0");
         }
         if self.subnqn.is_empty() {
-            return err_box!("NvmeTarget: subnqn cannot be empty");
+            return err_box!("NvmeSubsystem: subnqn cannot be empty");
         }
         let valid_trtype = ["rdma", "tcp"];
         if !valid_trtype.contains(&self.trtype.to_lowercase().as_str()) {
             return err_box!(
-                "NvmeTarget: invalid trtype '{}', expected one of {:?}",
+                "NvmeSubsystem: invalid trtype '{}', expected one of {:?}",
                 self.trtype,
                 valid_trtype
+            );
+        }
+        if self.controller_count == 0 {
+            return err_box!(
+                "NvmeSubsystem: controller_count must be >= 1, got {}",
+                self.controller_count
             );
         }
         Ok(())
@@ -198,7 +275,7 @@ impl NvmeTarget {
     }
 }
 
-impl Default for NvmeTarget {
+impl Default for NvmeSubsystem {
     fn default() -> Self {
         Self {
             trtype: "rdma".to_string(),
@@ -209,11 +286,12 @@ impl Default for NvmeTarget {
             hostnqn: String::new(),
             io_queues: 0,
             keep_alive_timeout_ms: 0,
+            controller_count: 1, // Default: 1 controller per subsystem
         }
     }
 }
 
-impl Display for NvmeTarget {
+impl Display for NvmeSubsystem {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.endpoint())
     }
@@ -239,7 +317,7 @@ pub struct SpdkConf {
     #[serde(default)]
     pub mem_channel: u32, // 0 = auto-detect
     #[serde(default)]
-    pub targets: Vec<NvmeTarget>,
+    pub subsystems: Vec<NvmeSubsystem>,
     #[serde(default)]
     pub io_queue_depth: u32,
     #[serde(default)]
@@ -256,6 +334,10 @@ pub struct SpdkConf {
     pub keep_alive_timeout_ms: u64, // parsed by init()
     #[serde(alias = "poll_interval", default)]
     pub poll_interval_ms: u64, // default = 1000
+    #[serde(alias = "controller_selection", default)]
+    pub controller_selection_str: String, // "First", "RoundRobin", or "Random"
+    #[serde(skip)]
+    pub controller_selection: ControllerSelectionStrategy, // parsed by init()
     #[serde(alias = "dma_pool_size", default)]
     pub dma_pool_size_str: String, // e.g. "64MB"
     #[serde(skip)]
@@ -280,6 +362,21 @@ impl SpdkConf {
         let dma_pool = ByteUnit::from_str(&self.dma_pool_size_str)?;
         self.dma_pool_bytes = dma_pool.as_byte();
 
+        // Parse controller selection strategy
+        self.controller_selection = match self.controller_selection_str.to_lowercase().as_str() {
+            "roundrobin" | "round_robin" | "round-robin" => {
+                ControllerSelectionStrategy::RoundRobin(RoundRobinController::new())
+            }
+            "random" => ControllerSelectionStrategy::Random(RandomController::new()),
+            "first" | "" => ControllerSelectionStrategy::First,
+            other => {
+                return err_box!(
+                    "SpdkConf: invalid controller_selection '{}', expected 'First', 'RoundRobin', or 'Random'",
+                    other
+                );
+            }
+        };
+
         Ok(())
     }
 
@@ -290,8 +387,8 @@ impl SpdkConf {
             return Ok(());
         }
 
-        if self.targets.is_empty() {
-            return err_box!("SpdkConf: enabled=true but no targets configured");
+        if self.subsystems.is_empty() {
+            return err_box!("SpdkConf: enabled=true but no subsystems configured");
         }
 
         // Validate reactor_mask is valid hex
@@ -306,7 +403,7 @@ impl SpdkConf {
             );
         }
 
-        // Validate hugepage from source string (skip field is 0 after deserialization)
+        // Validate hugepage
         let hugepage_mb = if self.hugepage_mb > 0 {
             self.hugepage_mb
         } else {
@@ -329,6 +426,7 @@ impl SpdkConf {
             );
         }
 
+        // Validate I/O parameters
         if self.io_queue_depth == 0 {
             return err_box!("SpdkConf: io_queue_depth must be > 0");
         }
@@ -341,24 +439,25 @@ impl SpdkConf {
             );
         }
 
-        for (i, target) in self.targets.iter().enumerate() {
-            target.validate().map_err(|e| {
-                let msg = format!("SpdkConf: targets[{}]: {}", i, e);
+        // Validate subsystems
+        for (i, subsystem) in self.subsystems.iter().enumerate() {
+            subsystem.validate().map_err(|e| {
+                let msg = format!("SpdkConf: subsystems[{}]: {}", i, e);
                 err_msg!(msg)
             })?;
-            if target.keep_alive_timeout_ms > 0
-                && target.keep_alive_timeout_ms < self.poll_interval_ms
+            if subsystem.keep_alive_timeout_ms > 0
+                && subsystem.keep_alive_timeout_ms < self.poll_interval_ms
             {
                 return err_box!(
-                    "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be >= poll_interval_ms ({})",
+                    "SpdkConf: subsystems[{}]: keep_alive_timeout_ms ({}) must be >= poll_interval_ms ({})",
                     i,
-                    target.keep_alive_timeout_ms,
+                    subsystem.keep_alive_timeout_ms,
                     self.poll_interval_ms
                 );
             }
         }
 
-        // Validate poller interval is reasonable
+        // Validate poller interval
         if self.poll_interval_ms == 0 {
             return err_box!("SpdkConf: poll_interval_ms must be > 0");
         }
@@ -384,7 +483,7 @@ impl Default for SpdkConf {
             reactor_mask: "0x1".to_string(),
             shm_id: -1,
             mem_channel: 0,
-            targets: vec![],
+            subsystems: vec![],
             io_queue_depth: 128,
             io_queue_requests: 512,
             io_timeout_str: "30s".to_string(),
@@ -393,6 +492,8 @@ impl Default for SpdkConf {
             keep_alive_timeout_str: "10s".to_string(),
             keep_alive_timeout_ms: 10_000,
             poll_interval_ms: 1000,
+            controller_selection_str: "First".to_string(),
+            controller_selection: ControllerSelectionStrategy::First,
             dma_pool_size_str: "64MB".to_string(),
             dma_pool_bytes: 64 * 1024 * 1024,
             block_align: 0,
@@ -404,11 +505,11 @@ impl Display for SpdkConf {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SpdkConf(enabled={}, hugepage={}MB, reactor_mask={}, targets={})",
+            "SpdkConf(enabled={}, hugepage={}MB, reactor_mask={}, subsystems={})",
             self.enabled,
             self.hugepage_mb,
             self.reactor_mask,
-            self.targets.len()
+            self.subsystems.len()
         )
     }
 }
@@ -422,9 +523,11 @@ pub struct BdevInfo {
     pub size_bytes: u64, // total size in bytes
     pub block_size: u32, // typically 512 or 4096
     pub num_blocks: u64,
-    pub target_endpoint: String,
-    pub ctrlr: usize, // raw pointer for SpdkBdev
-    pub ns: usize,    // raw pointer for SpdkBdev
+    pub target_endpoint: String, // trtype://traddr:trsvcid/subnqn
+    pub ctrlr: usize,            // raw pointer for SpdkBdev
+    pub ns: usize,               // raw pointer for SpdkBdev
+    pub nsid: u32,               // namespace ID (1-based)
+    pub ctrlr_idx: u32,          // controller index (0-based, for multi-controller)
 }
 
 impl Display for BdevInfo {
@@ -444,9 +547,14 @@ pub struct SpdkEnv {
     conf: SpdkConf,
     state: AtomicU8,
     bdevs: Vec<BdevInfo>, // populated during init(), immutable after
+    /// Group bdevs by (subnqn, nsid) for controller selection
+    bdev_groups: HashMap<(String, u32), Vec<usize>>,
     open_handles: AtomicUsize,
     qpair_pool: QpairPool,
-    poller: Mutex<Option<SpdkPoller>>,
+    /// Simple poller map: ctrlr_idx -> SpdkPoller (1:1 mapping)
+    pollers: Mutex<HashMap<usize, SpdkPoller>>,
+    /// Controller selection strategy state
+    controller_selection: Mutex<ControllerSelectionStrategy>,
 }
 
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
@@ -461,12 +569,14 @@ impl SpdkEnv {
         info!("SpdkEnv created: {}", conf);
 
         Ok(Self {
-            conf,
+            conf: conf.clone(),
             state: AtomicU8::new(SpdkEnvState::Created as u8),
             bdevs: Vec::new(),
+            bdev_groups: HashMap::new(),
             open_handles: AtomicUsize::new(0),
             qpair_pool: QpairPool::new(),
-            poller: Mutex::new(None),
+            pollers: Mutex::new(HashMap::new()),
+            controller_selection: Mutex::new(conf.controller_selection.clone()),
         })
     }
 
@@ -545,11 +655,12 @@ impl SpdkEnv {
         }
 
         info!(
-            "SPDK env init: app_name={}, hugepage={}MB, reactor_mask={}, targets={}",
+            "SPDK env init: app_name={}, hugepage={}MB, reactor_mask={}, subsystems={}, controller_selection={}",
             self.conf.app_name,
             self.conf.hugepage_mb,
             self.conf.reactor_mask,
-            self.conf.targets.len()
+            self.conf.subsystems.len(),
+            self.conf.controller_selection.name()
         );
 
         // Phase 1: Initialize SPDK environment (hugepages, DPDK, reactors)
@@ -557,13 +668,13 @@ impl SpdkEnv {
 
         // Phase 2: Attach NVMe-oF controllers and discover bdevs
         let mut all_bdevs = Vec::new();
-        for (i, target) in self.conf.targets.iter().enumerate() {
-            match self.attach_controller(target) {
+        for (i, subsystem) in self.conf.subsystems.iter().enumerate() {
+            match self.attach_controllers(subsystem) {
                 Ok(bdevs) => {
                     info!(
-                        "Target[{}] {}: discovered {} bdev(s): [{}]",
+                        "Subsystem[{}] {}: discovered {} bdev(s): [{}]",
                         i,
-                        target.endpoint(),
+                        subsystem.endpoint(),
                         bdevs.len(),
                         bdevs
                             .iter()
@@ -574,8 +685,13 @@ impl SpdkEnv {
                     all_bdevs.extend(bdevs);
                 }
                 Err(e) => {
-                    error!("Target[{}] {} attach failed: {}", i, target.endpoint(), e);
-                    // Continue to next target — partial success is acceptable
+                    error!(
+                        "Subsystem[{}] {} attach failed: {}",
+                        i,
+                        subsystem.endpoint(),
+                        e
+                    );
+                    // Continue to next subsystem — partial success is acceptable
                 }
             }
         }
@@ -585,23 +701,50 @@ impl SpdkEnv {
             self.env_fini();
             return err_box!(
                 "SpdkEnv::init() failed: no bdevs discovered from {} target(s)",
-                self.conf.targets.len()
+                self.conf.subsystems.len()
             );
         }
 
+        // Build bdev_groups
+        let mut bdev_groups: HashMap<(String, u32), Vec<usize>> = HashMap::new();
+        for (idx, bdev) in all_bdevs.iter().enumerate() {
+            // Extract subnqn from target_endpoint (format: trtype://traddr:trsvcid/subnqn)
+            if let Some(subnqn) = bdev.target_endpoint.split('/').nth(3) {
+                let key = (subnqn.to_string(), bdev.nsid);
+                bdev_groups.entry(key).or_default().push(idx);
+            }
+        }
+
         info!(
-            "SPDK env initialized: {} bdev(s) from {} target(s)",
+            "SPDK env initialized: {} bdev(s) from {} target(s), {} controller group(s)",
             all_bdevs.len(),
-            self.conf.targets.len()
+            self.conf.subsystems.len(),
+            bdev_groups.len()
         );
 
         self.bdevs = all_bdevs;
+        self.bdev_groups = bdev_groups;
 
-        // Start the dedicated I/O poller thread
+        // Start pollers: 1 poller per controller (1:1 mapping)
         {
-            let poller = SpdkPoller::start(self.conf.poll_interval_ms);
-            *self.poller.lock().unwrap() = Some(poller);
-            info!("SPDK poller thread started");
+            let mut pollers = self.pollers.lock().unwrap();
+            for bdev in &self.bdevs {
+                let ctrlr_idx = bdev.ctrlr_idx as usize;
+                if !pollers.contains_key(&ctrlr_idx) {
+                    info!(
+                        "Starting poller {} for controller {} (bdev={})",
+                        ctrlr_idx, bdev.ctrlr_idx, bdev.name
+                    );
+                    pollers.insert(
+                        ctrlr_idx,
+                        SpdkPoller::start(ctrlr_idx, self.conf.poll_interval_ms),
+                    );
+                }
+            }
+            info!(
+                "SPDK pollers started: {} poller(s) (1:1 with controllers)",
+                pollers.len()
+            );
         }
 
         self.state
@@ -653,12 +796,13 @@ impl SpdkEnv {
                     count,
                     Self::SHUTDOWN_DRAIN_TIMEOUT.as_secs()
                 );
-                // Stop the poller thread (safe — pending I/Os will get channel-closed errors)
+                // Stop pollers (safe — pending I/Os will get channel-closed errors)
                 // but do NOT detach controllers or call env_fini.
-                if let Some(mut poller) = self.poller.lock().unwrap().take() {
-                    poller.stop();
-                    info!("SPDK poller thread stopped (timeout path)");
+                let mut pollers = self.pollers.lock().unwrap();
+                for (id, poller) in pollers.drain() {
+                    info!("Stopping poller {} (timeout path)", id);
                 }
+                info!("SPDK pollers stopped (timeout path)");
                 return;
             }
             if !logged {
@@ -671,10 +815,13 @@ impl SpdkEnv {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        // Stop poller before draining qpairs (no in-flight I/Os).
-        if let Some(mut poller) = self.poller.lock().unwrap().take() {
-            poller.stop();
-            info!("SPDK poller thread stopped");
+        // Stop pollers before draining qpairs (no in-flight I/Os).
+        {
+            let mut pollers = self.pollers.lock().unwrap();
+            for (id, poller) in pollers.drain() {
+                info!("Stopping poller {}", id);
+            }
+            info!("SPDK pollers stopped");
         }
 
         self.qpair_pool.drain_all();
@@ -699,9 +846,9 @@ impl SpdkEnv {
         &self.conf
     }
 
-    /// Number of configured targets.
-    pub fn target_count(&self) -> usize {
-        self.conf.targets.len()
+    /// Number of configured subsystems.
+    pub fn subsystem_count(&self) -> usize {
+        self.conf.subsystems.len()
     }
 
     /// Names of all discovered bdevs.
@@ -717,6 +864,53 @@ impl SpdkEnv {
     /// Look up a bdev by name.
     pub fn get_bdev(&self, name: &str) -> Option<&BdevInfo> {
         self.bdevs.iter().find(|b| b.name == name)
+    }
+
+    /// Look up a bdev by subsystem NQN and namespace ID.
+    /// Uses controller selection strategy to pick among multiple controllers.
+    /// Returns None if not found.
+    pub fn get_bdev_by_nsid(&self, subnqn: &str, nsid: u32) -> Option<&BdevInfo> {
+        let key = (subnqn.to_string(), nsid);
+        let indices = self.bdev_groups.get(&key)?;
+
+        if indices.is_empty() {
+            return None;
+        }
+
+        let selected_idx = match &mut *self.controller_selection.lock().unwrap() {
+            ControllerSelectionStrategy::First => 0,
+            ControllerSelectionStrategy::RoundRobin(rr) => rr.select(&key, indices.len()),
+            ControllerSelectionStrategy::Random(rnd) => rnd.select(indices.len()),
+        };
+
+        let idx = indices[selected_idx % indices.len()];
+        Some(&self.bdevs[idx])
+    }
+
+    /// Validate that all expected namespaces (from worker data_dir config) are present.
+    /// Called after init() to detect namespace mismatches.
+    /// Returns error listing missing (subnqn, nsid) pairs.
+    pub fn validate_namespaces(&self, expected: &[(String, u32)]) -> CommonResult<()> {
+        let mut missing = Vec::new();
+        for (subnqn, nsid) in expected {
+            if self.get_bdev_by_nsid(subnqn, *nsid).is_none() {
+                missing.push(format!("{}:{}", subnqn, nsid));
+            }
+        }
+        if !missing.is_empty() {
+            return err_box!(
+                "SpdkEnv: namespaces not found: [{}]. \
+                 Verify SPDK target namespaces match datadir config. \
+                 Discovered bdevs: [{}]",
+                missing.join(", "),
+                self.bdevs
+                    .iter()
+                    .map(|b| format!("{}:{}", b.target_endpoint, b.nsid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Ok(())
     }
 
     /// Total capacity across all bdevs, in bytes.
@@ -736,26 +930,6 @@ impl SpdkEnv {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         pool.values().map(|v| v.len()).sum()
-    }
-
-    /// Get sender channel for poller thread (for SpdkIoChannel).
-    pub fn poller_sender(&self) -> crossbeam::channel::Sender<IoRequest> {
-        self.poller
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("SpdkPoller not started — was init() called?")
-            .sender()
-    }
-
-    /// Get eventfd for waking poller on new I/O
-    pub fn poller_eventfd(&self) -> std::sync::Arc<EventFd> {
-        self.poller
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("SpdkPoller not started — was init() called?")
-            .eventfd_arc()
     }
 
     // Handle tracking, which is used by SpdkBdev open/drop
@@ -794,14 +968,37 @@ impl SpdkEnv {
         self.qpair_pool.release(ctrlr, qpair);
     }
 
+    /// Get the poller for a given controller index.
+    pub fn get_poller(
+        &self,
+        ctrlr_idx: usize,
+    ) -> (
+        crossbeam::channel::Sender<crate::io::spdk_poller::IoRequest>,
+        Arc<EventFd>,
+        usize,
+    ) {
+        let pollers = self.pollers.lock().unwrap();
+        let poller = pollers.get(&ctrlr_idx).unwrap_or_else(|| {
+            panic!(
+                "Poller for ctrlr_idx {} not found. Was init() called?",
+                ctrlr_idx
+            );
+        });
+        (poller.sender(), poller.eventfd(), ctrlr_idx)
+    }
+
     /// Unregister qpair from poller, blocking until removed to prevent UAF.
     /// Returns false if poller didn't ack within timeout (likely stuck/dead).
-    pub fn unregister_qpair_from_poller(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
-        let poller = self.poller.lock().unwrap();
-        if let Some(poller) = poller.as_ref() {
+    pub fn unregister_qpair_from_poller(
+        &self,
+        ctrlr_idx: usize,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) -> bool {
+        let pollers = self.pollers.lock().unwrap();
+        if let Some(poller) = pollers.get(&ctrlr_idx) {
             poller.unregister_qpair(qpair)
         } else {
-            false
+            false // Poller not started
         }
     }
 
@@ -857,28 +1054,50 @@ impl SpdkEnv {
         Ok(())
     }
 
-    fn attach_controller(&self, target: &NvmeTarget) -> CommonResult<Vec<BdevInfo>> {
+    fn attach_controllers(&self, subsystem: &NvmeSubsystem) -> CommonResult<Vec<BdevInfo>> {
+        let mut all_bdevs = Vec::new();
+
+        for ctrlr_idx in 0..subsystem.controller_count {
+            info!(
+                "Attaching controller {}/{} for subsystem {}",
+                ctrlr_idx + 1,
+                subsystem.controller_count,
+                subsystem.endpoint()
+            );
+
+            let bdevs = self.attach_single_controller(subsystem, ctrlr_idx)?;
+            all_bdevs.extend(bdevs);
+        }
+
+        Ok(all_bdevs)
+    }
+
+    /// Attach a single controller to a subsystem.
+    fn attach_single_controller(
+        &self,
+        subsystem: &NvmeSubsystem,
+        ctrlr_idx: u32,
+    ) -> CommonResult<Vec<BdevInfo>> {
         use std::ffi::CString;
-        info!("Attaching NVMe-oF controller: {}", target.endpoint());
-        let traddr = CString::new(target.traddr.as_str())
+        let traddr = CString::new(subsystem.traddr.as_str())
             .map_err(|e| err_msg!(format!("invalid traddr: {}", e)))?;
-        let trsvcid = CString::new(target.trsvcid.to_string())
+        let trsvcid = CString::new(subsystem.trsvcid.to_string())
             .map_err(|e| err_msg!(format!("invalid trsvcid: {}", e)))?;
-        let subnqn = CString::new(target.subnqn.as_str())
+        let subnqn = CString::new(subsystem.subnqn.as_str())
             .map_err(|e| err_msg!(format!("invalid subnqn: {}", e)))?;
-        let trtype = match target.trtype.to_lowercase().as_str() {
+        let trtype = match subsystem.trtype.to_lowercase().as_str() {
             "rdma" => spdk_ffi::SPDK_NVME_TRANSPORT_RDMA,
             "tcp" => spdk_ffi::SPDK_NVME_TRANSPORT_TCP,
-            _ => return err_box!("unsupported transport type: {}", target.trtype),
+            _ => return err_box!("unsupported transport type: {}", subsystem.trtype),
         };
-        let adrfam = match target.adrfam.to_lowercase().as_str() {
+        let adrfam = match subsystem.adrfam.to_lowercase().as_str() {
             "ipv4" => spdk_ffi::SPDK_NVMF_ADRFAM_IPV4,
             "ipv6" => spdk_ffi::SPDK_NVMF_ADRFAM_IPV6,
-            _ => return err_box!("unsupported address family: {}", target.adrfam),
+            _ => return err_box!("unsupported address family: {}", subsystem.adrfam),
         };
+
         unsafe {
             // Verify our opaque buffers are large enough for the installed SPDK version.
-            // Same pattern as env_init() for spdk_env_opts.
             let trid_real = spdk_ffi::curvine_spdk_trid_sizeof();
             let trid_buf = std::mem::size_of::<spdk_ffi::spdk_nvme_transport_id>();
             if trid_real > trid_buf {
@@ -897,6 +1116,7 @@ impl SpdkEnv {
                     opts_buf
                 );
             }
+
             // Build transport ID via C helpers
             let mut trid: spdk_ffi::spdk_nvme_transport_id = std::mem::zeroed();
             spdk_ffi::curvine_spdk_trid_set_trtype(&mut trid, trtype);
@@ -904,28 +1124,35 @@ impl SpdkEnv {
             spdk_ffi::curvine_spdk_trid_set_traddr(&mut trid, traddr.as_ptr());
             spdk_ffi::curvine_spdk_trid_set_trsvcid(&mut trid, trsvcid.as_ptr());
             spdk_ffi::curvine_spdk_trid_set_subnqn(&mut trid, subnqn.as_ptr());
+
             // Build controller opts via C helpers
             let mut opts: spdk_ffi::spdk_nvme_ctrlr_opts = std::mem::zeroed();
             spdk_ffi::curvine_spdk_ctrlr_get_default_opts(&mut opts);
-            if target.io_queues > 0 {
-                spdk_ffi::curvine_spdk_ctrlr_opts_set_num_io_queues(&mut opts, target.io_queues);
+            if subsystem.io_queues > 0 {
+                spdk_ffi::curvine_spdk_ctrlr_opts_set_num_io_queues(&mut opts, subsystem.io_queues);
             }
-            if target.keep_alive_timeout_ms > 0 {
+            if subsystem.keep_alive_timeout_ms > 0 {
                 spdk_ffi::curvine_spdk_ctrlr_opts_set_keep_alive_timeout_ms(
                     &mut opts,
-                    target.keep_alive_timeout_ms as u32,
+                    subsystem.keep_alive_timeout_ms as u32,
                 );
             }
-            if !target.hostnqn.is_empty() {
-                let hostnqn = CString::new(target.hostnqn.as_str())
+            if !subsystem.hostnqn.is_empty() {
+                let hostnqn = CString::new(subsystem.hostnqn.as_str())
                     .map_err(|e| err_msg!(format!("invalid hostnqn: {}", e)))?;
                 spdk_ffi::curvine_spdk_ctrlr_opts_set_hostnqn(&mut opts, hostnqn.as_ptr());
             }
+
             // Connect
             let ctrlr = spdk_ffi::curvine_spdk_nvme_connect(&mut trid, &mut opts);
             if ctrlr.is_null() {
-                return err_box!("spdk_nvme_connect failed for target {}", target.endpoint());
+                return err_box!(
+                    "spdk_nvme_connect failed for {} (controller {})",
+                    subsystem.endpoint(),
+                    ctrlr_idx
+                );
             }
+
             // Enumerate active namespaces
             let num_ns = spdk_ffi::spdk_nvme_ctrlr_get_num_ns(ctrlr);
             let mut bdevs = Vec::new();
@@ -940,28 +1167,35 @@ impl SpdkEnv {
                 let sector_size = spdk_ffi::spdk_nvme_ns_get_sector_size(ns);
                 let num_sectors = spdk_ffi::spdk_nvme_ns_get_num_sectors(ns);
                 let size_bytes = sector_size as u64 * num_sectors;
-                let name = format!("NVMe_{}_{}_n{}", target.traddr, target.trsvcid, nsid);
+                let name = format!(
+                    "NVMe_{}_{}_c{}_n{}",
+                    subsystem.traddr, subsystem.trsvcid, ctrlr_idx, nsid
+                );
                 info!(
-                    "  Discovered ns {}: size={}B, sector_size={}, sectors={}",
-                    nsid, size_bytes, sector_size, num_sectors
+                    "  Discovered ns {} on controller {}: size={}B, sector_size={}, sectors={}",
+                    nsid, ctrlr_idx, size_bytes, sector_size, num_sectors
                 );
                 bdevs.push(BdevInfo {
                     name,
                     size_bytes,
                     block_size: sector_size,
                     num_blocks: num_sectors,
-                    target_endpoint: target.endpoint(),
+                    target_endpoint: subsystem.endpoint(),
                     ctrlr: ctrlr as usize,
                     ns: ns as usize,
+                    nsid,
+                    ctrlr_idx,
                 });
             }
+
             if bdevs.is_empty() {
                 warn!(
                     "Controller {} has no active namespaces, detaching controller",
-                    target.endpoint()
+                    subsystem.endpoint()
                 );
-                unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
+                spdk_ffi::spdk_nvme_detach(ctrlr);
             }
+
             Ok(bdevs)
         }
     }
@@ -1001,9 +1235,9 @@ impl Display for SpdkEnv {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SpdkEnv(state={:?}, targets={}, bdevs={}, capacity={})",
+            "SpdkEnv(state={:?}, subsystems={}, bdevs={}, capacity={})",
             self.state(),
-            self.conf.targets.len(),
+            self.conf.subsystems.len(),
             self.bdevs.len(),
             self.total_capacity()
         )

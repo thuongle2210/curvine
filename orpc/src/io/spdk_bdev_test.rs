@@ -1,10 +1,18 @@
 use crate::common::Utils;
 use crate::io::block_io::BlockIO;
 use crate::io::spdk_bdev::SpdkBdev;
-use crate::io::spdk_env::{NvmeTarget, SpdkConf, SpdkEnv, SpdkEnvState};
+use crate::io::spdk_env::{
+    ControllerSelectionStrategy, NvmeSubsystem, RandomController, RoundRobinController, SpdkConf,
+    SpdkEnv, SpdkEnvState,
+};
 use crate::sys::DataSlice;
 use bytes::BytesMut;
 use std::sync::Once;
+
+/// Typical NVMe block size for alignment
+const BLOCK_SIZE: usize = 512;
+/// I/O pattern size (4K page)
+const IO_SIZE: usize = 4096;
 
 static INIT: Once = Once::new();
 
@@ -24,11 +32,16 @@ fn test_spdk_conf() -> SpdkConf {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4420);
-    let subnqn =
-        std::env::var("SPDK_TARGET_NQN").unwrap_or("nqn.2024-01.io.curvine:test".to_string());
+    let subnqn = std::env::var("SPDK_SUBNQN").unwrap_or("nqn.2024-01.io.curvine:test".to_string());
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or("tcp".to_string());
+    let controller_count = std::env::var("SPDK_CONTROLLER_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let controller_selection =
+        std::env::var("SPDK_CONTROLLER_SELECTION").unwrap_or("First".to_string());
 
-    SpdkConf {
+    let mut conf = SpdkConf {
         enabled: true,
         app_name: "curvine-test".to_string(),
         hugepage_mb: std::env::var("SPDK_HUGEPAGE_MB")
@@ -36,17 +49,22 @@ fn test_spdk_conf() -> SpdkConf {
             .and_then(|v| v.parse().ok())
             .unwrap_or(256),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
-
-        targets: vec![NvmeTarget {
+        controller_selection_str: controller_selection,
+        controller_selection: ControllerSelectionStrategy::First,
+        subsystems: vec![NvmeSubsystem {
             traddr,
             trsvcid,
             subnqn,
             trtype,
             adrfam: "ipv4".to_string(),
+            controller_count,
             ..Default::default()
         }],
         ..Default::default()
-    }
+    };
+    // Parse computed fields
+    conf.init().expect("Failed to init SpdkConf");
+    conf
 }
 
 fn first_bdev_name() -> String {
@@ -71,6 +89,10 @@ fn spdk_full_lifecycle() {
     assert!(env.is_initialized());
     assert!(!env.bdev_names().is_empty());
     println!("Discovered bdevs: {:?}", env.bdev_names());
+    println!(
+        "Controller selection: {:?}",
+        env.conf().controller_selection.name()
+    );
     let bdev_name = first_bdev_name();
 
     // Phase 2: open for write
@@ -92,7 +114,7 @@ fn spdk_full_lifecycle() {
 
     // Phase 4: open with offset
     {
-        let offset = 4096u64;
+        let offset = IO_SIZE as u64;
         let bdev = SpdkBdev::open_read(&bdev_name, offset, 0).expect("open with offset");
         assert_eq!(bdev.pos(), offset as i64);
         println!("pass open file with offset test");
@@ -101,7 +123,7 @@ fn spdk_full_lifecycle() {
     // Phase 5: write/read roundtrip
     {
         let test_data = b"Hello SPDK over NVMe-oF/RDMA!";
-        let aligned_len = ((test_data.len() + 511) / 512) * 512;
+        let aligned_len = ((test_data.len() + (BLOCK_SIZE - 1)) / BLOCK_SIZE) * BLOCK_SIZE;
         let mut write_buf = vec![0u8; aligned_len];
         write_buf[..test_data.len()].copy_from_slice(test_data);
         zero_region(&bdev_name, 0, aligned_len);
@@ -120,43 +142,45 @@ fn spdk_full_lifecycle() {
 
     // Phase 6: write_region/read_region
     {
-        let block_size = 512;
-        let data = Utils::rand_str(block_size);
+        let data = Utils::rand_str(BLOCK_SIZE);
         let region = DataSlice::buffer(BytesMut::from(data.as_bytes()));
 
         let mut bdev = SpdkBdev::open_write(&bdev_name, 0, 0).unwrap();
         bdev.write_region(&region).unwrap();
         bdev.flush().unwrap();
-        assert_eq!(bdev.pos(), block_size as i64);
+        assert_eq!(bdev.pos(), BLOCK_SIZE as i64);
         bdev.seek(0).unwrap();
-        let result = bdev.read_region(false, block_size as i32).unwrap();
-        assert_eq!(result.len(), block_size);
+        let result = bdev.read_region(false, BLOCK_SIZE as i32).unwrap();
+        assert_eq!(result.len(), BLOCK_SIZE);
         assert_eq!(result.as_slice(), data.as_bytes());
         println!("pass write_region/read_region test");
     }
 
-    // Phase 7: concurrent I/O through poller
+    // Phase 7: concurrent I/O through poller (multi-controller)
     {
         use std::sync::{Arc, Barrier};
 
         let num_threads = 8;
         let barrier = Arc::new(Barrier::new(num_threads));
-        let aligned_len = 4096usize;
 
+        // Test that multiple threads can write/read concurrently
+        // With First: always use first controller
+        // With RoundRobin: cycle through controllers
+        // With Random: random controller selection
         let handles: Vec<_> = (0..num_threads)
             .map(|i| {
                 let name = bdev_name.clone();
                 let b = barrier.clone();
                 std::thread::spawn(move || {
-                    let offset = (i * aligned_len * 2) as i64;
+                    let offset = (i * IO_SIZE * 2) as i64;
                     let mut bdev = SpdkBdev::open_write(&name, offset, 0).unwrap();
-                    let pattern = vec![(i as u8).wrapping_add(0x41); aligned_len];
+                    let pattern = vec![(i as u8).wrapping_add(0x41); IO_SIZE];
 
                     b.wait();
                     bdev.write_all(&pattern).unwrap();
                     bdev.flush().unwrap();
                     bdev.seek(offset).unwrap();
-                    let mut read_buf = vec![0u8; aligned_len];
+                    let mut read_buf = vec![0u8; IO_SIZE];
                     bdev.read_all(&mut read_buf).unwrap();
                     assert_eq!(read_buf, pattern, "Thread {} data corruption", i);
                 })
@@ -166,7 +190,10 @@ fn spdk_full_lifecycle() {
         for h in handles {
             h.join().expect("Concurrent poller I/O thread panicked");
         }
-        println!("pass concurrent poller I/O test (8 threads)");
+        println!(
+            "pass concurrent I/O test (8 threads, controller selection: {:?})",
+            env.conf().controller_selection.name()
+        );
     }
 
     // Phase 8: shutdown (must be last — destructive)

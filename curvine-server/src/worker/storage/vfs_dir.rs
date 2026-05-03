@@ -72,7 +72,7 @@ impl VfsDir {
             LocalFile::write_toml(ver_file.as_path(), &version)?;
         }
 
-        // SPDK: resolve bdev name from global SpdkEnv (one bdev per data_dir)
+        // SPDK: resolve bdev using explicit SUBNQN+NSID binding from config
         #[cfg(feature = "spdk")]
         let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
             use orpc::io::spdk_env::SpdkEnv;
@@ -82,22 +82,41 @@ impl VfsDir {
                     conf.path
                 )
             })?;
-            let names = env.bdev_names();
-            if names.is_empty() {
-                return orpc::err_box!(
-                    "StorageType::SpdkDisk dir '{}' but no bdevs discovered from SPDK targets",
+
+            // Require explicit SUBNQN+NSID from config
+            let subnqn = conf.subnqn.as_ref().ok_or_else(|| {
+                orpc::err_msg!(
+                    "SPDK dir '{}' missing SUBNQN in prefix. Use format: [SPDK_DISK:SIZE|SUBNQN|NSID]/path",
                     conf.path
-                );
+                )
+            })?;
+            let nsid = conf.nsid.ok_or_else(|| {
+                orpc::err_msg!(
+                    "SPDK dir '{}' missing NSID in prefix. Use format: [SPDK_DISK:SIZE|SUBNQN|NSID]/path",
+                    conf.path
+                )
+            })?;
+
+            let bdev_info = env.get_bdev_by_nsid(subnqn, nsid);
+            match bdev_info {
+                Some(bdev) => {
+                    info!(
+                        "SPDK dir '{}' (dir_id={}) bound to subnqn='{}', nsid={}, bdev='{}' (capacity={})",
+                        conf.path, version.dir_id, subnqn, nsid, bdev.name, bdev.size_bytes
+                    );
+                    Some((bdev.name.clone(), bdev.size_bytes as i64))
+                }
+                None => {
+                    return orpc::err_box!(
+                        "SPDK dir '{}': no bdev found for subnqn='{}', nsid={}. \
+                         Verify that:\n\
+                         1. The namespace exists on the target subsystem\n\
+                         2. The datadir prefix uses correct format: [SPDK_DISK:SIZE|SUBNQN|NSID]/path\n\
+                         3. The SPDK target is accessible and initialized",
+                        conf.path, subnqn, nsid
+                    );
+                }
             }
-            let idx = version.dir_id as usize % names.len();
-            let name = names[idx].clone();
-            let bdev_info = env.get_bdev(&name);
-            let bdev_cap = bdev_info.map(|b| b.size_bytes as i64).unwrap_or(0);
-            info!(
-                "SPDK dir '{}' (dir_id={}) mapped to bdev '{}' (capacity={})",
-                conf.path, version.dir_id, name, bdev_cap
-            );
-            Some((name, bdev_cap))
         } else {
             None
         };

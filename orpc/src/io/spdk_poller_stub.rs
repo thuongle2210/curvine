@@ -1,16 +1,21 @@
+use nix::sys::eventfd;
 use std::sync::Arc;
-
 pub struct SpdkPoller {
     _p: std::marker::PhantomData<*const ()>,
 }
 impl SpdkPoller {
-    pub fn start() -> Self {
+    pub fn start(_ctrlr_id: usize, _poll_interval_ms: u64) -> Self {
         Self {
             _p: std::marker::PhantomData,
         }
     }
     pub fn sender(&self) -> crossbeam::channel::Sender<IoRequest> {
         crossbeam::channel::unbounded().0
+    }
+    pub fn eventfd(&self) -> Arc<eventfd::EventFd> {
+        Arc::new(
+            eventfd::EventFd::from_value_and_flags(0, eventfd::EfdFlags::EFD_NONBLOCK).unwrap(),
+        )
     }
     pub fn stop(&mut self) {}
 }

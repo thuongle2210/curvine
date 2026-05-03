@@ -10,7 +10,7 @@ use curvine_common::utils::ProtoUtils;
 use curvine_server::worker::Worker;
 use orpc::common::Utils;
 use orpc::io::net::NetUtils;
-use orpc::io::{NvmeTarget, SpdkConf};
+use orpc::io::{NvmeSubsystem, SpdkConf};
 use orpc::message::{Builder, RequestStatus};
 use orpc::sys::DataSlice::Buffer;
 use orpc::CommonResult;
@@ -39,7 +39,7 @@ fn get_worker() -> &'static ClusterConf {
             .unwrap()
             .parse()
             .expect("SPDK_TARGET_PORT must be a valid u16");
-        let subnqn = std::env::var("SPDK_TARGET_NQN").unwrap();
+        let subnqn = std::env::var("SPDK_SUBNQN").unwrap();
         let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
 
         let hugepage_mb: u32 = std::env::var("SPDK_HUGEPAGE_MB")
@@ -53,7 +53,7 @@ fn get_worker() -> &'static ClusterConf {
             hugepage_str: format!("{}MB", hugepage_mb),
             hugepage_mb,
             reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or_else(|_| "0x2".to_string()),
-            targets: vec![NvmeTarget {
+            subsystems: vec![NvmeSubsystem {
                 traddr,
                 trsvcid,
                 subnqn,

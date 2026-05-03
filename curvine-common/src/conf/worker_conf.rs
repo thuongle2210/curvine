@@ -18,7 +18,7 @@ use crate::conf::ClusterConf;
 use crate::state::StorageType;
 use orpc::common::{ByteUnit, DurationUnit, FileUtils, LogConf, Utils};
 use orpc::io::SpdkConf;
-use orpc::{err_box, CommonResult};
+use orpc::{err_box, err_msg, CommonResult};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Default, Deserialize, PartialEq)]
@@ -27,6 +27,9 @@ pub struct WorkerDataDir {
     pub storage_type: StorageType,
     pub capacity: u64,
     pub path: String,
+    // SPDK-specific: explicit namespace binding
+    pub subnqn: Option<String>,
+    pub nsid: Option<u32>,
 }
 
 impl WorkerDataDir {
@@ -36,6 +39,8 @@ impl WorkerDataDir {
             storage_type,
             capacity,
             path,
+            subnqn: None,
+            nsid: None,
         }
     }
 
@@ -57,7 +62,7 @@ impl WorkerDataDir {
     }
 
     pub fn from_str(str: &str) -> CommonResult<Self> {
-        let re = Regex::new(r"^\[([\w:]*)\](.+)$")?;
+        let re = Regex::new(r"^\[([^\]]*)\](.+)$")?;
         let caps = match re.captures(str) {
             None => return Ok(Self::with_path(str)),
             Some(v) => v,
@@ -65,12 +70,18 @@ impl WorkerDataDir {
 
         let prefix = caps.get(1).map_or("", |m| m.as_str());
         let path = caps.get(2).map_or("", |m| m.as_str());
-        let arr = prefix.split(":").collect::<Vec<&str>>();
 
-        if prefix.is_empty() || arr.is_empty() {
-            // /dir
+        if prefix.is_empty() {
             return Ok(Self::with_path(str));
         };
+
+        // Check for SPDK format with pipe delimiter: [SPDK_DISK:SIZE|SUBNQN|NSID]
+        if prefix.contains('|') {
+            return Self::parse_spdk_prefix(prefix, path, str);
+        }
+
+        // Non-SPDK format: [TYPE:SIZE] or [TYPE] or [SIZE]
+        let arr: Vec<&str> = prefix.split(':').collect();
 
         let (stg_type, capacity) = if arr.len() == 1 {
             if Self::is_valid_storage_type(arr[0]) {
@@ -92,6 +103,58 @@ impl WorkerDataDir {
             ByteUnit::from_str(capacity)?.as_byte(),
             path,
         ))
+    }
+
+    /// Parse SPDK prefix format: [SPDK_DISK:SIZE|SUBNQN|NSID] or [SPDK_DISK|SUBNQN|NSID]
+    fn parse_spdk_prefix(prefix: &str, path: &str, full_str: &str) -> CommonResult<Self> {
+        let parts: Vec<&str> = prefix.split('|').collect();
+        if parts.len() != 3 {
+            return err_box!(
+                "SPDK prefix must be [SPDK_DISK:SIZE|SUBNQN|NSID] or [SPDK_DISK|SUBNQN|NSID], got '{}' in '{}'",
+                prefix,
+                full_str
+            );
+        }
+
+        let type_size = parts[0];
+        let subnqn = parts[1];
+        let nsid_str = parts[2];
+
+        // Validate SUBNQN is not empty
+        if subnqn.is_empty() {
+            return err_box!("SPDK prefix missing SUBNQN in '{}'", full_str);
+        }
+
+        // Validate NSID is not empty
+        if nsid_str.is_empty() {
+            return err_box!("SPDK prefix missing NSID in '{}'", full_str);
+        }
+
+        // Parse TYPE:SIZE (SIZE is optional)
+        let type_size_arr: Vec<&str> = type_size.split(':').collect();
+        let (stg_type, capacity_str) = match type_size_arr.len() {
+            1 => (type_size_arr[0], "0"), // No size: [SPDK_DISK|SUBNQN|NSID]
+            2 => (type_size_arr[0], type_size_arr[1]), // With size: [SPDK_DISK:10GB|SUBNQN|NSID]
+            _ => {
+                return err_box!(
+                    "SPDK prefix TYPE:SIZE part invalid: '{}' in '{}'",
+                    type_size,
+                    full_str
+                );
+            }
+        };
+
+        let nsid = nsid_str
+            .parse::<u32>()
+            .map_err(|_| err_msg!("Invalid NSID '{}' in SPDK prefix '{}'", nsid_str, full_str))?;
+
+        Ok(Self {
+            storage_type: Self::parse_stg_type(stg_type),
+            capacity: ByteUnit::from_str(capacity_str)?.as_byte(),
+            path: FileUtils::absolute_path_string(path).unwrap(),
+            subnqn: Some(subnqn.to_string()),
+            nsid: Some(nsid),
+        })
     }
 
     pub fn storage_path<T: AsRef<str>>(&self, cluster_id: T) -> String {
