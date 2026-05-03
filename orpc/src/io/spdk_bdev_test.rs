@@ -1,14 +1,11 @@
 use crate::common::Utils;
 use crate::io::block_io::BlockIO;
 use crate::io::spdk_bdev::SpdkBdev;
-<<<<<<< HEAD
 use crate::io::spdk_env::{
     ControllerSelectionStrategy, NvmeSubsystem, RandomController, RoundRobinController, SpdkConf,
     SpdkEnv, SpdkEnvState,
 };
-=======
 use crate::io::spdk_env::{NvmeSubsystem, SpdkConf, SpdkEnv, SpdkEnvState};
->>>>>>> feat/support-mapping-data-dir-with-namespace
 use crate::sys::DataSlice;
 use bytes::BytesMut;
 use std::sync::Once;
@@ -53,12 +50,8 @@ fn test_spdk_conf() -> SpdkConf {
             .and_then(|v| v.parse().ok())
             .unwrap_or(256),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
-<<<<<<< HEAD
         controller_selection_str: controller_selection,
         controller_selection: ControllerSelectionStrategy::First,
-=======
-
->>>>>>> feat/support-mapping-data-dir-with-namespace
         subsystems: vec![NvmeSubsystem {
             traddr,
             trsvcid,
@@ -164,17 +157,14 @@ fn spdk_full_lifecycle() {
         println!("pass write_region/read_region test");
     }
 
-    // Phase 7: concurrent I/O through poller (multi-controller)
+    // Phase 7: concurrent I/O through poller
     {
         use std::sync::{Arc, Barrier};
 
         let num_threads = 8;
         let barrier = Arc::new(Barrier::new(num_threads));
+        let aligned_len = 4096usize;
 
-        // Test that multiple threads can write/read concurrently
-        // With First: always use first controller
-        // With RoundRobin: cycle through controllers
-        // With Random: random controller selection
         let handles: Vec<_> = (0..num_threads)
             .map(|i| {
                 let name = bdev_name.clone();
@@ -199,7 +189,7 @@ fn spdk_full_lifecycle() {
             h.join().expect("Concurrent poller I/O thread panicked");
         }
         println!(
-            "pass concurrent I/O test (8 threads, controller selection: {:?})",
+            "pass concurrent poller I/O test (8 threads, strategy: {:?})",
             env.conf().controller_selection.name()
         );
     }
