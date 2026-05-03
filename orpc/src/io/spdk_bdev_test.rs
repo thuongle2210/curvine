@@ -1,10 +1,14 @@
 use crate::common::Utils;
 use crate::io::block_io::BlockIO;
 use crate::io::spdk_bdev::SpdkBdev;
+<<<<<<< HEAD
 use crate::io::spdk_env::{
     ControllerSelectionStrategy, NvmeSubsystem, RandomController, RoundRobinController, SpdkConf,
     SpdkEnv, SpdkEnvState,
 };
+=======
+use crate::io::spdk_env::{NvmeSubsystem, SpdkConf, SpdkEnv, SpdkEnvState};
+>>>>>>> feat/support-mapping-data-dir-with-namespace
 use crate::sys::DataSlice;
 use bytes::BytesMut;
 use std::sync::Once;
@@ -49,8 +53,12 @@ fn test_spdk_conf() -> SpdkConf {
             .and_then(|v| v.parse().ok())
             .unwrap_or(256),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
+<<<<<<< HEAD
         controller_selection_str: controller_selection,
         controller_selection: ControllerSelectionStrategy::First,
+=======
+
+>>>>>>> feat/support-mapping-data-dir-with-namespace
         subsystems: vec![NvmeSubsystem {
             traddr,
             trsvcid,

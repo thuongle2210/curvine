@@ -62,6 +62,8 @@ pub struct SpdkConf {
     pub shm_id: i32,
     #[serde(default)]
     pub subsystems: Vec<NvmeSubsystem>,
+    #[serde(default)]
+    pub subsystems: Vec<NvmeSubsystem>,
     pub io_queue_depth: u32,
     pub io_queue_requests: u32,
     #[serde(alias = "io_timeout", default)]

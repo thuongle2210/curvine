@@ -36,7 +36,7 @@ pub use spdk_env::{
 };
 
 #[cfg(not(feature = "spdk"))]
-pub mod spdk_stub;
+mod spdk_stub;
 
 #[cfg(not(feature = "spdk"))]
 pub use spdk_stub::{BdevInfo, NvmeSubsystem, SpdkConf};

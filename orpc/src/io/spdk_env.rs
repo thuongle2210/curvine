@@ -214,6 +214,7 @@ impl Display for SpdkEnvState {
 }
 
 /// NVMe subsystem (remote NVMe-oF subsystem identified by subnqn)
+/// NVMe subsystem (remote NVMe-oF subsystem identified by subnqn)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct NvmeSubsystem {
