@@ -30,8 +30,9 @@ dir_reserved = "0"
 
 data_dir = [
     "[DISK]testing/data",
-    "[SPDK_DISK|nqn.2024-01.io.curvine:subsystem1|1]/mnt/nvme1/data",
-    "[SPDK_DISK:10GB|nqn.2024-01.io.curvine:subsystem2|1]/mnt/nvme2/data",
+    "[SPDK_DISK:10GB|nqn.2024-01.com.curvine:test|1]/mnt/nvme1/data",
+    "[SPDK_DISK:10GB|nqn.2024-01.com.curvine:test|2]/mnt/nvme2/data",
+    "[SPDK_DISK:10GB|nqn.2024-01.com.curvine:test|3]/mnt/nvme3/data",
 ]
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
 enable_s3_gateway = false
@@ -62,23 +63,28 @@ block_align = 0
 
 # NVMe-oF subsystems
 [[worker.spdk_disk.subsystems]]
-trtype = "rdma"
+trtype = "tcp"
 adrfam = "ipv4"
-traddr = "192.168.1.100"
+traddr = "127.0.0.1"
 trsvcid = 4420
-subnqn = "nqn.2024-01.io.curvine:subsystem1"
-controller_count = 2
+subnqn = "nqn.2024-01.com.curvine:test"
+controller_count = 3
 hostnqn = ""
 io_queues = 0
 keep_alive_timeout_ms = 0
+namespace_ids = [1, 2, 3]
 
 [[worker.spdk_disk.subsystems]]
-trtype = "rdma"
+trtype = "tcp"
 adrfam = "ipv4"
-traddr = "192.168.1.101"
-trsvcid = 4420
-subnqn = "nqn.2024-01.io.curvine:subsystem2"
-controller_count = 3
+traddr = "127.0.0.1"
+trsvcid = 4421
+subnqn = "nqn.2024-01.com.curvine:test2"
+controller_count = 1
+hostnqn = ""
+io_queues = 0
+keep_alive_timeout_ms = 0
+namespace_ids = [1]
 
 
 # Customer service configuration.

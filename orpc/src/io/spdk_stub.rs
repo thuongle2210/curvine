@@ -8,6 +8,7 @@ pub struct NvmeSubsystem {
     pub trsvcid: u16,
     pub subnqn: String,
     pub controller_count: u32,
+    pub namespace_ids: Vec<u32>,
 }
 
 /// Controller selection strategy stub

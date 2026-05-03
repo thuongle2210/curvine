@@ -227,6 +227,7 @@ pub struct NvmeSubsystem {
     pub io_queues: u32,             // 0 = default
     pub keep_alive_timeout_ms: u64, // 0 = use global
     pub controller_count: u32,      // Number of controllers for this subsystem (default 1)
+    pub namespace_ids: Vec<u32>, // Explicit namespace IDs to use (empty = auto-detect via spdk_nvme_ctrlr_get_num_ns)
 }
 
 impl NvmeSubsystem {
@@ -287,7 +288,8 @@ impl Default for NvmeSubsystem {
             hostnqn: String::new(),
             io_queues: 0,
             keep_alive_timeout_ms: 0,
-            controller_count: 1, // Default: 1 controller per subsystem
+            controller_count: 1,       // Default: 1 controller per subsystem
+            namespace_ids: Vec::new(), // Empty = auto-detect
         }
     }
 }
@@ -1155,14 +1157,29 @@ impl SpdkEnv {
             }
 
             // Enumerate active namespaces
-            let num_ns = spdk_ffi::spdk_nvme_ctrlr_get_num_ns(ctrlr);
+            // Use explicit namespace_ids if configured, otherwise auto-detect via spdk_nvme_ctrlr_get_num_ns
+            let nsids: Vec<u32> = if !subsystem.namespace_ids.is_empty() {
+                subsystem.namespace_ids.clone()
+            } else {
+                let num_ns = spdk_ffi::spdk_nvme_ctrlr_get_num_ns(ctrlr);
+                (1..=num_ns).collect()
+            };
+
             let mut bdevs = Vec::new();
-            for nsid in 1..=num_ns {
+            for nsid in nsids {
                 let ns = spdk_ffi::spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
                 if ns.is_null() {
+                    warn!(
+                        "  Namespace {} not found on controller {}, skipping",
+                        nsid, ctrlr_idx
+                    );
                     continue;
                 }
                 if !spdk_ffi::spdk_nvme_ns_is_active(ns) {
+                    warn!(
+                        "  Namespace {} not active on controller {}, skipping",
+                        nsid, ctrlr_idx
+                    );
                     continue;
                 }
                 let sector_size = spdk_ffi::spdk_nvme_ns_get_sector_size(ns);
