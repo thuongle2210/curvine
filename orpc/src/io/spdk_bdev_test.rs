@@ -5,7 +5,6 @@ use crate::io::spdk_env::{
     ControllerSelectionStrategy, NvmeSubsystem, RandomController, RoundRobinController, SpdkConf,
     SpdkEnv, SpdkEnvState,
 };
-use crate::io::spdk_env::{NvmeSubsystem, SpdkConf, SpdkEnv, SpdkEnvState};
 use crate::sys::DataSlice;
 use bytes::BytesMut;
 use std::sync::Once;
