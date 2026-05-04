@@ -373,6 +373,104 @@ impl SpdkBdev {
         Ok(result)
     }
 
+    /// Async version of spdk_read(). Returns a Future that resolves when read completes.
+    pub async fn spdk_read_async(&mut self, offset: i64, len: usize) -> IOResult<BytesMut> {
+        let buf_cap = self.read_buf.capacity();
+        let dma_buf = self.read_buf.as_ptr();
+
+        let bs = self.block_size as usize;
+        let mut result = BytesMut::with_capacity(len);
+        let mut remaining = len;
+        let mut cur_off = offset;
+        while remaining > 0 {
+            // Align down, compute head skip
+            let aligned_off = self.align_down(cur_off);
+            let head_skip = (cur_off - aligned_off) as usize;
+            debug_assert!(buf_cap > head_skip, "DMA buffer too small");
+            let chunk_data = remaining.min(buf_cap - head_skip);
+            let aligned_len = DmaBuf::align_up(chunk_data + head_skip, bs);
+
+            // Submit NVMe read
+            use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
+            let completion = IoCompletion::new();
+            self.inflight
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            let req = IoRequest {
+                op: IoOp::Read {
+                    ns: self.ns,
+                    qpair: self.io_channel.qpair,
+                    buf: dma_buf,
+                    offset: aligned_off as u64,
+                    num_bytes: aligned_len as u64,
+                },
+                completion: completion.clone(),
+                bdev_inflight: self.inflight.clone(),
+            };
+            if self.io_channel.poller_tx.send(req).is_err() {
+                self.inflight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                return err_box!("SPDK poller thread is gone");
+            }
+            if let Err(e) = self.io_channel.eventfd.write(1) {
+                warn!(
+                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                     I/O may be delayed until timeout.",
+                    self.name, e
+                );
+            }
+            let rc = completion.into_future().await;
+            if rc != 0 {
+                return err_box!(
+                    "NVMe async read failed on '{}' at offset={}: {}",
+                    self.name,
+                    aligned_off,
+                    Self::nvme_error_str(rc)
+                );
+            }
+            // Copy to heap (DMA buffer reused)
+            let slice = unsafe {
+                std::slice::from_raw_parts((dma_buf as *const u8).add(head_skip), chunk_data)
+            };
+            result.extend_from_slice(slice);
+            cur_off += chunk_data as i64;
+            remaining -= chunk_data;
+        }
+        Ok(result)
+    }
+
+    /// Async version of read_region(). Returns DataSlice future.
+    pub async fn read_region_async(
+        &mut self,
+        _enable_send_file: bool,
+        len: i32,
+    ) -> IOResult<DataSlice> {
+        let chunk = (len as i64).min(self.size - self.pos);
+        if chunk <= 0 {
+            return err_box!(
+                "offset exceeds bdev length, length={}, offset={}",
+                self.size,
+                self.pos
+            );
+        }
+
+        let buf = self.spdk_read_async(self.pos, chunk as usize).await?;
+        self.pos += chunk;
+        Ok(DataSlice::Buffer(buf))
+    }
+
+    /// Async version of read_all(). Reads exactly buf.len() bytes.
+    pub async fn read_all_async(&mut self, buf: &mut [u8]) -> IOResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        self.check_bounds(buf.len() as i64)?;
+        let data = self.spdk_read_async(self.pos, buf.len()).await?;
+        buf.copy_from_slice(&data);
+        self.pos += buf.len() as i64;
+        Ok(())
+    }
+
     /// Submit write to SPDK, wait for completion. Uses DMA buffer (large writes chunked).
     fn spdk_write(&mut self, offset: i64, data: &[u8]) -> IOResult<()> {
         use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};

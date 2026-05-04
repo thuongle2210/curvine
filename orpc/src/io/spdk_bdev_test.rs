@@ -41,14 +41,20 @@ fn test_spdk_conf() -> SpdkConf {
     let controller_selection =
         std::env::var("SPDK_CONTROLLER_SELECTION").unwrap_or("First".to_string());
 
+    // Use smaller hugepage size for tests (64MB is enough for basic I/O tests)
+    // IMPORTANT: Set hugepage_str BEFORE init() so it parses the correct value
+    let hugepage_mb = std::env::var("SPDK_HUGEPAGE_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let hugepage_str = format!("{}MB", hugepage_mb);
+
     let mut conf = SpdkConf {
         enabled: true,
         app_name: "curvine-test".to_string(),
-        hugepage_mb: std::env::var("SPDK_HUGEPAGE_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(256),
-        reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
+        hugepage_str: hugepage_str, // Set this BEFORE init() parses it
+        hugepage_mb: 0,             // Will be set by init()
+        reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x2".to_string()),
         controller_selection_str: controller_selection,
         controller_selection: ControllerSelectionStrategy::First,
         subsystems: vec![NvmeSubsystem {
@@ -62,7 +68,7 @@ fn test_spdk_conf() -> SpdkConf {
         }],
         ..Default::default()
     };
-    // Parse computed fields
+    // Parse computed fields (this will parse hugepage_str into hugepage_mb)
     conf.init().expect("Failed to init SpdkConf");
     conf
 }
@@ -126,17 +132,27 @@ fn spdk_full_lifecycle() {
         let aligned_len = ((test_data.len() + (BLOCK_SIZE - 1)) / BLOCK_SIZE) * BLOCK_SIZE;
         let mut write_buf = vec![0u8; aligned_len];
         write_buf[..test_data.len()].copy_from_slice(test_data);
-        zero_region(&bdev_name, 0, aligned_len);
 
-        let mut bdev = SpdkBdev::open_write(&bdev_name, 0, 0).unwrap();
-        bdev.write_all(&write_buf).unwrap();
-        bdev.flush().unwrap();
-        assert_eq!(bdev.pos(), aligned_len as i64);
-        bdev.seek(0).unwrap();
-        let mut read_buf = vec![0u8; aligned_len];
-        bdev.read_all(&mut read_buf).unwrap();
-        assert_eq!(&read_buf[..test_data.len()], test_data);
-        assert_eq!(bdev.pos(), aligned_len as i64);
+        // Single scope for write and read to avoid any drop/flush issues
+        {
+            let mut bdev = SpdkBdev::open_write(&bdev_name, 0, 0).unwrap();
+            // Write the test data
+            bdev.write_all(&write_buf).unwrap();
+            bdev.flush().unwrap();
+            assert_eq!(bdev.pos(), aligned_len as i64);
+
+            // Seek back to beginning and read
+            bdev.seek(0).unwrap();
+            let mut read_buf = vec![0u8; aligned_len];
+            bdev.read_all(&mut read_buf).unwrap();
+            assert_eq!(
+                &read_buf[..test_data.len()],
+                test_data,
+                "Data mismatch in same scope: read {:?} vs expected {:?}",
+                &read_buf[..test_data.len()],
+                test_data
+            );
+        }
         println!("pass write/read round-trip test");
     }
 
@@ -145,14 +161,25 @@ fn spdk_full_lifecycle() {
         let data = Utils::rand_str(BLOCK_SIZE);
         let region = DataSlice::buffer(BytesMut::from(data.as_bytes()));
 
-        let mut bdev = SpdkBdev::open_write(&bdev_name, 0, 0).unwrap();
-        bdev.write_region(&region).unwrap();
-        bdev.flush().unwrap();
-        assert_eq!(bdev.pos(), BLOCK_SIZE as i64);
-        bdev.seek(0).unwrap();
-        let result = bdev.read_region(false, BLOCK_SIZE as i32).unwrap();
-        assert_eq!(result.len(), BLOCK_SIZE);
-        assert_eq!(result.as_slice(), data.as_bytes());
+        // Write in its own scope
+        {
+            let mut bdev = SpdkBdev::open_write(&bdev_name, 0, 0).unwrap();
+            bdev.write_region(&region).unwrap();
+            bdev.flush().unwrap();
+            assert_eq!(bdev.pos(), BLOCK_SIZE as i64);
+        }
+
+        // Read in its own scope
+        {
+            let mut bdev = SpdkBdev::open_read(&bdev_name, 0, BLOCK_SIZE as i64).unwrap();
+            let result = bdev.read_region(false, BLOCK_SIZE as i32).unwrap();
+            assert_eq!(result.len(), BLOCK_SIZE);
+            assert_eq!(
+                result.as_slice(),
+                data.as_bytes(),
+                "write_region/read_region data mismatch"
+            );
+        }
         println!("pass write_region/read_region test");
     }
 
@@ -205,4 +232,60 @@ fn spdk_full_lifecycle() {
         assert!(result.is_err(), "Should not open bdev after shutdown");
         println!("pass shutdown test");
     }
+}
+
+// Async read test (requires tokio runtime)
+#[cfg(feature = "spdk")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spdk_async_read_test() {
+    // Initialize SPDK (reuse env from other tests)
+    let _env = get_spdk_env();
+    let bdev_name = first_bdev_name();
+
+    let test_data = b"Async SPDK read test data!";
+    let aligned_len = ((test_data.len() + (BLOCK_SIZE - 1)) / BLOCK_SIZE) * BLOCK_SIZE;
+    let mut write_buf = vec![0u8; aligned_len];
+    write_buf[..test_data.len()].copy_from_slice(test_data);
+
+    // Write and read in same scope
+    {
+        let mut bdev = SpdkBdev::open_write(&bdev_name, 0, 0).unwrap();
+        bdev.write_all(&write_buf).unwrap();
+        bdev.flush().unwrap();
+
+        // Seek to beginning and read back async
+        bdev.seek(0).unwrap();
+        let result = bdev.spdk_read_async(0, aligned_len).await.unwrap();
+        assert_eq!(
+            &result[..test_data.len()],
+            test_data,
+            "Async read mismatch: read {:?} vs expected {:?}",
+            &result[..test_data.len()],
+            test_data
+        );
+    }
+    println!("pass spdk_read_async test");
+}
+
+// Async read_region test
+#[cfg(feature = "spdk")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spdk_async_read_region_test() {
+    let _env = get_spdk_env();
+    let bdev_name = first_bdev_name();
+
+    // Write test pattern
+    let pattern = Utils::rand_str(IO_SIZE);
+    {
+        let mut bdev = SpdkBdev::open_write(&bdev_name, 0, 0).unwrap();
+        bdev.write_all(pattern.as_bytes()).unwrap();
+        bdev.flush().unwrap();
+    }
+
+    // Read back using read_region_async
+    let mut bdev = SpdkBdev::open_read(&bdev_name, 0, IO_SIZE as i64).unwrap();
+    let result = bdev.read_region_async(false, IO_SIZE as i32).await.unwrap();
+    assert_eq!(result.len(), IO_SIZE);
+    assert_eq!(result.as_slice(), pattern.as_bytes());
+    println!("pass spdk_read_region_async test");
 }

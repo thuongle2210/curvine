@@ -6,16 +6,19 @@
 /// Detected via periodic keep-alive poll every 1s while idle (~1s latency).
 /// TODO: SPDK fabric eventfd for immediate detection.
 use crate::io::spdk_ffi;
+use futures::task::AtomicWaker;
 use log::{error, info};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::future::Future;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
-
 const EVENT_SZ: usize = std::mem::size_of::<u64>();
 
 // I/O operation submitted to poller thread
@@ -49,9 +52,11 @@ pub enum IoOp {
 unsafe impl Send for IoOp {}
 
 /// Completion state shared between poller callback and waiting handler.
+/// Supports both sync (Condvar) and async (Waker) waiters.
 pub struct IoCompletion {
     inner: Mutex<IoCompletionInner>,
     cond: Condvar,
+    atomic_waker: AtomicWaker,
 }
 
 struct IoCompletionInner {
@@ -67,6 +72,7 @@ impl IoCompletion {
                 status: 0,
             }),
             cond: Condvar::new(),
+            atomic_waker: AtomicWaker::new(),
         })
     }
 
@@ -76,6 +82,7 @@ impl IoCompletion {
         inner.done = true;
         inner.status = status;
         self.cond.notify_one();
+        self.atomic_waker.wake();
     }
 
     /// Block until complete or timeout. Returns NVMe status.
@@ -102,7 +109,38 @@ impl IoCompletion {
         }
         inner.status
     }
+
+    /// Poll completion status for async await.
+    pub fn poll_async(&self, cx: &mut Context<'_>) -> Poll<i32> {
+        let inner = self.inner.lock().unwrap();
+        if inner.done {
+            return Poll::Ready(inner.status);
+        }
+        self.atomic_waker.register(cx.waker());
+        Poll::Pending
+    }
+
+    /// Convert into a Future that resolves when I/O completes.
+    pub fn into_future(self: Arc<Self>) -> IoCompletionFuture {
+        IoCompletionFuture { completion: self }
+    }
 }
+
+/// Future wrapping IoCompletion for async await.
+pub struct IoCompletionFuture {
+    completion: Arc<IoCompletion>,
+}
+
+impl Future for IoCompletionFuture {
+    type Output = i32;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.completion.poll_async(cx)
+    }
+}
+
+/// Type alias for IoCompletionFuture
+pub type AsyncSpdkRead = IoCompletionFuture;
 
 // Request sent from handler threads to the poller
 pub struct IoRequest {
