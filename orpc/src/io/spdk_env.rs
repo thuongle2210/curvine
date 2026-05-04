@@ -346,6 +346,10 @@ pub struct SpdkConf {
     #[serde(skip)]
     pub dma_pool_bytes: u64, // parsed by init()
     pub block_align: u32, // 0 = auto-detect
+    /// Enable async read for SPDK bdev (uses spdk_read_async internally)
+    /// When enabled, read_region will use non-blocking I/O with waker-based completion
+    #[serde(alias = "spdk_async_read", default)]
+    pub spdk_async_read: bool, // default = false
 }
 
 impl SpdkConf {
@@ -500,6 +504,7 @@ impl Default for SpdkConf {
             dma_pool_size_str: "64MB".to_string(),
             dma_pool_bytes: 64 * 1024 * 1024,
             block_align: 0,
+            spdk_async_read: false,
         }
     }
 }
@@ -888,6 +893,11 @@ impl SpdkEnv {
 
         let idx = indices[selected_idx % indices.len()];
         Some(&self.bdevs[idx])
+    }
+
+    /// Check if SPDK async read is enabled in config.
+    pub fn spdk_async_read_enabled(&self) -> bool {
+        self.conf.spdk_async_read
     }
 
     /// Look up a bdev by subsystem NQN, namespace ID, and specific controller index.

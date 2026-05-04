@@ -13,6 +13,7 @@
 
 use crate::err_box;
 use crate::io::block_io::BlockIO;
+use crate::io::spdk_env::SpdkEnv;
 use crate::io::IOResult;
 use crate::sys::DataSlice;
 use bytes::BytesMut;
@@ -628,6 +629,7 @@ impl SpdkBdev {
 
 impl BlockIO for SpdkBdev {
     /// Read up to len bytes from current position. Returns DataSlice::Buffer.
+    /// Uses spdk_read_async if spdk_async_read is enabled in config.
     fn read_region(&mut self, _enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
         let chunk = (len as i64).min(self.size - self.pos);
         if chunk <= 0 {
@@ -638,7 +640,30 @@ impl BlockIO for SpdkBdev {
             );
         }
 
-        let buf = self.spdk_read(self.pos, chunk as usize)?;
+        // Check if async read is enabled
+        let async_enabled = SpdkEnv::global()
+            .map(|env| env.spdk_async_read_enabled())
+            .unwrap_or(false);
+
+        let buf = if async_enabled {
+            // Use async read (requires tokio runtime)
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    match handle.block_on(self.spdk_read_async(self.pos, chunk as usize)) {
+                        Ok(data) => data,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(_) => {
+                    // Not in tokio context, fall back to sync read
+                    warn!("spdk_async_read enabled but not in tokio context, falling back to sync read");
+                    self.spdk_read(self.pos, chunk as usize)?
+                }
+            }
+        } else {
+            self.spdk_read(self.pos, chunk as usize)?
+        };
+
         self.pos += chunk;
         Ok(DataSlice::Buffer(buf))
     }
