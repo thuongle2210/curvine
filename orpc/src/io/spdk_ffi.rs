@@ -23,6 +23,15 @@ pub struct spdk_nvme_transport_id {
 pub struct spdk_nvme_ctrlr_opts {
     pub data: [u8; 8192],
 }
+// SPDK thread/poller opaque types
+pub enum spdk_thread {}
+pub enum spdk_poller {}
+
+// Callback types for native reactor
+pub type spdk_thread_fn = unsafe extern "C" fn(*mut c_void);
+pub type spdk_poller_fn = unsafe extern "C" fn(*mut c_void) -> c_int;
+pub type spdk_new_thread_fn = unsafe extern "C" fn(*mut c_void) -> *mut spdk_thread;
+
 extern "C" {
     // Environment (via C helper)
     pub fn curvine_spdk_env_opts_sizeof() -> usize;
@@ -34,6 +43,39 @@ extern "C" {
     pub fn curvine_spdk_env_opts_set_mem_size(opts: *mut spdk_env_opts, mem_size: c_int);
     pub fn curvine_spdk_env_init(opts: *mut spdk_env_opts) -> c_int;
     pub fn spdk_env_fini();
+
+    // SPDK thread library init (must be called before creating threads)
+    // new_thread_fn can be NULL (None) if not providing a custom thread creation fn
+    // Using debug wrapper to trace mempool creation failure
+    pub fn curvine_spdk_thread_lib_init(
+        new_thread_fn: Option<spdk_new_thread_fn>,
+        ctx_sz: usize,
+    ) -> c_int;
+    // Debug: check EAL memory availability
+    pub fn curvine_check_eal_memory();
+    pub fn spdk_thread_lib_fini();
+
+    // SPDK thread management (native reactor)
+    pub fn spdk_thread_create(name: *const c_char, cpumask: *const c_char) -> *mut spdk_thread;
+    pub fn spdk_thread_exit(thread: *mut spdk_thread);
+    pub fn spdk_thread_destroy(thread: *mut spdk_thread);
+    pub fn spdk_thread_send_msg(
+        thread: *mut spdk_thread,
+        cb: spdk_thread_fn,
+        arg: *mut c_void,
+    ) -> c_int;
+    // Use wrapper from spdk_opts_helper.c
+    pub fn curvine_spdk_thread_is_current(thread: *mut spdk_thread) -> bool;
+
+    // SPDK poller management
+    pub fn spdk_poller_register(
+        cb: spdk_poller_fn,
+        arg: *mut c_void,
+        period_us: u64,
+    ) -> *mut spdk_poller;
+    pub fn spdk_poller_unregister(poller: *mut *mut spdk_poller);
+    pub fn spdk_poller_pause(poller: *mut spdk_poller);
+    pub fn spdk_poller_resume(poller: *mut spdk_poller);
     // Transport ID (via C helper)
     pub fn curvine_spdk_trid_sizeof() -> usize;
     pub fn curvine_spdk_trid_set_trtype(trid: *mut spdk_nvme_transport_id, trtype: c_int);

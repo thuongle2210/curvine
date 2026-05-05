@@ -11,6 +11,7 @@ default = []
 jni = ["curvine-ufs/jni"]
 spdk = ["orpc/spdk"]
 spdk-rdma = ["spdk", "orpc/spdk-rdma"]
+spdk_native_reactor = ["orpc/spdk_native_reactor"]
 
 [dependencies]
 orpc = { workspace = true }

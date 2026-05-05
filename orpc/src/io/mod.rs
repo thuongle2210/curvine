@@ -54,6 +54,8 @@ pub use spdk_bdev::SpdkBdev;
 
 #[cfg(feature = "spdk")]
 pub mod spdk_poller;
+#[cfg(feature = "spdk_native_reactor")]
+pub use spdk_poller::spdk_native_reactor_msg_handler;
 #[cfg(feature = "spdk")]
 pub use spdk_poller::SpdkPoller;
 

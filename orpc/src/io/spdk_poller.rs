@@ -1,7 +1,9 @@
 //! SPDK I/O poller — handles NVMe submit/poll on dedicated thread.
-//! One poller per controller (1:1 mapping).
+//! One poller per controller (1:1 mapping, legacy).
 //! Uses eventfd for instant wake on new I/O submission.
 //!
+//! When spdk_native_reactor feature is enabled, uses SPDK native reactor threads
+//! with round-robin controller-to-reactor mapping.
 /// ## Disconnect Detection
 /// Detected via periodic keep-alive poll every 1s while idle (~1s latency).
 /// TODO: SPDK fabric eventfd for immediate detection.
@@ -496,4 +498,94 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     let ctx = Box::from_raw(cb_arg as *mut CallbackCtx);
     ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
     ctx.completion.complete(status);
+}
+
+// ---------------------------------------------------------------------------
+// SPDK Native Reactor Support
+// ---------------------------------------------------------------------------
+
+/// Message handler for native reactor: processes I/O requests sent via spdk_thread_send_msg.
+#[cfg(feature = "spdk_native_reactor")]
+pub unsafe extern "C" fn spdk_native_reactor_msg_handler(arg: *mut c_void) {
+    let req = Box::from_raw(arg as *mut IoRequest);
+    submit_one(&req, &mut Vec::new());
+}
+
+/// Submit a single I/O request (safe to call from native reactor thread).
+/// Exported for use by spdk_bdev.rs direct submission path.
+pub fn submit_one(req: &IoRequest, _active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>) {
+    let qpair = match &req.op {
+        IoOp::Read { qpair, .. } => *qpair,
+        IoOp::Write { qpair, .. } => *qpair,
+        IoOp::Flush { qpair, .. } => *qpair,
+        IoOp::UnregisterQpair { .. } => {
+            unreachable!("UnregisterQpair handled separately");
+        }
+    };
+
+    // Box::into_raw ensures CallbackCtx survives until poller_callback reclaims it
+    let cb_ctx = Box::new(CallbackCtx {
+        completion: req.completion.clone(),
+        async_ctx: unsafe { std::mem::zeroed() },
+        bdev_inflight: req.bdev_inflight.clone(),
+    });
+    let cb_ctx_ptr = Box::into_raw(cb_ctx);
+
+    // Initialize async_ctx via C helper
+    unsafe {
+        spdk_ffi::curvine_spdk_async_ctx_init(
+            &mut (*cb_ctx_ptr).async_ctx,
+            poller_callback,
+            cb_ctx_ptr as *mut c_void,
+        );
+    }
+
+    let rc = match &req.op {
+        IoOp::Read {
+            ns,
+            qpair,
+            buf,
+            offset,
+            num_bytes,
+        } => unsafe {
+            spdk_ffi::curvine_spdk_ns_submit_read(
+                *ns,
+                *qpair,
+                *buf,
+                *offset,
+                *num_bytes,
+                &mut (*cb_ctx_ptr).async_ctx,
+            )
+        },
+        IoOp::Write {
+            ns,
+            qpair,
+            buf,
+            offset,
+            num_bytes,
+        } => unsafe {
+            spdk_ffi::curvine_spdk_ns_submit_write(
+                *ns,
+                *qpair,
+                *buf,
+                *offset,
+                *num_bytes,
+                &mut (*cb_ctx_ptr).async_ctx,
+            )
+        },
+        IoOp::Flush { ns, qpair } => unsafe {
+            spdk_ffi::curvine_spdk_ns_submit_flush(*ns, *qpair, &mut (*cb_ctx_ptr).async_ctx)
+        },
+        IoOp::UnregisterQpair { .. } => {
+            unreachable!("UnregisterQpair handled separately");
+        }
+    };
+
+    if rc != 0 {
+        // Submission failed - reclaim allocation and complete with error
+        unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
+        req.bdev_inflight.fetch_sub(1, Ordering::Release);
+        req.completion.complete(rc);
+        return;
+    }
 }

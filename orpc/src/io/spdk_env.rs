@@ -2,9 +2,12 @@
 
 use crate::err_msg;
 use crate::io::spdk_ffi;
-use crate::io::spdk_poller::{IoRequest, SpdkPoller};
+use crate::io::spdk_poller::IoRequest;
+#[cfg(not(feature = "spdk_native_reactor"))]
+use crate::io::spdk_poller::SpdkPoller;
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
+#[cfg(not(feature = "spdk_native_reactor"))]
 use nix::sys::eventfd::EventFd;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -350,6 +353,14 @@ pub struct SpdkConf {
     /// When enabled, read_region will use non-blocking I/O with waker-based completion
     #[serde(alias = "spdk_async_read", default)]
     pub spdk_async_read: bool, // default = false
+    /// Enable SPDK native reactor instead of custom poller threads
+    #[cfg(feature = "spdk_native_reactor")]
+    #[serde(alias = "spdk_native_reactor", default)]
+    pub spdk_native_reactor: bool, // default = false
+    /// Number of reactor cores (default: all physical cores)
+    #[cfg(feature = "spdk_native_reactor")]
+    #[serde(alias = "reactor_core_count", default)]
+    pub reactor_core_count: Option<u32>,
 }
 
 impl SpdkConf {
@@ -505,6 +516,10 @@ impl Default for SpdkConf {
             dma_pool_bytes: 64 * 1024 * 1024,
             block_align: 0,
             spdk_async_read: false,
+            #[cfg(feature = "spdk_native_reactor")]
+            spdk_native_reactor: false,
+            #[cfg(feature = "spdk_native_reactor")]
+            reactor_core_count: None,
         }
     }
 }
@@ -559,10 +574,18 @@ pub struct SpdkEnv {
     bdev_groups: HashMap<(String, u32), Vec<usize>>,
     open_handles: AtomicUsize,
     qpair_pool: QpairPool,
-    /// Simple poller map: ctrlr_idx -> SpdkPoller (1:1 mapping)
-    pollers: Mutex<HashMap<usize, SpdkPoller>>,
     /// Controller selection strategy state
     controller_selection: Mutex<ControllerSelectionStrategy>,
+    /// SPDK native reactor threads (round-robin mapping)
+    #[cfg(feature = "spdk_native_reactor")]
+    reactor_threads: Mutex<Vec<*mut spdk_ffi::spdk_thread>>,
+    #[cfg(feature = "spdk_native_reactor")]
+    next_reactor_idx: Mutex<usize>,
+    #[cfg(feature = "spdk_native_reactor")]
+    thread_pollers: Mutex<HashMap<*mut spdk_ffi::spdk_thread, Vec<*mut spdk_ffi::spdk_poller>>>,
+    /// Simple poller map: ctrlr_idx -> SpdkPoller (1:1 mapping) - legacy
+    #[cfg(not(feature = "spdk_native_reactor"))]
+    pollers: Mutex<HashMap<usize, SpdkPoller>>,
 }
 
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
@@ -583,8 +606,15 @@ impl SpdkEnv {
             bdev_groups: HashMap::new(),
             open_handles: AtomicUsize::new(0),
             qpair_pool: QpairPool::new(),
-            pollers: Mutex::new(HashMap::new()),
             controller_selection: Mutex::new(conf.controller_selection.clone()),
+            #[cfg(feature = "spdk_native_reactor")]
+            reactor_threads: Mutex::new(Vec::new()),
+            #[cfg(feature = "spdk_native_reactor")]
+            next_reactor_idx: Mutex::new(0),
+            #[cfg(feature = "spdk_native_reactor")]
+            thread_pollers: Mutex::new(HashMap::new()),
+            #[cfg(not(feature = "spdk_native_reactor"))]
+            pollers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -733,8 +763,14 @@ impl SpdkEnv {
         self.bdevs = all_bdevs;
         self.bdev_groups = bdev_groups;
 
-        // Start pollers: 1 poller per controller (1:1 mapping)
+        // Start reactors/pollers based on feature flag
+        #[cfg(feature = "spdk_native_reactor")]
         {
+            self.start_native_reactors()?;
+        }
+        #[cfg(not(feature = "spdk_native_reactor"))]
+        {
+            // Start pollers: 1 poller per controller (1:1 mapping)
             let mut pollers = self.pollers.lock().unwrap();
             for bdev in &self.bdevs {
                 let ctrlr_idx = bdev.ctrlr_idx as usize;
@@ -757,6 +793,93 @@ impl SpdkEnv {
 
         self.state
             .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        Ok(())
+    }
+
+    /// Start SPDK native reactor threads with round-robin controller mapping
+    #[cfg(feature = "spdk_native_reactor")]
+    fn start_native_reactors(&self) -> CommonResult<()> {
+        use std::ffi::CString;
+
+        // Verify EAL initialized successfully by checking if we can get the current core
+        // (EAL must be initialized before spdk_thread_lib_init)
+        info!(
+            "Starting SPDK native reactors: hugepage_mb={}, reactor_mask={}",
+            self.conf.hugepage_mb, self.conf.reactor_mask
+        );
+
+        // Debug: Check if EAL actually has memory before calling spdk_thread_lib_init
+        unsafe { spdk_ffi::curvine_check_eal_memory() };
+
+        // Initialize SPDK thread library (must be called after EAL init)
+        // Pass NULL for new_thread_fn — we create threads manually via spdk_thread_create
+        // Note: spdk_thread_lib_init creates spdk_msg_mempool which may fail due to
+        // NUMA issues or mempool flags. Try with retry logic.
+        info!("Calling spdk_thread_lib_init (via debug wrapper)...");
+
+        // Retry spdk_thread_lib_init up to 3 times with delay
+        let mut rc = -12;
+        for attempt in 1..=3 {
+            info!("spdk_thread_lib_init attempt {}/3", attempt);
+            rc = unsafe { spdk_ffi::curvine_spdk_thread_lib_init(None, 0) };
+            if rc == 0 {
+                break;
+            }
+            error!("spdk_thread_lib_init failed: rc={} (attempt {})", rc, attempt);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if rc != 0 {
+            error!(
+                "spdk_thread_lib_init failed: rc={} (ENOMEM=-12 means EAL has no memory)",
+                rc
+            );
+            return err_box!(
+                "Failed to initialize SPDK thread library: rc={} (check EAL memory allocation)",
+                rc
+            );
+        }
+        info!("SPDK thread library initialized successfully");
+
+        let core_count = self
+            .conf
+            .reactor_core_count
+            .unwrap_or_else(|| num_cpus::get() as u32) as usize;
+
+        info!(
+            "Starting {} SPDK native reactor threads (round-robin)",
+            core_count
+        );
+
+        let mut threads = Vec::new();
+        for core_idx in 0..core_count {
+            let thread_name = CString::new(format!("spdk-reactor-{}", core_idx))
+                .map_err(|e| err_msg!(format!("invalid thread name: {}", e)))?;
+
+            let thread =
+                unsafe { spdk_ffi::spdk_thread_create(thread_name.as_ptr(), std::ptr::null()) };
+            if thread.is_null() {
+                // Clean up already-created threads
+                for t in threads {
+                    unsafe {
+                        spdk_ffi::spdk_thread_exit(t);
+                    }
+                }
+                unsafe {
+                    spdk_ffi::spdk_thread_lib_fini();
+                }
+                return err_box!("Failed to create SPDK thread for core {}", core_idx);
+            }
+            threads.push(thread);
+        }
+
+        *self.reactor_threads.lock().unwrap() = threads;
+        *self.next_reactor_idx.lock().unwrap() = 0;
+
+        info!(
+            "SPDK native reactors started: {} reactor(s)",
+            self.reactor_threads.lock().unwrap().len()
+        );
 
         Ok(())
     }
@@ -806,11 +929,14 @@ impl SpdkEnv {
                 );
                 // Stop pollers (safe — pending I/Os will get channel-closed errors)
                 // but do NOT detach controllers or call env_fini.
-                let mut pollers = self.pollers.lock().unwrap();
-                for (id, poller) in pollers.drain() {
-                    info!("Stopping poller {} (timeout path)", id);
+                #[cfg(not(feature = "spdk_native_reactor"))]
+                {
+                    let mut pollers = self.pollers.lock().unwrap();
+                    for (id, poller) in pollers.drain() {
+                        info!("Stopping poller {} (timeout path)", id);
+                    }
+                    info!("SPDK pollers stopped (timeout path)");
                 }
-                info!("SPDK pollers stopped (timeout path)");
                 return;
             }
             if !logged {
@@ -824,12 +950,30 @@ impl SpdkEnv {
         }
 
         // Stop pollers before draining qpairs (no in-flight I/Os).
+        #[cfg(not(feature = "spdk_native_reactor"))]
         {
             let mut pollers = self.pollers.lock().unwrap();
             for (id, poller) in pollers.drain() {
                 info!("Stopping poller {}", id);
             }
             info!("SPDK pollers stopped");
+        }
+        #[cfg(feature = "spdk_native_reactor")]
+        {
+            // Native reactor: exit SPDK threads
+            let threads = self.reactor_threads.lock().unwrap();
+            for (idx, thread) in threads.iter().enumerate() {
+                unsafe {
+                    spdk_ffi::spdk_thread_exit(*thread);
+                }
+                info!("Stopping reactor thread {}", idx);
+            }
+            info!("SPDK native reactors stopped");
+            // Finalize thread library
+            unsafe {
+                spdk_ffi::spdk_thread_lib_fini();
+            }
+            info!("SPDK thread library finalized");
         }
 
         self.qpair_pool.drain_all();
@@ -1002,7 +1146,8 @@ impl SpdkEnv {
         self.qpair_pool.release(ctrlr, qpair);
     }
 
-    /// Get the poller for a given controller index.
+    /// Get the poller for a given controller index (legacy poller thread).
+    #[cfg(not(feature = "spdk_native_reactor"))]
     pub fn get_poller(
         &self,
         ctrlr_idx: usize,
@@ -1021,8 +1166,31 @@ impl SpdkEnv {
         (poller.sender(), poller.eventfd(), ctrlr_idx)
     }
 
+    /// Get the SPDK thread for a given controller index (native reactor, round-robin).
+    /// Called once per controller attach, result cached in IoChannel.
+    #[cfg(feature = "spdk_native_reactor")]
+    pub fn get_spdk_thread(&self, ctrlr_idx: usize) -> *mut spdk_ffi::spdk_thread {
+        let threads = self.reactor_threads.lock().unwrap();
+        let mut next_idx = self.next_reactor_idx.lock().unwrap();
+
+        // Round-robin assignment
+        let target_idx = *next_idx % threads.len();
+        let assigned_thread = threads[target_idx];
+
+        info!(
+            "Assigned controller {} to reactor thread {} (round-robin)",
+            ctrlr_idx, target_idx
+        );
+
+        // Increment for next controller
+        *next_idx = (*next_idx + 1) % threads.len().max(1);
+
+        assigned_thread
+    }
+
     /// Unregister qpair from poller, blocking until removed to prevent UAF.
     /// Returns false if poller didn't ack within timeout (likely stuck/dead).
+    #[cfg(not(feature = "spdk_native_reactor"))]
     pub fn unregister_qpair_from_poller(
         &self,
         ctrlr_idx: usize,
@@ -1034,6 +1202,18 @@ impl SpdkEnv {
         } else {
             false // Poller not started
         }
+    }
+
+    /// Unregister qpair from native reactor (placeholder for future qpair tracking).
+    #[cfg(feature = "spdk_native_reactor")]
+    pub fn unregister_qpair_from_poller(
+        &self,
+        _ctrlr_idx: usize,
+        _qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) -> bool {
+        // Native reactor handles qpair cleanup via SPDK thread exit
+        // For now, just return true (success)
+        true
     }
 
     // SPDK FFI — feature-gated
@@ -1076,10 +1256,32 @@ impl SpdkEnv {
                 self.conf.mem_channel as i32,
             );
             spdk_ffi::curvine_spdk_env_opts_set_mem_size(&mut opts, self.conf.hugepage_mb as i32);
+
+            info!(
+                "Calling spdk_env_init with: name={}, mask={}, mem_size={}MB, shm_id={}, mem_channel={}",
+                self.conf.app_name,
+                self.conf.reactor_mask,
+                self.conf.hugepage_mb,
+                self.conf.shm_id,
+                self.conf.mem_channel
+            );
+
             let rc = spdk_ffi::curvine_spdk_env_init(&mut opts);
+            info!("spdk_env_init returned rc={}", rc);
             if rc != 0 {
+                error!("spdk_env_init failed: rc={} (EAL init failed)", rc);
                 return err_box!("spdk_env_init failed with rc={}", rc);
             }
+
+            // Verify EAL has memory by checking if we can allocate a small buffer
+            let test_buf = spdk_ffi::curvine_spdk_dma_malloc(4096, 4096);
+            if test_buf.is_null() {
+                error!("EAL init succeeded but cannot allocate DMA memory - EAL has no memory!");
+                return err_box!("EAL has no memory after init (check hugepages)");
+            }
+            spdk_ffi::curvine_spdk_dma_free(test_buf);
+            info!("EAL memory verification passed (DMA alloc/free works)");
+
             // Register NVMe transports (TCP, RDMA, PCIe).
             // Must be called after env_init but before nvme_connect.
             spdk_ffi::curvine_spdk_register_transports();

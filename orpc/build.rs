@@ -30,6 +30,18 @@ fn link_spdk() {
         .compile("spdk_opts_helper");
     println!("cargo:rerun-if-changed={}", helper_src);
 
+    // Compile C helper for thread wrapper (spdk_native_reactor)
+    #[cfg(feature = "spdk_native_reactor")]
+    {
+        let thread_wrapper_src = format!("{}/csrc/spdk_thread_wrapper.c", manifest_dir);
+        cc::Build::new()
+            .file(&thread_wrapper_src)
+            .include(&include_dir)
+            .include(&dpdk_include)
+            .compile("spdk_thread_wrapper");
+        println!("cargo:rerun-if-changed={}", thread_wrapper_src);
+    }
+
     // DPDK lib subdirs
     if let Some(ref dir) = spdk_dir {
         println!("cargo:rustc-link-search=native={}/dpdk/build/lib", dir);
@@ -52,6 +64,10 @@ fn link_spdk() {
         "spdk_thread",
         "spdk_dma",
     ];
+
+    // SPDK thread lib (needed for spdk_native_reactor)
+    #[cfg(feature = "spdk_native_reactor")]
+    libs.push("spdk_thread");
 
     #[cfg(feature = "spdk-rdma")]
     libs.extend(["spdk_rdma_provider", "spdk_rdma_utils"]);

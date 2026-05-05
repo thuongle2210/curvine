@@ -96,6 +96,29 @@ void curvine_spdk_dma_free(void *buf) {
     spdk_dma_free(buf);
 }
 
+// Thread helpers
+#include "spdk/thread.h"
+bool curvine_spdk_thread_is_current(struct spdk_thread *thread) {
+    struct spdk_thread *current = spdk_get_thread();
+    return (current != NULL) && (current == thread);
+}
+
+// Debug: check EAL memory availability
+void curvine_check_eal_memory(void) {
+    fprintf(stderr, "[DEBUG C] Checking EAL memory:\n");
+    void *buf = spdk_dma_malloc(4096, 4096, NULL);
+    if (buf) {
+        fprintf(stderr, "[DEBUG C]   spdk_dma_malloc(4096) succeeded: %p\n", buf);
+        spdk_dma_free(buf);
+    } else {
+        fprintf(stderr, "[DEBUG C]   spdk_dma_malloc(4096) FAILED - EAL has no memory!\n");
+    }
+}
+
+// NOTE: curvine_spdk_thread_lib_init is now implemented in spdk_thread_wrapper.c
+// to use spdk_thread_lib_init_ext with smaller mempool size.
+// This wrapper file only contains the check_eal_memory function.
+
 // I/O qpair
 struct spdk_nvme_qpair *curvine_spdk_alloc_io_qpair(struct spdk_nvme_ctrlr *ctrlr) {
     struct spdk_nvme_io_qpair_opts opts;
@@ -178,12 +201,12 @@ int curvine_spdk_ns_submit_read(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair 
     return spdk_nvme_ns_cmd_read(ns, qpair, buf, offset / ss, nbytes / ss, curvine_async_cb_fn, ctx, 0);
 }
 int curvine_spdk_ns_submit_write(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
-                                  void *buf, uint64_t offset, uint64_t nbytes, struct curvine_async_ctx *ctx) {
+                                void *buf, uint64_t offset, uint64_t nbytes, struct curvine_async_ctx *ctx) {
     uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
     return spdk_nvme_ns_cmd_write(ns, qpair, buf, offset / ss, nbytes / ss, curvine_async_cb_fn, ctx, 0);
 }
 int curvine_spdk_ns_submit_flush(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
-                                  struct curvine_async_ctx *ctx) {
+                                struct curvine_async_ctx *ctx) {
     return spdk_nvme_ns_cmd_flush(ns, qpair, curvine_async_cb_fn, ctx);
 }
 int curvine_spdk_qpair_poll(struct spdk_nvme_qpair *qpair, int max_completions) {

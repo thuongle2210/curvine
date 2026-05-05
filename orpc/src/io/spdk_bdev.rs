@@ -2,7 +2,8 @@
 //! Mirrors LocalFile API but uses SPDK bdev layer instead of kernel I/O.
 //!
 //! # Alignment: all I/O aligned to block size.
-//! # Threading: I/O forwarded to dedicated poller thread via channel.
+//! # Threading: I/O forwarded to dedicated poller thread via channel (legacy)
+//!             or native SPDK reactor thread (spdk_native_reactor feature).
 //!
 //! # TODOs
 //! - Reliability: NVMe retry (exp backoff via SpdkConf::io_retry_count). Retriable: SCT=0x03,0x00 SC=0x02/0x0A.
@@ -23,7 +24,8 @@ use std::fmt::{Display, Formatter};
 // SPDK I/O channel — bridge between Tokio and SPDK reactor
 // ---------------------------------------------------------------------------
 
-/// SPDK I/O channel — wraps qpair and poller sender.
+/// SPDK I/O channel — wraps qpair and poller sender (legacy poller thread).
+#[cfg(not(feature = "spdk_native_reactor"))]
 pub struct SpdkIoChannel {
     pub qpair: *mut crate::io::spdk_ffi::spdk_nvme_qpair,
     pub poller_tx: crossbeam::channel::Sender<crate::io::spdk_poller::IoRequest>,
@@ -32,7 +34,21 @@ pub struct SpdkIoChannel {
     /// Poller ID for unregister on drop
     pub poller_id: usize,
 }
+#[cfg(not(feature = "spdk_native_reactor"))]
 unsafe impl Send for SpdkIoChannel {}
+#[cfg(not(feature = "spdk_native_reactor"))]
+unsafe impl Sync for SpdkIoChannel {}
+
+/// SPDK I/O channel — wraps qpair and owning SPDK thread (native reactor).
+#[cfg(feature = "spdk_native_reactor")]
+pub struct SpdkIoChannel {
+    pub qpair: *mut crate::io::spdk_ffi::spdk_nvme_qpair,
+    /// SPDK thread that owns this qpair (cached from get_spdk_thread)
+    pub owning_thread: *mut crate::io::spdk_ffi::spdk_thread,
+}
+#[cfg(feature = "spdk_native_reactor")]
+unsafe impl Send for SpdkIoChannel {}
+#[cfg(feature = "spdk_native_reactor")]
 unsafe impl Sync for SpdkIoChannel {}
 
 /// DMA buffer (hugepage-backed).
@@ -224,13 +240,27 @@ impl SpdkBdev {
                     return Err(e.into());
                 }
             };
-            // Get poller for this controller (1:1 mapping)
-            let (poller_tx, eventfd, poller_id) = env.get_poller(info.ctrlr_idx as usize);
-            let io_channel = SpdkIoChannel {
-                qpair,
-                poller_tx,
-                eventfd,
-                poller_id,
+            // Get I/O channel based on feature flag
+            let io_channel = {
+                #[cfg(feature = "spdk_native_reactor")]
+                {
+                    let owning_thread = env.get_spdk_thread(info.ctrlr_idx as usize);
+                    SpdkIoChannel {
+                        qpair,
+                        owning_thread,
+                    }
+                }
+                #[cfg(not(feature = "spdk_native_reactor"))]
+                {
+                    // Get poller for this controller (1:1 mapping)
+                    let (poller_tx, eventfd, poller_id) = env.get_poller(info.ctrlr_idx as usize);
+                    SpdkIoChannel {
+                        qpair,
+                        poller_tx,
+                        eventfd,
+                        poller_id,
+                    }
+                }
             };
             let io_timeout_us = env.conf().io_timeout_us;
             Ok(Self {
@@ -342,17 +372,43 @@ impl SpdkBdev {
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
             };
-            if self.io_channel.poller_tx.send(req).is_err() {
-                self.inflight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                return err_box!("SPDK poller thread is gone");
+
+            // Submit based on feature flag
+            #[cfg(feature = "spdk_native_reactor")]
+            {
+                // Native reactor: send message to reactor thread via spdk_thread_send_msg
+                let thread = self.io_channel.owning_thread;
+                let req_ptr = Box::into_raw(Box::new(req));
+                let rc = unsafe {
+                    crate::io::spdk_ffi::spdk_thread_send_msg(
+                        thread,
+                        crate::io::spdk_poller::spdk_native_reactor_msg_handler,
+                        req_ptr as *mut std::ffi::c_void,
+                    )
+                };
+                if rc != 0 {
+                    self.inflight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    unsafe {
+                        Box::from_raw(req_ptr);
+                    }
+                    return err_box!("Failed to send message to SPDK thread");
+                }
             }
-            if let Err(e) = self.io_channel.eventfd.write(1) {
-                warn!(
-                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                     I/O may be delayed until timeout.",
-                    self.name, e
-                );
+            #[cfg(not(feature = "spdk_native_reactor"))]
+            {
+                if self.io_channel.poller_tx.send(req).is_err() {
+                    self.inflight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    return err_box!("SPDK poller thread is gone");
+                }
+                if let Err(e) = self.io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                         I/O may be delayed until timeout.",
+                        self.name, e
+                    );
+                }
             }
             let rc = completion.wait(self.io_timeout_us);
             if rc != 0 {
@@ -407,17 +463,43 @@ impl SpdkBdev {
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
             };
-            if self.io_channel.poller_tx.send(req).is_err() {
-                self.inflight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                return err_box!("SPDK poller thread is gone");
+
+            // Submit based on feature flag
+            #[cfg(feature = "spdk_native_reactor")]
+            {
+                // Native reactor: send message to reactor thread via spdk_thread_send_msg
+                let thread = self.io_channel.owning_thread;
+                let req_ptr = Box::into_raw(Box::new(req));
+                let rc = unsafe {
+                    crate::io::spdk_ffi::spdk_thread_send_msg(
+                        thread,
+                        crate::io::spdk_poller::spdk_native_reactor_msg_handler,
+                        req_ptr as *mut std::ffi::c_void,
+                    )
+                };
+                if rc != 0 {
+                    self.inflight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    unsafe {
+                        Box::from_raw(req_ptr);
+                    }
+                    return err_box!("Failed to send message to SPDK thread");
+                }
             }
-            if let Err(e) = self.io_channel.eventfd.write(1) {
-                warn!(
-                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                     I/O may be delayed until timeout.",
-                    self.name, e
-                );
+            #[cfg(not(feature = "spdk_native_reactor"))]
+            {
+                if self.io_channel.poller_tx.send(req).is_err() {
+                    self.inflight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    return err_box!("SPDK poller thread is gone");
+                }
+                if let Err(e) = self.io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                         I/O may be delayed until timeout.",
+                        self.name, e
+                    );
+                }
             }
             let rc = completion.into_future().await;
             if rc != 0 {
@@ -513,17 +595,43 @@ impl SpdkBdev {
                     completion: completion.clone(),
                     bdev_inflight: self.inflight.clone(),
                 };
-                if self.io_channel.poller_tx.send(req).is_err() {
-                    self.inflight
-                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                    return err_box!("SPDK poller thread is gone");
+
+                // Submit based on feature flag
+                #[cfg(feature = "spdk_native_reactor")]
+                {
+                    // Native reactor: send message to reactor thread via spdk_thread_send_msg
+                    let thread = self.io_channel.owning_thread;
+                    let req_ptr = Box::into_raw(Box::new(req));
+                    let rc = unsafe {
+                        crate::io::spdk_ffi::spdk_thread_send_msg(
+                            thread,
+                            crate::io::spdk_poller::spdk_native_reactor_msg_handler,
+                            req_ptr as *mut std::ffi::c_void,
+                        )
+                    };
+                    if rc != 0 {
+                        self.inflight
+                            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                        unsafe {
+                            Box::from_raw(req_ptr);
+                        }
+                        return err_box!("Failed to send message to SPDK thread");
+                    }
                 }
-                if let Err(e) = self.io_channel.eventfd.write(1) {
-                    warn!(
-                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                         I/O may be delayed until timeout.",
-                        self.name, e
-                    );
+                #[cfg(not(feature = "spdk_native_reactor"))]
+                {
+                    if self.io_channel.poller_tx.send(req).is_err() {
+                        self.inflight
+                            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                        return err_box!("SPDK poller thread is gone");
+                    }
+                    if let Err(e) = self.io_channel.eventfd.write(1) {
+                        warn!(
+                            "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                             I/O may be delayed until timeout.",
+                            self.name, e
+                        );
+                    }
                 }
                 let rc = completion.wait(self.io_timeout_us);
 
@@ -559,17 +667,43 @@ impl SpdkBdev {
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
             };
-            if self.io_channel.poller_tx.send(req).is_err() {
-                self.inflight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                return err_box!("SPDK poller thread is gone");
+
+            // Submit based on feature flag
+            #[cfg(feature = "spdk_native_reactor")]
+            {
+                // Native reactor: send message to reactor thread via spdk_thread_send_msg
+                let thread = self.io_channel.owning_thread;
+                let req_ptr = Box::into_raw(Box::new(req));
+                let rc = unsafe {
+                    crate::io::spdk_ffi::spdk_thread_send_msg(
+                        thread,
+                        crate::io::spdk_poller::spdk_native_reactor_msg_handler,
+                        req_ptr as *mut std::ffi::c_void,
+                    )
+                };
+                if rc != 0 {
+                    self.inflight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    unsafe {
+                        Box::from_raw(req_ptr);
+                    }
+                    return err_box!("Failed to send message to SPDK thread");
+                }
             }
-            if let Err(e) = self.io_channel.eventfd.write(1) {
-                warn!(
-                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                     I/O may be delayed until timeout.",
-                    self.name, e
-                );
+            #[cfg(not(feature = "spdk_native_reactor"))]
+            {
+                if self.io_channel.poller_tx.send(req).is_err() {
+                    self.inflight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    return err_box!("SPDK poller thread is gone");
+                }
+                if let Err(e) = self.io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                         I/O may be delayed until timeout.",
+                        self.name, e
+                    );
+                }
             }
             let rc = completion.wait(self.io_timeout_us);
             if rc != 0 {
@@ -601,15 +735,43 @@ impl SpdkBdev {
             completion: completion.clone(),
             bdev_inflight: self.inflight.clone(),
         };
-        if self.io_channel.poller_tx.send(req).is_err() {
-            return err_box!("SPDK poller thread is gone");
+
+        // Submit based on feature flag
+        #[cfg(feature = "spdk_native_reactor")]
+        {
+            // Native reactor: send message to reactor thread via spdk_thread_send_msg
+            let thread = self.io_channel.owning_thread;
+            let req_ptr = Box::into_raw(Box::new(req));
+            let rc = unsafe {
+                crate::io::spdk_ffi::spdk_thread_send_msg(
+                    thread,
+                    crate::io::spdk_poller::spdk_native_reactor_msg_handler,
+                    req_ptr as *mut std::ffi::c_void,
+                )
+            };
+            if rc != 0 {
+                self.inflight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                unsafe {
+                    Box::from_raw(req_ptr);
+                }
+                return err_box!("Failed to send message to SPDK thread");
+            }
         }
-        if let Err(e) = self.io_channel.eventfd.write(1) {
-            warn!(
-                "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                 I/O may be delayed until timeout.",
-                self.name, e
-            );
+        #[cfg(not(feature = "spdk_native_reactor"))]
+        {
+            if self.io_channel.poller_tx.send(req).is_err() {
+                self.inflight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                return err_box!("SPDK poller thread is gone");
+            }
+            if let Err(e) = self.io_channel.eventfd.write(1) {
+                warn!(
+                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                     I/O may be delayed until timeout.",
+                    self.name, e
+                );
+            }
         }
         let rc = completion.wait(self.io_timeout_us);
         if rc != 0 {
@@ -822,15 +984,23 @@ impl Drop for SpdkBdev {
         // Return qpair to pool and release handle.
         if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
             // Unregister qpair from poller before returning it to pool to avoid use-after-free
-            let unregistered =
-                env.unregister_qpair_from_poller(self.io_channel.poller_id, self.io_channel.qpair);
-            if unregistered {
+            #[cfg(not(feature = "spdk_native_reactor"))]
+            {
+                let unregistered = env
+                    .unregister_qpair_from_poller(self.io_channel.poller_id, self.io_channel.qpair);
+                if unregistered {
+                    env.release_qpair(self.ctrlr, self.io_channel.qpair);
+                } else {
+                    error!(
+                        "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
+                        self.name
+                    );
+                }
+            }
+            #[cfg(feature = "spdk_native_reactor")]
+            {
+                // Native reactor handles qpair cleanup via thread exit
                 env.release_qpair(self.ctrlr, self.io_channel.qpair);
-            } else {
-                error!(
-                    "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
-                    self.name
-                );
             }
             env.release_handle();
         } else {
@@ -857,8 +1027,14 @@ mod test {
         let mut conf = SpdkConf::default();
         conf.enabled = true;
         conf.app_name = "curvine-test".to_string();
-        conf.hugepage_mb = 64;
-        conf.reactor_mask = "0x1".to_string();
+        // Read hugepage_mb from environment or default to 128MB
+        conf.hugepage_mb = std::env::var("SPDK_HUGEPAGE_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        // Read reactor_mask from environment or default to 0x1
+        conf.reactor_mask = std::env::var("SPDK_REACTOR_MASK")
+            .unwrap_or_else(|_| "0x1".to_string());
         let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
         let trsvcid = std::env::var("SPDK_TARGET_PORT")
             .ok()

@@ -32,6 +32,7 @@ linked-hash-map = { workspace = true }
 
 [features]
 default = ["opendal-s3"]
+spdk_native_reactor = ["orpc/spdk_native_reactor"]
 
 opendal = ["dep:curvine-ufs", "curvine-ufs/opendal"]
 opendal-s3 = ["opendal", "curvine-ufs/opendal-s3"]
