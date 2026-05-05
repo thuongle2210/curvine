@@ -1021,6 +1021,13 @@ mod test {
     use crate::io::spdk_env::{SpdkConf, SpdkEnv};
 
     fn ensure_spdk_init() {
+        ensure_spdk_init_with_nvme(true);
+    }
+
+    /// Initialize SPDK env for tests.
+    /// `with_nvme` = true: include NVMe subsystem (needs nvmf_tgt running)
+    /// `with_nvme` = false: only init EAL + thread lib (no NVMe connection attempts)
+    fn ensure_spdk_init_with_nvme(with_nvme: bool) {
         if SpdkEnv::global().is_some() {
             return;
         }
@@ -1035,28 +1042,31 @@ mod test {
         // Read reactor_mask from environment or default to 0x1
         conf.reactor_mask = std::env::var("SPDK_REACTOR_MASK")
             .unwrap_or_else(|_| "0x1".to_string());
-        let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
-        let trsvcid = std::env::var("SPDK_TARGET_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4420);
-        let subnqn =
-            std::env::var("SPDK_SUBNQN").unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
-        let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
-        conf.subsystems = vec![crate::io::spdk_env::NvmeSubsystem {
-            traddr,
-            trsvcid,
-            subnqn,
-            trtype,
-            adrfam: "ipv4".to_string(),
-            ..Default::default()
-        }];
+
+        if with_nvme {
+            let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+            let trsvcid = std::env::var("SPDK_TARGET_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4420);
+            let subnqn =
+                std::env::var("SPDK_SUBNQN").unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
+            let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
+            conf.subsystems = vec![crate::io::spdk_env::NvmeSubsystem {
+                traddr,
+                trsvcid,
+                subnqn,
+                trtype,
+                adrfam: "ipv4".to_string(),
+                ..Default::default()
+            }];
+        }
         SpdkEnv::init_global(conf).expect("SPDK init for tests");
     }
 
     #[test]
     fn dma_buf_alloc_aligned() {
-        ensure_spdk_init();
+        ensure_spdk_init_with_nvme(false);
         let buf = DmaBuf::alloc(1000, 512).unwrap();
         // 1000 rounded up to 512 alignment = 1024
         assert_eq!(buf.capacity(), 1024);
@@ -1064,7 +1074,7 @@ mod test {
     }
     #[test]
     fn dma_buf_as_slice_roundtrip() {
-        ensure_spdk_init();
+        ensure_spdk_init_with_nvme(false);
         let mut buf = DmaBuf::alloc(4096, 4096).unwrap();
         assert_eq!(buf.capacity(), 4096);
         // Write a pattern and read it back
@@ -1075,7 +1085,7 @@ mod test {
     }
     #[test]
     fn dma_buf_fixed_capacity() {
-        ensure_spdk_init();
+        ensure_spdk_init_with_nvme(false);
         let buf = DmaBuf::alloc(4096, 512).unwrap();
         // Buffer is fixed-size — capacity and pointer never change
         assert_eq!(buf.capacity(), 4096);
@@ -1083,6 +1093,7 @@ mod test {
     }
     #[test]
     fn dma_buf_invalid_block_size() {
+        ensure_spdk_init_with_nvme(false);
         // block_size = 0
         assert!(DmaBuf::alloc(1024, 0).is_err());
         // block_size not power of two

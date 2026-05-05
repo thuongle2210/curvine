@@ -705,47 +705,42 @@ impl SpdkEnv {
         self.env_init()?;
 
         // Phase 2: Attach NVMe-oF controllers and discover bdevs
-        // Skip if no subsystems (e.g., DMA-only tests that don't need NVMe)
         let mut all_bdevs = Vec::new();
-        if !self.conf.subsystems.is_empty() {
-            for (i, subsystem) in self.conf.subsystems.iter().enumerate() {
-                match self.attach_controllers(subsystem) {
-                    Ok(bdevs) => {
-                        info!(
-                            "Subsystem[{}] {}: discovered {} bdev(s): [{}]",
-                            i,
-                            subsystem.endpoint(),
-                            bdevs.len(),
-                            bdevs
-                                .iter()
-                                .map(|b| b.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                        all_bdevs.extend(bdevs);
-                    }
-                    Err(e) => {
-                        error!(
-                            "Subsystem[{}] {} attach failed: {}",
-                            i,
-                            subsystem.endpoint(),
-                            e
-                        );
-                        // Continue to next subsystem — partial success is acceptable
-                    }
+        for (i, subsystem) in self.conf.subsystems.iter().enumerate() {
+            match self.attach_controllers(subsystem) {
+                Ok(bdevs) => {
+                    info!(
+                        "Subsystem[{}] {}: discovered {} bdev(s): [{}]",
+                        i,
+                        subsystem.endpoint(),
+                        bdevs.len(),
+                        bdevs
+                            .iter()
+                            .map(|b| b.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    all_bdevs.extend(bdevs);
+                }
+                Err(e) => {
+                    error!(
+                        "Subsystem[{}] {} attach failed: {}",
+                        i,
+                        subsystem.endpoint(),
+                        e
+                    );
+                    // Continue to next subsystem — partial success is acceptable
                 }
             }
+        }
 
-            if all_bdevs.is_empty() {
-                // Clean up since we failed
-                self.env_fini();
-                return err_box!(
-                    "SpdkEnv::init() failed: no bdevs discovered from {} target(s)",
-                    self.conf.subsystems.len()
-                );
-            }
-        } else {
-            info!("No subsystems configured — skipping NVMe controller attachment");
+        if all_bdevs.is_empty() {
+            // Clean up since we failed
+            self.env_fini();
+            return err_box!(
+                "SpdkEnv::init() failed: no bdevs discovered from {} target(s)",
+                self.conf.subsystems.len()
+            );
         }
 
         // Build bdev_groups

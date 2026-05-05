@@ -50,7 +50,10 @@ fn link_spdk() {
     }
 
     // Link SPDK libs (static)
+    // NOTE: rte_mempool_ring needs --whole-archive to ensure its constructor runs
     let whole = ["spdk_nvme", "spdk_sock", "spdk_sock_posix"];
+    // DPDK libs that need --whole-archive (constructors must run)
+    let whole_dpdk = ["rte_mempool_ring", "rte_mempool"];
     let mut libs = vec![
         "spdk_trace",
         "spdk_json",
@@ -72,10 +75,32 @@ fn link_spdk() {
     #[cfg(feature = "spdk-rdma")]
     libs.extend(["spdk_rdma_provider", "spdk_rdma_utils"]);
 
+    // SPDK libs that need --whole-archive (constructors must run)
     for lib in &whole {
-        let path = format!("{}/lib{}.a", lib_dir, lib);
-        if std::path::Path::new(&path).exists() {
-            println!("cargo:rustc-link-lib=static:+whole-archive={}", lib);
+        let lib_path = format!("{}/lib{}.a", lib_dir, lib);
+        if std::path::Path::new(&lib_path).exists() {
+            println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+            println!("cargo:rustc-link-arg={}", lib_path);
+            println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+        }
+    }
+    
+    // DPDK libs that need --whole-archive (constructors must run)
+    // Compute path from spdk_dir since dpdk_dir is defined later
+    if let Some(ref dir) = spdk_dir {
+        let dpdk_lib_dir = format!("{}/dpdk/build/lib", dir);
+        for lib in &whole_dpdk {
+            let lib_path = format!("{}/lib{}.a", dpdk_lib_dir, lib);
+            // Debug output
+            println!("cargo:warning=Checking for: {}", lib_path);
+            if std::path::Path::new(&lib_path).exists() {
+                println!("cargo:warning=Found! Adding --whole-archive for {}", lib_path);
+                println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+                println!("cargo:rustc-link-arg={}", lib_path);
+                println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+            } else {
+                println!("cargo:warning=NOT FOUND: {}", lib_path);
+            }
         }
     }
     for lib in &libs {
@@ -92,7 +117,6 @@ fn link_spdk() {
         .unwrap_or_else(|| "/usr/local/lib".to_string());
     let dpdk_libs = [
         "rte_eal",
-        "rte_mempool",
         "rte_ring",
         "rte_mbuf",
         "rte_bus_pci",
@@ -121,7 +145,6 @@ fn link_spdk() {
         "rte_bus_vdev",
         "rte_cmdline",
         "rte_hash",
-        "rte_mempool_ring",
         "rte_meter",
         "rte_rcu",
         "rte_stack",
