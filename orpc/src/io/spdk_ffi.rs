@@ -34,7 +34,7 @@ pub type spdk_new_thread_fn = unsafe extern "C" fn(*mut c_void) -> *mut spdk_thr
 
 extern "C" {
     // Environment (via C helper)
-    pub fn curvine_spdk_preload_libs();
+    // pub fn curvine_spdk_preload_libs();
     pub fn curvine_spdk_env_opts_sizeof() -> usize;
     pub fn curvine_spdk_env_opts_init(opts: *mut spdk_env_opts);
     pub fn curvine_spdk_env_opts_set_name(opts: *mut spdk_env_opts, name: *const c_char);

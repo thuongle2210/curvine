@@ -36,21 +36,6 @@ fn link_spdk() {
     println!("cargo:rustc-link-search=native={}", out_dir);
     println!("cargo:rustc-link-lib=static=spdk_opts_helper");
 
-    // Compile C helper for thread wrapper (spdk_native_reactor)
-    #[cfg(feature = "spdk_native_reactor")]
-    {
-        let thread_wrapper_src = format!("{}/csrc/spdk_thread_wrapper.c", manifest_dir);
-        cc::Build::new()
-            .file(&thread_wrapper_src)
-            .include(&include_dir)
-            .include(&dpdk_include)
-            .compile("spdk_thread_wrapper");
-        println!("cargo:rerun-if-changed={}", thread_wrapper_src);
-        // Explicitly link spdk_thread_wrapper from OUT_DIR
-        println!("cargo:rustc-link-search=native={}", out_dir);
-        println!("cargo:rustc-link-lib=static=spdk_thread_wrapper");
-    }
-
     // DPDK lib subdirs
     if let Some(ref dir) = spdk_dir {
         println!("cargo:rustc-link-search=native={}/dpdk/build/lib", dir);

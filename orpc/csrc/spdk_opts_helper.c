@@ -15,21 +15,21 @@
 // Pre-load SPDK/DPDK shared libraries BEFORE spdk_env_init()
 // This ensures constructors run and mempool drivers are registered.
 // Based on working spdk_native_reactor_highest_perf.c pattern.
-void curvine_spdk_preload_libs(void) {
-    fprintf(stderr, "[DEBUG C] Pre-loading SPDK/DPDK libraries...\n");
-    const char *libs[] = {
-        "/home/thuongle/spdk_project/spdk/dpdk/build/lib/librte_mempool_ring.so",
-        NULL
-    };
-    for (int i = 0; libs[i]; i++) {
-        void *handle = dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
-        if (handle) {
-            fprintf(stderr, "[DEBUG C]   Loaded: %s\n", libs[i]);
-        } else {
-            fprintf(stderr, "[DEBUG C]   FAILED to load: %s (error=%s)\n", libs[i], dlerror());
-        }
-    }
-}
+// void curvine_spdk_preload_libs(void) {
+    // fprintf(stderr, "[DEBUG C] Pre-loading SPDK/DPDK libraries...\n");
+    // const char *libs[] = {
+    //     "/home/thuongle/spdk_project/spdk/dpdk/build/lib/librte_mempool_ring.so",
+    //     NULL
+    // };
+    // for (int i = 0; libs[i]; i++) {
+    //     void *handle = dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
+    //     if (handle) {
+    //         fprintf(stderr, "[DEBUG C]   Loaded: %s\n", libs[i]);
+    //     } else {
+    //         fprintf(stderr, "[DEBUG C]   FAILED to load: %s (error=%s)\n", libs[i], dlerror());
+    //     }
+    // }
+// }
 
 // env_opts helpers
 void curvine_spdk_env_opts_init(struct spdk_env_opts *opts) {
@@ -219,9 +219,7 @@ int curvine_spdk_get_shutdown_flag(void) {
     return g_shutdown_flag;
 }
 
-// NOTE: curvine_spdk_thread_lib_init is now implemented in spdk_thread_wrapper.c
-// to use spdk_thread_lib_init_ext with smaller mempool size.
-// This wrapper file only contains the check_eal_memory function.
+
 
 // I/O qpair
 struct spdk_nvme_qpair *curvine_spdk_alloc_io_qpair(struct spdk_nvme_ctrlr *ctrlr) {
@@ -343,4 +341,12 @@ void curvine_spdk_async_ctx_init(struct curvine_async_ctx *ctx, curvine_async_cb
     ctx->cb = cb;
     ctx->cb_arg = cb_arg;
     fprintf(stderr, "[DEBUG C] curvine_spdk_async_ctx_init: ctx=%p, cb=%p, cb_arg=%p\n", (void*)ctx, (void*)(uintptr_t)cb, cb_arg);
+}
+
+// Thread library init wrapper - uses smaller mempool size to avoid ENOMEM
+// This is the function previously in spdk_thread_wrapper.c
+int curvine_spdk_thread_lib_init(spdk_new_thread_fn new_thread_fn, size_t ctx_sz) {
+    // Use smaller mempool size to avoid ENOMEM failures due to hugepage fragmentation
+    size_t small_mempool_size = 4096;
+    return spdk_thread_lib_init_ext(NULL, NULL, ctx_sz, small_mempool_size);
 }
