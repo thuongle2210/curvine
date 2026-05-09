@@ -171,7 +171,6 @@ unsafe impl Sync for SpdkBdev {}
 
 impl SpdkBdev {
     // mirror LocalFile::with_read/with_write
-    // mirror LocalFile::with_read/with_write
 
     pub fn open_read(name: &str, offset: u64, max_len: i64) -> IOResult<Self> {
         Self::open(name, offset as i64, false, max_len)
@@ -244,7 +243,7 @@ impl SpdkBdev {
                 {
                     // Create qpair on reactor thread (SPDK requirement)
                     let owning_thread = env.get_spdk_thread(info.ctrlr_idx as usize);
-                    let reactor_state = env.get_reactor_state(info.ctrlr_idx as usize);
+                    let _reactor_state = env.get_reactor_state(info.ctrlr_idx as usize);
 
                     // Send message to reactor thread to create qpair
                     let qpair_out = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -299,9 +298,6 @@ impl SpdkBdev {
                             return err_box!("Qpair creation returned null");
                         }
                     };
-
-                    // Add qpair to reactor state so completions get processed
-                    reactor_state.qpairs.lock().unwrap().push(qpair);
 
                     SpdkIoChannel {
                         qpair,
@@ -406,6 +402,29 @@ impl SpdkBdev {
         Ok(())
     }
 
+    /// Send I/O request to reactor thread via spdk_thread_send_msg.
+    #[cfg(feature = "spdk_native_reactor")]
+    fn send_to_reactor(&self, req: crate::io::spdk_poller::IoRequest) -> IOResult<()> {
+        let thread = self.io_channel.owning_thread;
+        let req_ptr = Box::into_raw(Box::new(req));
+        let rc = unsafe {
+            crate::io::spdk_ffi::spdk_thread_send_msg(
+                thread,
+                crate::io::spdk_poller::spdk_native_reactor_msg_handler,
+                req_ptr as *mut std::ffi::c_void,
+            )
+        };
+        if rc != 0 {
+            self.inflight
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            unsafe {
+                Box::from_raw(req_ptr);
+            }
+            return err_box!("Failed to send message to SPDK thread");
+        }
+        Ok(())
+    }
+
     /// Submit read to SPDK, wait for completion. Uses DMA buffer (large reads chunked).
     fn spdk_read(&mut self, offset: i64, len: usize) -> IOResult<BytesMut> {
         let buf_cap = self.read_buf.capacity();
@@ -444,24 +463,7 @@ impl SpdkBdev {
             // Submit based on feature flag
             #[cfg(feature = "spdk_native_reactor")]
             {
-                // Native reactor: send message to reactor thread via spdk_thread_send_msg
-                let thread = self.io_channel.owning_thread;
-                let req_ptr = Box::into_raw(Box::new(req));
-                let rc = unsafe {
-                    crate::io::spdk_ffi::spdk_thread_send_msg(
-                        thread,
-                        crate::io::spdk_poller::spdk_native_reactor_msg_handler,
-                        req_ptr as *mut std::ffi::c_void,
-                    )
-                };
-                if rc != 0 {
-                    self.inflight
-                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                    unsafe {
-                        Box::from_raw(req_ptr);
-                    }
-                    return err_box!("Failed to send message to SPDK thread");
-                }
+                self.send_to_reactor(req)?;
             }
             #[cfg(not(feature = "spdk_native_reactor"))]
             {
@@ -535,24 +537,7 @@ impl SpdkBdev {
             // Submit based on feature flag
             #[cfg(feature = "spdk_native_reactor")]
             {
-                // Native reactor: send message to reactor thread via spdk_thread_send_msg
-                let thread = self.io_channel.owning_thread;
-                let req_ptr = Box::into_raw(Box::new(req));
-                let rc = unsafe {
-                    crate::io::spdk_ffi::spdk_thread_send_msg(
-                        thread,
-                        crate::io::spdk_poller::spdk_native_reactor_msg_handler,
-                        req_ptr as *mut std::ffi::c_void,
-                    )
-                };
-                if rc != 0 {
-                    self.inflight
-                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                    unsafe {
-                        Box::from_raw(req_ptr);
-                    }
-                    return err_box!("Failed to send message to SPDK thread");
-                }
+                self.send_to_reactor(req)?;
             }
             #[cfg(not(feature = "spdk_native_reactor"))]
             {
@@ -667,28 +652,11 @@ impl SpdkBdev {
                 // Submit based on feature flag
                 #[cfg(feature = "spdk_native_reactor")]
                 {
-                    // Native reactor: send message to reactor thread via spdk_thread_send_msg
-                    let thread = self.io_channel.owning_thread;
                     info!(
                         "[SpdkBdev] Sending write: ns={:?}, qpair={:?}, offset={}, len={}",
                         self.ns, self.io_channel.qpair, aligned_off, aligned_len
                     );
-                    let req_ptr = Box::into_raw(Box::new(req));
-                    let rc = unsafe {
-                        crate::io::spdk_ffi::spdk_thread_send_msg(
-                            thread,
-                            crate::io::spdk_poller::spdk_native_reactor_msg_handler,
-                            req_ptr as *mut std::ffi::c_void,
-                        )
-                    };
-                    if rc != 0 {
-                        self.inflight
-                            .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                        unsafe {
-                            Box::from_raw(req_ptr);
-                        }
-                        return err_box!("Failed to send message to SPDK thread");
-                    }
+                    self.send_to_reactor(req)?;
                 }
                 #[cfg(not(feature = "spdk_native_reactor"))]
                 {
@@ -743,24 +711,7 @@ impl SpdkBdev {
             // Submit based on feature flag
             #[cfg(feature = "spdk_native_reactor")]
             {
-                // Native reactor: send message to reactor thread via spdk_thread_send_msg
-                let thread = self.io_channel.owning_thread;
-                let req_ptr = Box::into_raw(Box::new(req));
-                let rc = unsafe {
-                    crate::io::spdk_ffi::spdk_thread_send_msg(
-                        thread,
-                        crate::io::spdk_poller::spdk_native_reactor_msg_handler,
-                        req_ptr as *mut std::ffi::c_void,
-                    )
-                };
-                if rc != 0 {
-                    self.inflight
-                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                    unsafe {
-                        Box::from_raw(req_ptr);
-                    }
-                    return err_box!("Failed to send message to SPDK thread");
-                }
+                self.send_to_reactor(req)?;
             }
             #[cfg(not(feature = "spdk_native_reactor"))]
             {
@@ -811,24 +762,7 @@ impl SpdkBdev {
         // Submit based on feature flag
         #[cfg(feature = "spdk_native_reactor")]
         {
-            // Native reactor: send message to reactor thread via spdk_thread_send_msg
-            let thread = self.io_channel.owning_thread;
-            let req_ptr = Box::into_raw(Box::new(req));
-            let rc = unsafe {
-                crate::io::spdk_ffi::spdk_thread_send_msg(
-                    thread,
-                    crate::io::spdk_poller::spdk_native_reactor_msg_handler,
-                    req_ptr as *mut std::ffi::c_void,
-                )
-            };
-            if rc != 0 {
-                self.inflight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                unsafe {
-                    Box::from_raw(req_ptr);
-                }
-                return err_box!("Failed to send message to SPDK thread");
-            }
+            self.send_to_reactor(req)?;
         }
         #[cfg(not(feature = "spdk_native_reactor"))]
         {
@@ -840,7 +774,7 @@ impl SpdkBdev {
             if let Err(e) = self.io_channel.eventfd.write(1) {
                 warn!(
                     "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                     I/O may be delayed until timeout.",
+                         I/O may be delayed until timeout.",
                     self.name, e
                 );
             }
