@@ -59,24 +59,24 @@ extern "C" {
     // SPDK thread management (native reactor)
     pub fn spdk_thread_create(name: *const c_char, cpumask: *const c_void) -> *mut spdk_thread;
     pub fn spdk_thread_exit(thread: *mut spdk_thread);
-    pub fn spdk_thread_destroy(thread: *mut spdk_thread);
+    // pub fn spdk_thread_destroy(thread: *mut spdk_thread);
     pub fn spdk_thread_send_msg(
         thread: *mut spdk_thread,
         cb: spdk_thread_fn,
         arg: *mut c_void,
     ) -> c_int;
     // Use wrapper from spdk_opts_helper.c
-    pub fn curvine_spdk_thread_is_current(thread: *mut spdk_thread) -> bool;
+    // pub fn curvine_spdk_thread_is_current(thread: *mut spdk_thread) -> bool;
     pub fn spdk_set_thread(thread: *mut spdk_thread);
     pub fn spdk_get_thread() -> *mut spdk_thread;
     pub fn spdk_thread_poll(thread: *mut spdk_thread, max_msgs: u32, now: u64) -> c_int;
     // Run reactor loop (C helper)
     pub fn curvine_spdk_run_reactor_loop(thread: *mut spdk_thread);
-    pub fn curvine_spdk_run_reactor_loop_with_stop(
-        thread: *mut spdk_thread,
-        stop_flag: *const std::ffi::c_void,
-    );
-    pub fn curvine_spdk_signal_reactor_exit(thread: *mut spdk_thread);
+    // pub fn curvine_spdk_run_reactor_loop_with_stop(
+    //     thread: *mut spdk_thread,
+    //     stop_flag: *const std::ffi::c_void,
+    // );
+    // pub fn curvine_spdk_signal_reactor_exit(thread: *mut spdk_thread);
     pub fn curvine_spdk_set_shutdown_flag();
     pub fn curvine_spdk_get_shutdown_flag() -> std::ffi::c_int;
 
@@ -87,8 +87,8 @@ extern "C" {
         period_us: u64,
     ) -> *mut spdk_poller;
     pub fn spdk_poller_unregister(poller: *mut spdk_poller);
-    pub fn spdk_poller_pause(poller: *mut spdk_poller);
-    pub fn spdk_poller_resume(poller: *mut spdk_poller);
+    // pub fn spdk_poller_pause(poller: *mut spdk_poller);
+    // pub fn spdk_poller_resume(poller: *mut spdk_poller);
     // I/O completion processing
     pub fn spdk_nvme_qpair_process_completions(
         qpair: *mut spdk_nvme_qpair,
@@ -131,28 +131,28 @@ extern "C" {
     // I/O qpair
     pub fn curvine_spdk_alloc_io_qpair(ctrlr: *mut spdk_nvme_ctrlr) -> *mut spdk_nvme_qpair;
     pub fn curvine_spdk_free_io_qpair(qpair: *mut spdk_nvme_qpair);
-    // Sync NVMe I/O (unused, to remove)
-    pub fn curvine_spdk_ns_read(
-        ns: *mut spdk_nvme_ns,
-        qpair: *mut spdk_nvme_qpair,
-        buf: *mut c_void,
-        offset: u64,
-        num_bytes: u64,
-        timeout_us: u64,
-    ) -> c_int;
-    pub fn curvine_spdk_ns_write(
-        ns: *mut spdk_nvme_ns,
-        qpair: *mut spdk_nvme_qpair,
-        buf: *mut c_void,
-        offset: u64,
-        num_bytes: u64,
-        timeout_us: u64,
-    ) -> c_int;
-    pub fn curvine_spdk_ns_flush(
-        ns: *mut spdk_nvme_ns,
-        qpair: *mut spdk_nvme_qpair,
-        timeout_us: u64,
-    ) -> c_int;
+    // Sync NVMe I/O (unused, replaced by async _submit variants)
+    // pub fn curvine_spdk_ns_read(
+    //     ns: *mut spdk_nvme_ns,
+    //     qpair: *mut spdk_nvme_qpair,
+    //     buf: *mut c_void,
+    //     offset: u64,
+    //     num_bytes: u64,
+    //     timeout_us: u64,
+    // ) -> c_int;
+    // pub fn curvine_spdk_ns_write(
+    //     ns: *mut spdk_nvme_ns,
+    //     qpair: *mut spdk_nvme_qpair,
+    //     buf: *mut c_void,
+    //     offset: u64,
+    //     num_bytes: u64,
+    //     timeout_us: u64,
+    // ) -> c_int;
+    // pub fn curvine_spdk_ns_flush(
+    //     ns: *mut spdk_nvme_ns,
+    //     qpair: *mut spdk_nvme_qpair,
+    //     timeout_us: u64,
+    // ) -> c_int;
 }
 
 // Async context - opaque C struct (byte buffer)

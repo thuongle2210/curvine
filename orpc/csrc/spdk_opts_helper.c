@@ -121,11 +121,11 @@ void curvine_spdk_dma_free(void *buf) {
 }
 
 // Thread helpers
-#include "spdk/thread.h"
-bool curvine_spdk_thread_is_current(struct spdk_thread *thread) {
-    struct spdk_thread *current = spdk_get_thread();
-    return (current != NULL) && (current == thread);
-}
+// #include "spdk/thread.h"
+// bool curvine_spdk_thread_is_current(struct spdk_thread *thread) {
+//     struct spdk_thread *current = spdk_get_thread();
+//     return (current != NULL) && (current == thread);
+// }
 
 // Debug: check EAL memory availability
 void curvine_check_eal_memory(void) {
@@ -195,12 +195,12 @@ void curvine_spdk_run_reactor_loop(struct spdk_thread *thread) {
 // Signal the reactor thread to exit.
 // This should be called from WITHIN the reactor thread.
 // Sets the thread's exit flag so next spdk_thread_poll will return.
-void curvine_spdk_signal_reactor_exit(struct spdk_thread *thread) {
-    if (thread) {
-        fprintf(stderr, "[DEBUG C] curvine_spdk_signal_reactor_exit: thread=%p\n", thread);
-        spdk_thread_exit(thread);
-    }
-}
+// void curvine_spdk_signal_reactor_exit(struct spdk_thread *thread) {
+//     if (thread) {
+//         fprintf(stderr, "[DEBUG C] curvine_spdk_signal_reactor_exit: thread=%p\n", thread);
+//         spdk_thread_exit(thread);
+//     }
+// }
 
 // Global shutdown flag (atomic) - set by Rust shutdown()
 static volatile int g_shutdown_flag = 0;
@@ -271,32 +271,32 @@ static int curvine_poll(struct spdk_nvme_qpair *qpair, struct curvine_io_ctx *ct
     return ctx->status;
 }
 
-// Sync I/O
-int curvine_spdk_ns_read(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
-                         void *buf, uint64_t offset, uint64_t nbytes, uint64_t timeout_us) {
-    uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
-    fprintf(stderr, "[DEBUG C] curvine_spdk_ns_read: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu\n",
-            ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss);
-    struct curvine_io_ctx ctx = { .done = false, .status = 0 };
-    int rc = spdk_nvme_ns_cmd_read(ns, qpair, buf, offset / ss, nbytes / ss, curvine_cb, &ctx, 0);
-    fprintf(stderr, "[DEBUG C] curvine_spdk_ns_read: spdk_nvme_ns_cmd_read returned rc=%d\n", rc);
-    return rc ? rc : curvine_poll(qpair, &ctx, timeout_us);
-}
-int curvine_spdk_ns_write(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
-                          void *buf, uint64_t offset, uint64_t nbytes, uint64_t timeout_us) {
-    uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
-    fprintf(stderr, "[DEBUG C] curvine_spdk_ns_write: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu\n",
-            ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss);
-    struct curvine_io_ctx ctx = { .done = false, .status = 0 };
-    int rc = spdk_nvme_ns_cmd_write(ns, qpair, buf, offset / ss, nbytes / ss, curvine_cb, &ctx, 0);
-    fprintf(stderr, "[DEBUG C] curvine_spdk_ns_write: spdk_nvme_ns_cmd_write returned rc=%d\n", rc);
-    return rc ? rc : curvine_poll(qpair, &ctx, timeout_us);
-}
-int curvine_spdk_ns_flush(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, uint64_t timeout_us) {
-    struct curvine_io_ctx ctx = { .done = false, .status = 0 };
-    int rc = spdk_nvme_ns_cmd_flush(ns, qpair, curvine_cb, &ctx);
-    return rc ? rc : curvine_poll(qpair, &ctx, timeout_us);
-}
+// Sync I/O (unused, replaced by async _submit variants)
+// int curvine_spdk_ns_read(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+//                          void *buf, uint64_t offset, uint64_t nbytes, uint64_t timeout_us) {
+//     uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
+//     fprintf(stderr, "[DEBUG C] curvine_spdk_ns_read: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu\n",
+//             ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss);
+//     struct curvine_io_ctx ctx = { .done = false, .status = 0 };
+//     int rc = spdk_nvme_ns_cmd_read(ns, qpair, buf, offset / ss, nbytes / ss, curvine_cb, &ctx, 0);
+//     fprintf(stderr, "[DEBUG C] curvine_spdk_ns_read: spdk_nvme_ns_cmd_read returned rc=%d\n", rc);
+//     return rc ? rc : curvine_poll(qpair, &ctx, timeout_us);
+// }
+// int curvine_spdk_ns_write(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+//                           void *buf, uint64_t offset, uint64_t nbytes, uint64_t timeout_us) {
+//     uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
+//     fprintf(stderr, "[DEBUG C] curvine_spdk_ns_write: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu\n",
+//             ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss);
+//     struct curvine_io_ctx ctx = { .done = false, .status = 0 };
+//     int rc = spdk_nvme_ns_cmd_write(ns, qpair, buf, offset / ss, nbytes / ss, curvine_cb, &ctx, 0);
+//     fprintf(stderr, "[DEBUG C] curvine_spdk_ns_write: spdk_nvme_ns_cmd_write returned rc=%d\n", rc);
+//     return rc ? rc : curvine_poll(qpair, &ctx, timeout_us);
+// }
+// int curvine_spdk_ns_flush(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, uint64_t timeout_us) {
+//     struct curvine_io_ctx ctx = { .done = false, .status = 0 };
+//     int rc = spdk_nvme_ns_cmd_flush(ns, qpair, curvine_cb, &ctx);
+//     return rc ? rc : curvine_poll(qpair, &ctx, timeout_us);
+// }
 
 // Async I/O
 typedef void (*curvine_async_cb)(void *arg, int status);
