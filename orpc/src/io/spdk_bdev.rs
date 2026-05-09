@@ -15,10 +15,11 @@
 use crate::err_box;
 use crate::io::block_io::BlockIO;
 use crate::io::spdk_env::SpdkEnv;
+use crate::io::spdk_ffi;
 use crate::io::IOResult;
 use crate::sys::DataSlice;
 use bytes::BytesMut;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use std::fmt::{Display, Formatter};
 // ---------------------------------------------------------------------------
 // SPDK I/O channel — bridge between Tokio and SPDK reactor
@@ -45,6 +46,8 @@ pub struct SpdkIoChannel {
     pub qpair: *mut crate::io::spdk_ffi::spdk_nvme_qpair,
     /// SPDK thread that owns this qpair (cached from get_spdk_thread)
     pub owning_thread: *mut crate::io::spdk_ffi::spdk_thread,
+    /// Index of the controller this qpair belongs to (for reactor state lookup)
+    pub ctrlr_idx: usize,
 }
 #[cfg(feature = "spdk_native_reactor")]
 unsafe impl Send for SpdkIoChannel {}
@@ -165,7 +168,9 @@ pub struct SpdkBdev {
 // SAFETY: owns qpair and DMA buffers exclusively
 unsafe impl Send for SpdkBdev {}
 unsafe impl Sync for SpdkBdev {}
+
 impl SpdkBdev {
+    // mirror LocalFile::with_read/with_write
     // mirror LocalFile::with_read/with_write
 
     pub fn open_read(name: &str, offset: u64, max_len: i64) -> IOResult<Self> {
@@ -232,26 +237,84 @@ impl SpdkBdev {
             // Recover raw SPDK pointers from BdevInfo
             let ctrlr = info.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
             let ns = info.ns as *mut spdk_ffi::spdk_nvme_ns;
-            // Acquire a qpair from the pool (reuses a cached one or allocates new).
-            let qpair = match env.acquire_qpair(ctrlr) {
-                Ok(qp) => qp,
-                Err(e) => {
-                    env.release_handle();
-                    return Err(e.into());
-                }
-            };
+            
             // Get I/O channel based on feature flag
             let io_channel = {
                 #[cfg(feature = "spdk_native_reactor")]
                 {
+                    // Create qpair on reactor thread (SPDK requirement)
                     let owning_thread = env.get_spdk_thread(info.ctrlr_idx as usize);
+                    let reactor_state = env.get_reactor_state(info.ctrlr_idx as usize);
+                    
+                    // Send message to reactor thread to create qpair
+                    let qpair_out = std::sync::Arc::new(std::sync::Mutex::new(None));
+                    let completion = crate::io::spdk_poller::IoCompletion::new();
+                    
+                    let create_req = Box::new(crate::io::spdk_poller::QpairCreateRequest {
+                        ctrlr,
+                        qpair_out: qpair_out.clone(),
+                        completion: completion.clone(),
+                    });
+                    
+                    info!("[qpair] Sending qpair creation message to thread {:?}", owning_thread);
+                    let req_ptr = Box::into_raw(create_req);
+                    let rc = unsafe {
+                        spdk_ffi::spdk_thread_send_msg(
+                            owning_thread,
+                            crate::io::spdk_poller::qpair_create_handler,
+                            req_ptr as *mut std::ffi::c_void,
+                        )
+                    };
+                    
+                    if rc != 0 {
+                        unsafe { Box::from_raw(req_ptr); }
+                        error!("[qpair] spdk_thread_send_msg failed: rc={}", rc);
+                        env.release_handle();
+                        return err_box!("Failed to send qpair creation message to reactor thread");
+                    }
+                    
+                    info!("[qpair] Waiting for qpair creation completion...");
+                    // Wait for qpair creation
+                    let status = completion.wait(env.conf().io_timeout_us);
+                    info!("[qpair] Qpair creation completion: status={}", status);
+                    if status != 0 {
+                        env.release_handle();
+                        return err_box!("Qpair creation on reactor thread failed");
+                    }
+                    
+                    let qpair = {
+                        let mut out = qpair_out.lock().unwrap();
+                        out.take()
+                    };
+                    
+                    let qpair = match qpair {
+                        Some(qp) => qp,
+                        None => {
+                            env.release_handle();
+                            return err_box!("Qpair creation returned null");
+                        }
+                    };
+                    
+                    // Add qpair to reactor state so completions get processed
+                    reactor_state.qpairs.lock().unwrap().push(qpair);
+                    
                     SpdkIoChannel {
                         qpair,
                         owning_thread,
+                        ctrlr_idx: info.ctrlr_idx as usize,
                     }
                 }
                 #[cfg(not(feature = "spdk_native_reactor"))]
                 {
+                    // Acquire a qpair from the pool (reuses a cached one or allocates new).
+                    let qpair = match env.acquire_qpair(ctrlr) {
+                        Ok(qp) => qp,
+                        Err(e) => {
+                            env.release_handle();
+                            return Err(e.into());
+                        }
+                    };
+                    
                     // Get poller for this controller (1:1 mapping)
                     let (poller_tx, eventfd, poller_id) = env.get_poller(info.ctrlr_idx as usize);
                     SpdkIoChannel {
@@ -596,19 +659,26 @@ impl SpdkBdev {
                     bdev_inflight: self.inflight.clone(),
                 };
 
-                // Submit based on feature flag
-                #[cfg(feature = "spdk_native_reactor")]
-                {
-                    // Native reactor: send message to reactor thread via spdk_thread_send_msg
-                    let thread = self.io_channel.owning_thread;
-                    let req_ptr = Box::into_raw(Box::new(req));
-                    let rc = unsafe {
-                        crate::io::spdk_ffi::spdk_thread_send_msg(
-                            thread,
-                            crate::io::spdk_poller::spdk_native_reactor_msg_handler,
-                            req_ptr as *mut std::ffi::c_void,
-                        )
-                    };
+// Submit based on feature flag
+            #[cfg(feature = "spdk_native_reactor")]
+            {
+                // Native reactor: send message to reactor thread via spdk_thread_send_msg
+                let thread = self.io_channel.owning_thread;
+                info!(
+                    "[SpdkBdev] Sending write: ns={:?}, qpair={:?}, offset={}, len={}",
+                    self.ns,
+                    self.io_channel.qpair,
+                    aligned_off,
+                    aligned_len
+                );
+                let req_ptr = Box::into_raw(Box::new(req));
+                let rc = unsafe {
+                    crate::io::spdk_ffi::spdk_thread_send_msg(
+                        thread,
+                        crate::io::spdk_poller::spdk_native_reactor_msg_handler,
+                        req_ptr as *mut std::ffi::c_void,
+                    )
+                };
                     if rc != 0 {
                         self.inflight
                             .fetch_sub(1, std::sync::atomic::Ordering::Release);
@@ -999,8 +1069,27 @@ impl Drop for SpdkBdev {
             }
             #[cfg(feature = "spdk_native_reactor")]
             {
-                // Native reactor handles qpair cleanup via thread exit
-                env.release_qpair(self.ctrlr, self.io_channel.qpair);
+                // Remove qpair from reactor state's qpair list
+                let reactor_state = env.get_reactor_state(self.io_channel.ctrlr_idx);
+                reactor_state.qpairs.lock().unwrap()
+                    .retain(|&qp| qp != self.io_channel.qpair);
+                
+                // Free qpair on reactor thread (SPDK requirement)
+                let free_req = Box::new(crate::io::spdk_poller::QpairFreeRequest {
+                    qpair: self.io_channel.qpair,
+                });
+                let req_ptr = Box::into_raw(free_req);
+                let rc = unsafe {
+                    spdk_ffi::spdk_thread_send_msg(
+                        self.io_channel.owning_thread,
+                        crate::io::spdk_poller::qpair_free_handler,
+                        req_ptr as *mut std::ffi::c_void,
+                    )
+                };
+                if rc != 0 {
+                    unsafe { Box::from_raw(req_ptr); }
+                    error!("Failed to send qpair free message to reactor thread");
+                }
             }
             env.release_handle();
         } else {

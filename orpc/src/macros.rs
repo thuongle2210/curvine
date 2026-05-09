@@ -34,7 +34,8 @@ macro_rules! err_msg {
 #[macro_export]
 macro_rules! err_box {
     ($e:expr) => ({
-        Err($crate::err_msg!($e).into())
+        let msg: String = $crate::err_msg!($e);
+        Err(msg.into())
     });
 
     ($f:tt, $($arg:expr),+) => ({

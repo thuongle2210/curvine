@@ -2,6 +2,7 @@
 
 use crate::err_msg;
 use crate::io::spdk_ffi;
+#[cfg(feature = "spdk_native_reactor")]
 use crate::io::spdk_poller::IoRequest;
 #[cfg(not(feature = "spdk_native_reactor"))]
 use crate::io::spdk_poller::SpdkPoller;
@@ -11,10 +12,34 @@ use log::{error, info, warn};
 use nix::sys::eventfd::EventFd;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
+
+// ---------------------------------------------------------------------------
+// Reactor State (native reactor only)
+// ---------------------------------------------------------------------------
+
+/// Single poller per reactor: processes completions for ALL qpairs on that reactor.
+#[cfg(feature = "spdk_native_reactor")]
+pub struct ReactorState {
+    pub thread: *mut spdk_ffi::spdk_thread,
+    pub os_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub qpairs: Mutex<Vec<*mut spdk_ffi::spdk_nvme_qpair>>,
+    pub poller: *mut spdk_ffi::spdk_poller,
+    pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,  // Signal to stop reactor loop
+    pub reactor_idx: usize,  // Index of this reactor (0-based)
+    /// Controllers attached on this reactor thread (ctrlr_idx -> controller pointer)
+    pub controllers: Mutex<HashMap<usize, *mut spdk_ffi::spdk_nvme_ctrlr>>,
+}
+
+#[cfg(feature = "spdk_native_reactor")]
+unsafe impl Send for ReactorState {}
+#[cfg(feature = "spdk_native_reactor")]
+unsafe impl Sync for ReactorState {}
 
 /// Controller selection strategy for distributing I/O across multiple controllers.
 #[derive(Clone, Debug, PartialEq)]
@@ -184,6 +209,31 @@ impl QpairPool {
 
 static SPDK_ENV: OnceLock<SpdkEnv> = OnceLock::new();
 static INIT_LOCK: Mutex<()> = Mutex::new(());
+static REACTOR_STATES: OnceLock<Mutex<Vec<Arc<ReactorState>>>> = OnceLock::new();
+
+/// Register reactor states (called after start_native_reactors completes)
+#[cfg(feature = "spdk_native_reactor")]
+pub fn register_reactor_states(states: Vec<Arc<ReactorState>>) {
+    let _ = REACTOR_STATES.set(Mutex::new(states));
+}
+
+/// Find the ReactorState that owns a given controller pointer.
+/// The controller was attached on that reactor's thread.
+#[cfg(feature = "spdk_native_reactor")]
+pub fn find_reactor_for_controller(ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr) -> Option<Arc<ReactorState>> {
+    if let Some(states) = REACTOR_STATES.get() {
+        let states = states.lock().unwrap();
+        for state in states.iter() {
+            let controllers = state.controllers.lock().unwrap();
+            for (_, stored_ctrlr) in controllers.iter() {
+                if *stored_ctrlr == ctrlr {
+                    return Some(state.clone());
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Lifecycle state
 #[repr(u8)]
@@ -551,6 +601,8 @@ pub struct BdevInfo {
     pub ns: usize,               // raw pointer for SpdkBdev
     pub nsid: u32,               // namespace ID (1-based)
     pub ctrlr_idx: u32,          // controller index (0-based, for multi-controller)
+    #[cfg(feature = "spdk_native_reactor")]
+    pub reactor_idx: usize,      // Which reactor thread owns this controller
 }
 
 impl Display for BdevInfo {
@@ -576,13 +628,11 @@ pub struct SpdkEnv {
     qpair_pool: QpairPool,
     /// Controller selection strategy state
     controller_selection: Mutex<ControllerSelectionStrategy>,
-    /// SPDK native reactor threads (round-robin mapping)
+    /// SPDK native reactor threads + single poller per reactor (round-robin mapping)
     #[cfg(feature = "spdk_native_reactor")]
-    reactor_threads: Mutex<Vec<*mut spdk_ffi::spdk_thread>>,
+    reactor_states: Mutex<Vec<Arc<ReactorState>>>,
     #[cfg(feature = "spdk_native_reactor")]
     next_reactor_idx: Mutex<usize>,
-    #[cfg(feature = "spdk_native_reactor")]
-    thread_pollers: Mutex<HashMap<*mut spdk_ffi::spdk_thread, Vec<*mut spdk_ffi::spdk_poller>>>,
     /// Simple poller map: ctrlr_idx -> SpdkPoller (1:1 mapping) - legacy
     #[cfg(not(feature = "spdk_native_reactor"))]
     pollers: Mutex<HashMap<usize, SpdkPoller>>,
@@ -608,11 +658,9 @@ impl SpdkEnv {
             qpair_pool: QpairPool::new(),
             controller_selection: Mutex::new(conf.controller_selection.clone()),
             #[cfg(feature = "spdk_native_reactor")]
-            reactor_threads: Mutex::new(Vec::new()),
+            reactor_states: Mutex::new(Vec::new()),
             #[cfg(feature = "spdk_native_reactor")]
             next_reactor_idx: Mutex::new(0),
-            #[cfg(feature = "spdk_native_reactor")]
-            thread_pollers: Mutex::new(HashMap::new()),
             #[cfg(not(feature = "spdk_native_reactor"))]
             pollers: Mutex::new(HashMap::new()),
         })
@@ -705,74 +753,132 @@ impl SpdkEnv {
         self.env_init()?;
 
         // Phase 2: Attach NVMe-oF controllers and discover bdevs
-        // Skip if no subsystems (e.g., DMA-only tests that don't need NVMe)
+        // For spdk_native_reactor: controllers are attached on reactor threads (see start_native_reactors)
+        // For legacy mode: attach controllers here on main thread
         let mut all_bdevs = Vec::new();
-        if !self.conf.subsystems.is_empty() {
-            for (i, subsystem) in self.conf.subsystems.iter().enumerate() {
-                match self.attach_controllers(subsystem) {
-                    Ok(bdevs) => {
-                        info!(
-                            "Subsystem[{}] {}: discovered {} bdev(s): [{}]",
-                            i,
-                            subsystem.endpoint(),
-                            bdevs.len(),
-                            bdevs
-                                .iter()
-                                .map(|b| b.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                        all_bdevs.extend(bdevs);
+
+        #[cfg(not(feature = "spdk_native_reactor"))]
+        {
+            if !self.conf.subsystems.is_empty() {
+                for (i, subsystem) in self.conf.subsystems.iter().enumerate() {
+                    match self.attach_controllers(subsystem) {
+                        Ok(bdevs) => {
+                            info!(
+                                "Subsystem[{}] {}: discovered {} bdev(s): [{}]",
+                                i,
+                                subsystem.endpoint(),
+                                bdevs.len(),
+                                bdevs
+                                    .iter()
+                                    .map(|b| b.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                            all_bdevs.extend(bdevs);
+                        }
+                        Err(e) => {
+                            error!(
+                                "Subsystem[{}] {} attach failed: {}",
+                                i,
+                                subsystem.endpoint(),
+                                e
+                            );
+                            // Continue to next subsystem — partial success is acceptable
+                        }
                     }
-                    Err(e) => {
-                        error!(
-                            "Subsystem[{}] {} attach failed: {}",
-                            i,
-                            subsystem.endpoint(),
-                            e
-                        );
-                        // Continue to next subsystem — partial success is acceptable
-                    }
+                }
+
+                if all_bdevs.is_empty() {
+                    // Clean up since we failed
+                    self.env_fini();
+                    return err_box!(
+                        "SpdkEnv::init() failed: no bdevs discovered from {} target(s)",
+                        self.conf.subsystems.len()
+                    );
+                }
+            } else {
+                info!("No subsystems configured — skipping NVMe controller attachment");
+            }
+        }
+
+        // Build bdev_groups (for non-native-reactor mode, bdevs are already populated)
+        #[cfg(not(feature = "spdk_native_reactor"))]
+        {
+            let mut bdev_groups: HashMap<(String, u32), Vec<usize>> = HashMap::new();
+            for (idx, bdev) in all_bdevs.iter().enumerate() {
+                // Extract subnqn from target_endpoint (format: trtype://traddr:trsvcid/subnqn)
+                if let Some(subnqn) = bdev.target_endpoint.split('/').nth(3) {
+                    let key = (subnqn.to_string(), bdev.nsid);
+                    bdev_groups.entry(key).or_default().push(idx);
                 }
             }
 
-            if all_bdevs.is_empty() {
-                // Clean up since we failed
-                self.env_fini();
-                return err_box!(
-                    "SpdkEnv::init() failed: no bdevs discovered from {} target(s)",
-                    self.conf.subsystems.len()
-                );
+            info!(
+                "SPDK env initialized: {} bdev(s) from {} target(s), {} controller group(s)",
+                all_bdevs.len(),
+                self.conf.subsystems.len(),
+                bdev_groups.len()
+            );
+
+            info!("Discovered bdevs:");
+            for (idx, bdev) in all_bdevs.iter().enumerate() {
+                #[cfg(feature = "spdk_native_reactor")]
+                {
+                    info!("  bdev[{}]: name={}, ctrlr_idx={}, reactor_idx={}",
+                        idx, bdev.name, bdev.ctrlr_idx, bdev.reactor_idx);
+                }
+                #[cfg(not(feature = "spdk_native_reactor"))]
+                {
+                    info!("  bdev[{}]: name={}, ctrlr_idx={}",
+                        idx, bdev.name, bdev.ctrlr_idx);
+                }
             }
-        } else {
-            info!("No subsystems configured — skipping NVMe controller attachment");
+
+            self.bdevs = all_bdevs;
+            self.bdev_groups = bdev_groups;
         }
-
-        // Build bdev_groups
-        let mut bdev_groups: HashMap<(String, u32), Vec<usize>> = HashMap::new();
-        for (idx, bdev) in all_bdevs.iter().enumerate() {
-            // Extract subnqn from target_endpoint (format: trtype://traddr:trsvcid/subnqn)
-            if let Some(subnqn) = bdev.target_endpoint.split('/').nth(3) {
-                let key = (subnqn.to_string(), bdev.nsid);
-                bdev_groups.entry(key).or_default().push(idx);
-            }
-        }
-
-        info!(
-            "SPDK env initialized: {} bdev(s) from {} target(s), {} controller group(s)",
-            all_bdevs.len(),
-            self.conf.subsystems.len(),
-            bdev_groups.len()
-        );
-
-        self.bdevs = all_bdevs;
-        self.bdev_groups = bdev_groups;
 
         // Start reactors/pollers based on feature flag
         #[cfg(feature = "spdk_native_reactor")]
         {
-            self.start_native_reactors()?;
+            // Controllers will be attached on reactor threads
+            // bdevs will be populated by start_native_reactors()
+            all_bdevs = self.start_native_reactors()?;
+
+            // Build bdev_groups from discovered bdevs
+            let mut bdev_groups: HashMap<(String, u32), Vec<usize>> = HashMap::new();
+            for (idx, bdev) in all_bdevs.iter().enumerate() {
+                if let Some(subnqn) = bdev.target_endpoint.split('/').nth(3) {
+                    let key = (subnqn.to_string(), bdev.nsid);
+                    bdev_groups.entry(key).or_default().push(idx);
+                }
+            }
+
+            info!(
+                "SPDK env initialized: {} bdev(s) from {} target(s), {} controller group(s)",
+                all_bdevs.len(),
+                self.conf.subsystems.len(),
+                bdev_groups.len()
+            );
+
+            info!("Discovered bdevs:");
+            for (idx, bdev) in all_bdevs.iter().enumerate() {
+                #[cfg(feature = "spdk_native_reactor")]
+                {
+                    info!("  bdev[{}]: name={}, ctrlr_idx={}, reactor_idx={}",
+                        idx, bdev.name, bdev.ctrlr_idx, bdev.reactor_idx);
+                }
+                #[cfg(not(feature = "spdk_native_reactor"))]
+                {
+                    info!("  bdev[{}]: name={}, ctrlr_idx={}",
+                        idx, bdev.name, bdev.ctrlr_idx);
+                }
+            }
+
+            self.bdevs = all_bdevs;
+            self.bdev_groups = bdev_groups;
         }
+
         #[cfg(not(feature = "spdk_native_reactor"))]
         {
             // Start pollers: 1 poller per controller (1:1 mapping)
@@ -802,45 +908,37 @@ impl SpdkEnv {
         Ok(())
     }
 
-    /// Start SPDK native reactor threads with round-robin controller mapping
+    /// Start native reactors matching C demo pattern:
+    /// 1. Create SPDK threads
+    /// 2. Spawn OS threads that:
+    ///    a. Call spdk_set_thread()
+    ///    b. Attach controllers (ALL on reactor thread)
+    ///    c. Register poller
+    ///    d. Run reactor loop via curvine_spdk_run_reactor_loop()
     #[cfg(feature = "spdk_native_reactor")]
-    fn start_native_reactors(&self) -> CommonResult<()> {
+    fn start_native_reactors(&mut self) -> CommonResult<Vec<BdevInfo>> {
         use std::ffi::CString;
+        use std::sync::Arc;
 
-        // Verify EAL initialized successfully by checking if we can get the current core
-        // (EAL must be initialized before spdk_thread_lib_init)
         info!(
             "Starting SPDK native reactors: hugepage_mb={}, reactor_mask={}",
             self.conf.hugepage_mb, self.conf.reactor_mask
         );
 
-        // Debug: Check if EAL actually has memory before calling spdk_thread_lib_init
         unsafe { spdk_ffi::curvine_check_eal_memory() };
 
-        // Initialize SPDK thread library (must be called after EAL init)
-        // Pass NULL for new_thread_fn — we create threads manually via spdk_thread_create
-        // Note: spdk_thread_lib_init creates spdk_msg_mempool which may fail due to
-        // NUMA issues or mempool flags. Try with retry logic.
-        info!("Calling spdk_thread_lib_init (via debug wrapper)...");
-
-        // Retry spdk_thread_lib_init up to 3 times with delay
+        info!("Calling spdk_thread_lib_init...");
         let mut rc = -12;
         for attempt in 1..=3 {
             info!("spdk_thread_lib_init attempt {}/3", attempt);
             rc = unsafe { spdk_ffi::curvine_spdk_thread_lib_init(None, 0) };
-            if rc == 0 {
-                break;
-            }
+            if rc == 0 { break; }
             error!("spdk_thread_lib_init failed: rc={} (attempt {})", rc, attempt);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if rc != 0 {
-            error!(
-                "spdk_thread_lib_init failed: rc={} (ENOMEM=-12 means EAL has no memory)",
-                rc
-            );
             return err_box!(
-                "Failed to initialize SPDK thread library: rc={} (check EAL memory allocation)",
+                "Failed to initialize SPDK thread library: rc={} (check EAL memory)",
                 rc
             );
         }
@@ -851,12 +949,25 @@ impl SpdkEnv {
             .reactor_core_count
             .unwrap_or_else(|| num_cpus::get() as u32) as usize;
 
-        info!(
-            "Starting {} SPDK native reactor threads (round-robin)",
-            core_count
-        );
+        info!("Starting {} SPDK native reactor threads", core_count);
 
-        let mut threads = Vec::new();
+        // Distribute subsystems across reactor threads (C demo pattern: each reactor owns its controllers)
+        // Simple round-robin: subsystem[i] -> reactor[i % core_count]
+        let subsystems = self.conf.subsystems.clone();
+        let subsystems_per_reactor: Vec<Vec<NvmeSubsystem>> = {
+            let mut map: Vec<Vec<NvmeSubsystem>> = (0..core_count).map(|_| Vec::new()).collect();
+            for (idx, subsystem) in subsystems.iter().enumerate() {
+                let reactor_idx = idx % core_count;
+                map[reactor_idx].push(subsystem.clone());
+            }
+            map
+        };
+
+        // Shared vector to collect bdevs from all reactor threads
+        let all_bdevs = Arc::new(Mutex::new(Vec::new()));
+
+        let mut reactor_states: Vec<Arc<ReactorState>> = Vec::new();
+
         for core_idx in 0..core_count {
             let thread_name = CString::new(format!("spdk-reactor-{}", core_idx))
                 .map_err(|e| err_msg!(format!("invalid thread name: {}", e)))?;
@@ -864,29 +975,350 @@ impl SpdkEnv {
             let thread =
                 unsafe { spdk_ffi::spdk_thread_create(thread_name.as_ptr(), std::ptr::null()) };
             if thread.is_null() {
-                // Clean up already-created threads
-                for t in threads {
-                    unsafe {
-                        spdk_ffi::spdk_thread_exit(t);
-                    }
+                for state in &reactor_states {
+                    unsafe { spdk_ffi::spdk_thread_exit(state.thread) };
                 }
-                unsafe {
-                    spdk_ffi::spdk_thread_lib_fini();
-                }
+                unsafe { spdk_ffi::spdk_thread_lib_fini(); }
                 return err_box!("Failed to create SPDK thread for core {}", core_idx);
             }
-            threads.push(thread);
+
+            let ready_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let all_bdevs_clone = all_bdevs.clone();
+            let reactor_subsystems = subsystems_per_reactor[core_idx].clone();
+            let reactor_idx = core_idx;
+
+            let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let state = Arc::new(ReactorState {
+                thread,
+                os_thread: Mutex::new(None),
+                qpairs: Mutex::new(Vec::new()),
+                poller: std::ptr::null_mut(),
+                ready: ready_flag.clone(),
+                stop_flag: stop_flag.clone(),
+                controllers: Mutex::new(HashMap::new()),
+                reactor_idx,
+            });
+
+            // Spawn OS thread to run reactor loop (matching C demo pattern)
+            let state_clone = state.clone();
+            let os_thread = std::thread::spawn(move || {
+                info!("[Reactor-{}] OS thread started", reactor_idx);
+
+                unsafe {
+                    // C demo pattern: spdk_set_thread() FIRST
+                    spdk_ffi::spdk_set_thread(state_clone.thread);
+                    info!("[Reactor-{}] SPDK thread set", reactor_idx);
+
+                    // Attach ONLY the subsystems assigned to THIS reactor thread
+                    let mut thread_bdevs = Vec::new();
+                    for subsystem in &reactor_subsystems {
+                        info!(
+                            "[Reactor-{}] Attaching subsystem: {} (ctrlrs={})",
+                            reactor_idx,
+                            subsystem.endpoint(),
+                            subsystem.controller_count
+                        );
+                        match Self::attach_controllers_on_thread(subsystem, reactor_idx, &state_clone) {
+                            Ok(bdevs) => {
+                                info!(
+                                    "[Reactor-{}] Attached subsystem {}: {} bdev(s)",
+                                    reactor_idx,
+                                    subsystem.endpoint(),
+                                    bdevs.len()
+                                );
+                                thread_bdevs.extend(bdevs);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[Reactor-{}] Failed to attach subsystem {}: {}",
+                                    reactor_idx,
+                                    subsystem.endpoint(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+
+                    // Store discovered bdevs in shared vector with reactor_idx
+                    if !thread_bdevs.is_empty() {
+                        let mut shared_bdevs = all_bdevs_clone.lock().unwrap();
+                        shared_bdevs.extend(thread_bdevs);
+                    }
+
+                    // Register poller on this thread (BEFORE signaling ready)
+                    // IMPORTANT: pass pointer to SAME state that holds controllers and qpairs
+                    // Use Arc::as_ptr() to get the data pointer (stable Rust 1.92+)
+                    // This way poller and controller storage point to same ReactorState
+                    let state_ptr: *mut ReactorState = Arc::as_ptr(&state_clone) as *mut ReactorState;
+                    
+                    let poller = spdk_ffi::spdk_poller_register(
+                        crate::io::spdk_poller::reactor_poller_cb,
+                        state_ptr as *mut c_void,
+                        0,
+                    );
+                    if poller.is_null() {
+                        error!("[Reactor-{}] Failed to register poller", reactor_idx);
+                    } else {
+                        info!("[Reactor-{}] Poller registered at {:?} with state_ptr={:?}", reactor_idx, poller, state_ptr);
+                    }
+                    
+                    // Now signal that thread is ready (controllers attached AND poller registered)
+                    state_clone.ready.store(true, std::sync::atomic::Ordering::Release);
+
+                    // Run reactor loop (C demo pattern: spdk_thread_poll in loop)
+                    info!("[Reactor-{}] Entering reactor loop", reactor_idx);
+                    spdk_ffi::curvine_spdk_run_reactor_loop(state_clone.thread);
+                    info!("[Reactor-{}] Exited reactor loop", reactor_idx);
+
+                    // Cleanup: unregister poller
+                    if !poller.is_null() {
+                        spdk_ffi::spdk_poller_unregister(poller);
+                    }
+                }
+
+                info!("[Reactor-{}] OS thread ended", reactor_idx);
+            });
+
+            // Store OS thread handle
+            {
+                let mut thread_guard = state.os_thread.lock().unwrap();
+                *thread_guard = Some(os_thread);
+            }
+
+            reactor_states.push(state);
         }
 
-        *self.reactor_threads.lock().unwrap() = threads;
+        // Wait for all reactor threads to be ready
+        for (idx, state) in reactor_states.iter().enumerate() {
+            let mut attempts = 0;
+            while !state.ready.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                attempts += 1;
+                if attempts > 1000 {  // Increase timeout for controller attachment
+                    error!("[Reactor-{}] Timed out waiting for thread to be ready", idx);
+                    break;
+                }
+            }
+        }
+
+        // Collect all bdevs from shared vector
+        let all_bdevs = std::mem::take(&mut *all_bdevs.lock().unwrap());
+
+        if all_bdevs.is_empty() && !self.conf.subsystems.is_empty() {
+            // Clean up
+            for state in &reactor_states {
+                unsafe { spdk_ffi::spdk_thread_exit(state.thread) };
+            }
+            for state in &reactor_states {
+                let mut thread_guard = state.os_thread.lock().unwrap();
+                if let Some(handle) = thread_guard.take() {
+                    let _ = handle.join();
+                }
+            }
+            unsafe { spdk_ffi::spdk_thread_lib_fini(); }
+
+            return err_box!(
+                "SpdkEnv::start_native_reactors() failed: no bdevs discovered from {} target(s)",
+                self.conf.subsystems.len()
+            );
+        }
+
+        *self.reactor_states.lock().unwrap() = reactor_states;
         *self.next_reactor_idx.lock().unwrap() = 0;
+        
+        // Register in global for reactor thread access
+        register_reactor_states(self.reactor_states.lock().unwrap().clone());
 
         info!(
-            "SPDK native reactors started: {} reactor(s)",
-            self.reactor_threads.lock().unwrap().len()
+            "SPDK native reactors started: {} reactor(s), {} bdev(s)",
+            self.reactor_states.lock().unwrap().len(),
+            all_bdevs.len()
         );
 
-        Ok(())
+        Ok(all_bdevs)
+    }
+
+    /// Attach controllers on the current thread (must be called with spdk_set_thread already called)
+    /// Returns discovered bdevs and stores controllers in reactor state
+    #[cfg(feature = "spdk_native_reactor")]
+    fn attach_controllers_on_thread(
+        subsystem: &NvmeSubsystem,
+        reactor_idx: usize,
+        state: &Arc<ReactorState>,
+    ) -> CommonResult<Vec<BdevInfo>> {
+        let mut all_bdevs = Vec::new();
+
+        for ctrlr_idx in 0..subsystem.controller_count {
+            info!(
+                "[Reactor-{}] Attaching controller {}/{} for subsystem {}",
+                reactor_idx,
+                ctrlr_idx + 1,
+                subsystem.controller_count,
+                subsystem.endpoint()
+            );
+
+            let bdevs = Self::attach_single_controller_on_thread(subsystem, ctrlr_idx, reactor_idx, state)?;
+            all_bdevs.extend(bdevs);
+        }
+
+        Ok(all_bdevs)
+    }
+
+    /// Attach a single controller on the current thread
+    #[cfg(feature = "spdk_native_reactor")]
+    fn attach_single_controller_on_thread(
+        subsystem: &NvmeSubsystem,
+        ctrlr_idx: u32,
+        reactor_idx: usize,
+        state: &Arc<ReactorState>,
+    ) -> CommonResult<Vec<BdevInfo>> {
+        use std::ffi::CString;
+        let traddr = CString::new(subsystem.traddr.as_str())
+            .map_err(|e| err_msg!(format!("invalid traddr: {}", e)))?;
+        let trsvcid = CString::new(subsystem.trsvcid.to_string())
+            .map_err(|e| err_msg!(format!("invalid trsvcid: {}", e)))?;
+        let subnqn = CString::new(subsystem.subnqn.as_str())
+            .map_err(|e| err_msg!(format!("invalid subnqn: {}", e)))?;
+        let trtype = match subsystem.trtype.to_lowercase().as_str() {
+            "rdma" => spdk_ffi::SPDK_NVME_TRANSPORT_RDMA,
+            "tcp" => spdk_ffi::SPDK_NVME_TRANSPORT_TCP,
+            _ => return err_box!("unsupported transport type: {}", subsystem.trtype),
+        };
+        let adrfam = match subsystem.adrfam.to_lowercase().as_str() {
+            "ipv4" => spdk_ffi::SPDK_NVMF_ADRFAM_IPV4,
+            "ipv6" => spdk_ffi::SPDK_NVMF_ADRFAM_IPV6,
+            _ => return err_box!("unsupported address family: {}", subsystem.adrfam),
+        };
+
+        unsafe {
+            // Verify our opaque buffers are large enough for the installed SPDK version.
+            let trid_real = spdk_ffi::curvine_spdk_trid_sizeof();
+            let trid_buf = std::mem::size_of::<spdk_ffi::spdk_nvme_transport_id>();
+            if trid_real > trid_buf {
+                return err_box!(
+                    "spdk_nvme_transport_id is {} bytes but our buffer is only {}",
+                    trid_real,
+                    trid_buf
+                );
+            }
+            let opts_real = spdk_ffi::curvine_spdk_ctrlr_opts_sizeof();
+            let opts_buf = std::mem::size_of::<spdk_ffi::spdk_nvme_ctrlr_opts>();
+            if opts_real > opts_buf {
+                return err_box!(
+                    "spdk_nvme_ctrlr_opts is {} bytes but our buffer is only {}",
+                    opts_real,
+                    opts_buf
+                );
+            }
+
+            // Build transport ID via C helpers
+            let mut trid: spdk_ffi::spdk_nvme_transport_id = std::mem::zeroed();
+            spdk_ffi::curvine_spdk_trid_set_trtype(&mut trid, trtype);
+            spdk_ffi::curvine_spdk_trid_set_adrfam(&mut trid, adrfam);
+            spdk_ffi::curvine_spdk_trid_set_traddr(&mut trid, traddr.as_ptr());
+            spdk_ffi::curvine_spdk_trid_set_trsvcid(&mut trid, trsvcid.as_ptr());
+            spdk_ffi::curvine_spdk_trid_set_subnqn(&mut trid, subnqn.as_ptr());
+
+            // Build controller opts via C helpers
+            let mut opts: spdk_ffi::spdk_nvme_ctrlr_opts = std::mem::zeroed();
+            spdk_ffi::curvine_spdk_ctrlr_get_default_opts(&mut opts);
+            if subsystem.io_queues > 0 {
+                spdk_ffi::curvine_spdk_ctrlr_opts_set_num_io_queues(&mut opts, subsystem.io_queues);
+            }
+            if subsystem.keep_alive_timeout_ms > 0 {
+                spdk_ffi::curvine_spdk_ctrlr_opts_set_keep_alive_timeout_ms(
+                    &mut opts,
+                    subsystem.keep_alive_timeout_ms as u32,
+                );
+            }
+            if !subsystem.hostnqn.is_empty() {
+                let hostnqn = CString::new(subsystem.hostnqn.as_str())
+                    .map_err(|e| err_msg!(format!("invalid hostnqn: {}", e)))?;
+                spdk_ffi::curvine_spdk_ctrlr_opts_set_hostnqn(&mut opts, hostnqn.as_ptr());
+            }
+
+            // Connect - must be on reactor thread with spdk_set_thread called
+            let ctrlr = spdk_ffi::curvine_spdk_nvme_connect(&mut trid, &mut opts);
+            if ctrlr.is_null() {
+                return err_box!(
+                    "spdk_nvme_connect failed for {} (controller {})",
+                    subsystem.endpoint(),
+                    ctrlr_idx
+                );
+            }
+
+            info!(
+                "[Reactor-{}] Controller connected: {:?} for subsystem {}",
+                reactor_idx, ctrlr, subsystem.endpoint()
+            );
+
+            // Store controller in reactor state with reactor_idx
+            {
+                let mut controllers = state.controllers.lock().unwrap();
+                controllers.insert(ctrlr_idx as usize, ctrlr);
+            }
+
+            // Enumerate active namespaces
+            let nsids: Vec<u32> = if !subsystem.namespace_ids.is_empty() {
+                subsystem.namespace_ids.clone()
+            } else {
+                let num_ns = spdk_ffi::spdk_nvme_ctrlr_get_num_ns(ctrlr);
+                (1..=num_ns).collect()
+            };
+
+            let mut bdevs = Vec::new();
+            for nsid in nsids {
+                let ns = spdk_ffi::spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+                if ns.is_null() {
+                    warn!(
+                        "  Namespace {} not found on controller {}, skipping",
+                        nsid, ctrlr_idx
+                    );
+                    continue;
+                }
+                if !spdk_ffi::spdk_nvme_ns_is_active(ns) {
+                    warn!(
+                        "  Namespace {} not active on controller {}, skipping",
+                        nsid, ctrlr_idx
+                    );
+                    continue;
+                }
+                let sector_size = spdk_ffi::spdk_nvme_ns_get_sector_size(ns);
+                let num_sectors = spdk_ffi::spdk_nvme_ns_get_num_sectors(ns);
+                let size_bytes = sector_size as u64 * num_sectors;
+                let name = format!(
+                    "NVMe_{}_{}_c{}_n{}",
+                    subsystem.traddr, subsystem.trsvcid, ctrlr_idx, nsid
+                );
+                info!(
+                    "  Discovered ns {} on controller {} (reactor-{}): size={}B, sector_size={}, sectors={}",
+                    nsid, ctrlr_idx, reactor_idx, size_bytes, sector_size, num_sectors
+                );
+                bdevs.push(BdevInfo {
+                    name,
+                    size_bytes,
+                    block_size: sector_size,
+                    num_blocks: num_sectors,
+                    target_endpoint: subsystem.endpoint(),
+                    ctrlr: ctrlr as usize,
+                    ns: ns as usize,
+                    nsid,
+                    ctrlr_idx,
+                    #[cfg(feature = "spdk_native_reactor")]
+                    reactor_idx,
+                });
+            }
+
+            if bdevs.is_empty() {
+                warn!(
+                    "Controller {} has no active namespaces, detaching controller",
+                    subsystem.endpoint()
+                );
+                spdk_ffi::spdk_nvme_detach(ctrlr);
+            }
+
+            Ok(bdevs)
+        }
     }
 
     // Shutdown
@@ -965,16 +1397,21 @@ impl SpdkEnv {
         }
         #[cfg(feature = "spdk_native_reactor")]
         {
-            // Native reactor: exit SPDK threads
-            let threads = self.reactor_threads.lock().unwrap();
-            for (idx, thread) in threads.iter().enumerate() {
-                unsafe {
-                    spdk_ffi::spdk_thread_exit(*thread);
+            // Set global shutdown flag so reactor threads will exit their loops
+            // SAFETY: This function only sets a flag, no thread safety concerns
+            unsafe { spdk_ffi::curvine_spdk_set_shutdown_flag(); }
+            
+            // Wait for OS threads to finish
+            let states = self.reactor_states.lock().unwrap();
+            for state in states.iter() {
+                let mut thread_guard = state.os_thread.lock().unwrap();
+                if let Some(handle) = thread_guard.take() {
+                    let _ = handle.join();
                 }
-                info!("Stopping reactor thread {}", idx);
             }
-            info!("SPDK native reactors stopped");
-            // Finalize thread library
+            info!("SPDK native reactor threads stopped");
+            
+            // Finalize thread library (handles all thread cleanup internally)
             unsafe {
                 spdk_ffi::spdk_thread_lib_fini();
             }
@@ -1150,6 +1587,22 @@ impl SpdkEnv {
     ) {
         self.qpair_pool.release(ctrlr, qpair);
     }
+    
+    /// Allocate a new qpair (bypassing pool) - for native reactor mode.
+    #[cfg(feature = "spdk_native_reactor")]
+    pub fn alloc_qpair_on_reactor(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+    ) -> CommonResult<*mut spdk_ffi::spdk_nvme_qpair> {
+        let qpair = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
+        if qpair.is_null() {
+            return err_box!(
+                "Failed to allocate I/O qpair for ctrlr {:p} on reactor thread",
+                ctrlr
+            );
+        }
+        Ok(qpair)
+    }
 
     /// Get the poller for a given controller index (legacy poller thread).
     #[cfg(not(feature = "spdk_native_reactor"))]
@@ -1171,26 +1624,74 @@ impl SpdkEnv {
         (poller.sender(), poller.eventfd(), ctrlr_idx)
     }
 
-    /// Get the SPDK thread for a given controller index (native reactor, round-robin).
-    /// Called once per controller attach, result cached in IoChannel.
+    /// Get the SPDK thread for a given controller index (native reactor).
+    /// Returns the thread that OWNS this controller (based on reactor_idx in BdevInfo).
     #[cfg(feature = "spdk_native_reactor")]
     pub fn get_spdk_thread(&self, ctrlr_idx: usize) -> *mut spdk_ffi::spdk_thread {
-        let threads = self.reactor_threads.lock().unwrap();
+        let states = self.reactor_states.lock().unwrap();
+
+        // Find the bdev for this ctrlr_idx to get the reactor_idx
+        // We need to find which reactor owns this controller
+        // For now, use the reactor_idx stored in bdevs
+        if let Some(bdev) = self.bdevs.iter().find(|b| b.ctrlr_idx as usize == ctrlr_idx) {
+            #[cfg(feature = "spdk_native_reactor")]
+            {
+                let reactor_idx = bdev.reactor_idx;
+                if reactor_idx < states.len() {
+                    let state = &states[reactor_idx];
+                    info!(
+                        "Controller {} found on reactor-{} (matching BdevInfo)",
+                        ctrlr_idx, reactor_idx
+                    );
+                    return state.thread;
+                }
+            }
+        }
+
+        // Fallback: use round-robin if bdev not found
         let mut next_idx = self.next_reactor_idx.lock().unwrap();
+        let target_idx = *next_idx % states.len();
+        let state = &states[target_idx];
+        let assigned_thread = state.thread;
 
-        // Round-robin assignment
-        let target_idx = *next_idx % threads.len();
-        let assigned_thread = threads[target_idx];
-
-        info!(
-            "Assigned controller {} to reactor thread {} (round-robin)",
+        warn!(
+            "Controller {} not found in bdevs, using round-robin: reactor-{}",
             ctrlr_idx, target_idx
         );
 
-        // Increment for next controller
-        *next_idx = (*next_idx + 1) % threads.len().max(1);
-
+        *next_idx = (*next_idx + 1) % states.len().max(1);
         assigned_thread
+    }
+
+    /// Get the ReactorState for a given controller index (native reactor).
+    /// Returns the reactor that OWNS this controller.
+    #[cfg(feature = "spdk_native_reactor")]
+    pub fn get_reactor_state(&self, ctrlr_idx: usize) -> Arc<ReactorState> {
+        let states = self.reactor_states.lock().unwrap();
+
+        // Find the bdev for this ctrlr_idx to get the reactor_idx
+        if let Some(bdev) = self.bdevs.iter().find(|b| b.ctrlr_idx as usize == ctrlr_idx) {
+            #[cfg(feature = "spdk_native_reactor")]
+            {
+                let reactor_idx = bdev.reactor_idx;
+                if reactor_idx < states.len() {
+                    info!(
+                        "Controller {} found on reactor-{}",
+                        ctrlr_idx, reactor_idx
+                    );
+                    return states[reactor_idx].clone();
+                }
+            }
+        }
+
+        // Fallback: use round-robin
+        let mut next_idx = self.next_reactor_idx.lock().unwrap();
+        let target_idx = *next_idx % states.len();
+        warn!(
+            "Controller {} not found in bdevs, using round-robin: reactor-{}",
+            ctrlr_idx, target_idx
+        );
+        states[target_idx].clone()
     }
 
     /// Unregister qpair from poller, blocking until removed to prevent UAF.
@@ -1441,6 +1942,8 @@ impl SpdkEnv {
                     ns: ns as usize,
                     nsid,
                     ctrlr_idx,
+                    #[cfg(feature = "spdk_native_reactor")]
+                    reactor_idx: 0,  // Default for non-native-reactor path
                 });
             }
 
@@ -1458,25 +1961,63 @@ impl SpdkEnv {
 
     fn detach_controllers(&self) {
         use std::collections::HashSet;
-        let mut detached: HashSet<usize> = HashSet::new();
-        for bdev in &self.bdevs {
-            if bdev.ctrlr == 0 || !detached.insert(bdev.ctrlr) {
-                continue; // skip null or already-detached controllers
+
+        #[cfg(feature = "spdk_native_reactor")]
+        {
+            // Native reactor mode: controllers are stored in ReactorState.controllers
+            let states = self.reactor_states.lock().unwrap();
+            let mut detached: HashSet<usize> = HashSet::new();
+
+            for (idx, state) in states.iter().enumerate() {
+                // Collect controllers to detach (avoid holding lock across detach calls)
+                let ctrlrs_to_detach: Vec<(u32, *mut spdk_ffi::spdk_nvme_ctrlr)> = {
+                    let controllers = state.controllers.lock().unwrap();
+                    controllers.iter().map(|(k, &v)| (*k as u32, v)).collect()
+                };
+
+                for (ctrlr_idx, ctrlr) in ctrlrs_to_detach {
+                    if ctrlr.is_null() || !detached.insert(ctrlr as usize) {
+                        continue;
+                    }
+                    info!(
+                        "Detaching NVMe controller {} on reactor {} (ctrlr={:p})",
+                        ctrlr_idx, idx, ctrlr
+                    );
+                    let rc = unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
+                    if rc != 0 {
+                        warn!(
+                            "spdk_nvme_detach failed for reactor {} controller {}, rc={}",
+                            idx, ctrlr_idx, rc
+                        );
+                    }
+                }
             }
-            let ctrlr = bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
-            info!(
-                "Detaching NVMe controller for target '{}' (ctrlr={:p})",
-                bdev.target_endpoint, ctrlr
-            );
-            let rc = unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
-            if rc != 0 {
-                warn!(
-                    "spdk_nvme_detach failed for '{}', rc={}",
-                    bdev.target_endpoint, rc
-                );
-            }
+            info!("Detached {} NVMe controller(s) (native reactor mode)", detached.len());
         }
-        info!("Detached {} NVMe controller(s)", detached.len());
+
+        #[cfg(not(feature = "spdk_native_reactor"))]
+        {
+            // Legacy mode: controllers are referenced by bdevs
+            let mut detached: HashSet<usize> = HashSet::new();
+            for bdev in &self.bdevs {
+                if bdev.ctrlr == 0 || !detached.insert(bdev.ctrlr) {
+                    continue; // skip null or already-detached controllers
+                }
+                let ctrlr = bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
+                info!(
+                    "Detaching NVMe controller for target '{}' (ctrlr={:p})",
+                    bdev.target_endpoint, ctrlr
+                );
+                let rc = unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
+                if rc != 0 {
+                    warn!(
+                        "spdk_nvme_detach failed for '{}', rc={}",
+                        bdev.target_endpoint, rc
+                    );
+                }
+            }
+            info!("Detached {} NVMe controller(s)", detached.len());
+        }
     }
 
     fn env_fini(&self) {

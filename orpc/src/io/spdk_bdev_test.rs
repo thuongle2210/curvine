@@ -68,6 +68,11 @@ fn test_spdk_conf() -> SpdkConf {
         }],
         ..Default::default()
     };
+    // Enable native reactor if compiled with the feature
+    #[cfg(feature = "spdk_native_reactor")]
+    {
+        conf.spdk_native_reactor = true;
+    }
     // Parse computed fields (this will parse hugepage_str into hugepage_mb)
     conf.init().expect("Failed to init SpdkConf");
     conf

@@ -34,6 +34,7 @@ pub type spdk_new_thread_fn = unsafe extern "C" fn(*mut c_void) -> *mut spdk_thr
 
 extern "C" {
     // Environment (via C helper)
+    pub fn curvine_spdk_preload_libs();
     pub fn curvine_spdk_env_opts_sizeof() -> usize;
     pub fn curvine_spdk_env_opts_init(opts: *mut spdk_env_opts);
     pub fn curvine_spdk_env_opts_set_name(opts: *mut spdk_env_opts, name: *const c_char);
@@ -56,7 +57,7 @@ extern "C" {
     pub fn spdk_thread_lib_fini();
 
     // SPDK thread management (native reactor)
-    pub fn spdk_thread_create(name: *const c_char, cpumask: *const c_char) -> *mut spdk_thread;
+    pub fn spdk_thread_create(name: *const c_char, cpumask: *const c_void) -> *mut spdk_thread;
     pub fn spdk_thread_exit(thread: *mut spdk_thread);
     pub fn spdk_thread_destroy(thread: *mut spdk_thread);
     pub fn spdk_thread_send_msg(
@@ -66,6 +67,18 @@ extern "C" {
     ) -> c_int;
     // Use wrapper from spdk_opts_helper.c
     pub fn curvine_spdk_thread_is_current(thread: *mut spdk_thread) -> bool;
+    pub fn spdk_set_thread(thread: *mut spdk_thread);
+    pub fn spdk_get_thread() -> *mut spdk_thread;
+    pub fn spdk_thread_poll(thread: *mut spdk_thread, max_msgs: u32, now: u64) -> c_int;
+    // Run reactor loop (C helper)
+    pub fn curvine_spdk_run_reactor_loop(thread: *mut spdk_thread);
+    pub fn curvine_spdk_run_reactor_loop_with_stop(
+        thread: *mut spdk_thread,
+        stop_flag: *const std::ffi::c_void,
+    );
+    pub fn curvine_spdk_signal_reactor_exit(thread: *mut spdk_thread);
+    pub fn curvine_spdk_set_shutdown_flag();
+    pub fn curvine_spdk_get_shutdown_flag() -> std::ffi::c_int;
 
     // SPDK poller management
     pub fn spdk_poller_register(
@@ -73,9 +86,14 @@ extern "C" {
         arg: *mut c_void,
         period_us: u64,
     ) -> *mut spdk_poller;
-    pub fn spdk_poller_unregister(poller: *mut *mut spdk_poller);
+    pub fn spdk_poller_unregister(poller: *mut spdk_poller);
     pub fn spdk_poller_pause(poller: *mut spdk_poller);
     pub fn spdk_poller_resume(poller: *mut spdk_poller);
+    // I/O completion processing
+    pub fn spdk_nvme_qpair_process_completions(
+        qpair: *mut spdk_nvme_qpair,
+        max_completions: u32,
+    ) -> c_int;
     // Transport ID (via C helper)
     pub fn curvine_spdk_trid_sizeof() -> usize;
     pub fn curvine_spdk_trid_set_trtype(trid: *mut spdk_nvme_transport_id, trtype: c_int);
