@@ -139,84 +139,26 @@ void curvine_check_eal_memory(void) {
     }
 }
 
-// Run SPDK reactor loop on current thread
+// Run SPDK reactor loop on current thread.
 // ASSUME: spdk_set_thread() has already been called by the caller.
 // The loop continues until spdk_thread_exit() is called on this thread.
-// stop_flag: if non-NULL, checked after first N iterations; if true, exits the loop.
-//            This allows Rust to signal stop from another thread after initialization.
-void curvine_spdk_run_reactor_loop_with_stop(struct spdk_thread *thread, volatile void *stop_flag) {
-    fprintf(stderr, "[DEBUG C] Entering reactor poll loop for thread %p, stop_flag=%p...\n", thread, stop_flag);
-    
-    // Main reactor loop - poll until thread is exited OR stop_flag is set
-    int iteration = 0;
-    int init_complete = 0;  // Flag to track initialization
+// Exit is triggered by a self-exit message sent from Rust via spdk_thread_send_msg.
+void curvine_spdk_run_reactor_loop(struct spdk_thread *thread) {
+    fprintf(stderr, "[DEBUG C] Entering reactor poll loop for thread %p...\n", thread);
     
     while (!spdk_thread_is_exited(thread)) {
-        // After first 10 iterations, check stop flag if provided
-        // This gives time for initialization (controller attach, qpair create, etc.)
-        if (init_complete && stop_flag != NULL && *(volatile int*)stop_flag) {
-            fprintf(stderr, "[DEBUG C] Reactor loop: stop_flag set, exiting after %d iterations\n", iteration);
-            break;
-        }
-        
-        // Also check global shutdown flag (set by Rust shutdown())
-        if (init_complete && curvine_spdk_get_shutdown_flag()) {
-            fprintf(stderr, "[DEBUG C] Reactor loop: global shutdown flag set, exiting after %d iterations\n", iteration);
-            break;
-        }
-        
-        // Poll this thread - processes messages and pollers
-        int msgs = spdk_thread_poll(thread, 0, 0);  // max_msgs=0 means no limit
-        
-        // Mark init as complete after some iterations or msgs processed
-        if (iteration >= 10 || msgs > 0) {
-            init_complete = 1;
-        }
-        
-        if (msgs > 0) {
-            fprintf(stderr, "[DEBUG C] Reactor iteration %d: processed %d message(s), init_complete=%d\n", 
-                    iteration, msgs, init_complete);
-        }
-        iteration++;
-        if (iteration % 100000 == 0) {
-            fprintf(stderr, "[DEBUG C] Reactor still running, iteration %d, exited=%d, shutdown=%d\n", 
-                    iteration, spdk_thread_is_exited(thread), curvine_spdk_get_shutdown_flag());
-        }
+        spdk_thread_poll(thread, 0, 0);
     }
     
-    fprintf(stderr, "[DEBUG C] Reactor loop exiting after %d iterations\n", iteration);
+    fprintf(stderr, "[DEBUG C] Reactor loop exiting for thread %p\n", thread);
 }
 
-// Backward compatibility: original function without stop flag
-void curvine_spdk_run_reactor_loop(struct spdk_thread *thread) {
-    curvine_spdk_run_reactor_loop_with_stop(thread, NULL);
-}
-
-// Signal the reactor thread to exit.
-// This should be called from WITHIN the reactor thread.
-// Sets the thread's exit flag so next spdk_thread_poll will return.
-// void curvine_spdk_signal_reactor_exit(struct spdk_thread *thread) {
-//     if (thread) {
-//         fprintf(stderr, "[DEBUG C] curvine_spdk_signal_reactor_exit: thread=%p\n", thread);
-//         spdk_thread_exit(thread);
-//     }
-// }
-
-// Global shutdown flag (atomic) - set by Rust shutdown()
-static volatile int g_shutdown_flag = 0;
-
-// Set global shutdown flag (called from Rust during shutdown)
-void curvine_spdk_set_shutdown_flag(void) {
-    __sync_synchronize();  // Memory barrier
-    g_shutdown_flag = 1;
-    __sync_synchronize();
-    fprintf(stderr, "[DEBUG C] curvine_spdk_set_shutdown_flag: g_shutdown_flag=1\n");
-}
-
-// Check global shutdown flag
-int curvine_spdk_get_shutdown_flag(void) {
-    __sync_synchronize();  // Memory barrier
-    return g_shutdown_flag;
+// Self-exit handler: called via spdk_thread_send_msg from the main thread.
+// Runs on the reactor thread, triggers clean exit of the reactor loop.
+void curvine_reactor_exit_handler(void *arg) {
+    struct spdk_thread *thread = (struct spdk_thread *)arg;
+    fprintf(stderr, "[DEBUG C] curvine_reactor_exit_handler: thread=%p\n", thread);
+    spdk_thread_exit(thread);
 }
 
 

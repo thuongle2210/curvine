@@ -30,8 +30,7 @@ pub struct ReactorState {
     pub qpairs: Mutex<Vec<*mut spdk_ffi::spdk_nvme_qpair>>,
     pub poller: *mut spdk_ffi::spdk_poller,
     pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>, // Signal to stop reactor loop
-    pub reactor_idx: usize,                                       // Index of this reactor (0-based)
+    pub reactor_idx: usize,
     /// Controllers attached on this reactor thread (ctrlr_idx -> controller pointer)
     pub controllers: Mutex<HashMap<usize, *mut spdk_ffi::spdk_nvme_ctrlr>>,
 }
@@ -1004,14 +1003,12 @@ impl SpdkEnv {
             let reactor_subsystems = subsystems_per_reactor[core_idx].clone();
             let reactor_idx = core_idx;
 
-            let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let state = Arc::new(ReactorState {
                 thread,
                 os_thread: Mutex::new(None),
                 qpairs: Mutex::new(Vec::new()),
                 poller: std::ptr::null_mut(),
                 ready: ready_flag.clone(),
-                stop_flag: stop_flag.clone(),
                 controllers: Mutex::new(HashMap::new()),
                 reactor_idx,
             });
@@ -1133,10 +1130,17 @@ impl SpdkEnv {
         let all_bdevs = std::mem::take(&mut *all_bdevs.lock().unwrap());
 
         if all_bdevs.is_empty() && !self.conf.subsystems.is_empty() {
-            // Clean up
+            // Send self-exit message to each reactor thread
             for state in &reactor_states {
-                unsafe { spdk_ffi::spdk_thread_exit(state.thread) };
+                unsafe {
+                    spdk_ffi::spdk_thread_send_msg(
+                        state.thread,
+                        spdk_ffi::curvine_reactor_exit_handler as spdk_ffi::spdk_thread_fn,
+                        state.thread as *mut std::ffi::c_void,
+                    );
+                }
             }
+            // Wait for OS threads to finish
             for state in &reactor_states {
                 let mut thread_guard = state.os_thread.lock().unwrap();
                 if let Some(handle) = thread_guard.take() {
@@ -1430,14 +1434,18 @@ impl SpdkEnv {
         }
         #[cfg(feature = "spdk_native_reactor")]
         {
-            // Set global shutdown flag so reactor threads will exit their loops
-            // SAFETY: This function only sets a flag, no thread safety concerns
-            unsafe {
-                spdk_ffi::curvine_spdk_set_shutdown_flag();
-            }
-
-            // Wait for OS threads to finish
+            // Send self-exit message to ALL reactor threads first, then wait for each
             let states = self.reactor_states.lock().unwrap();
+            for state in states.iter() {
+                unsafe {
+                    spdk_ffi::spdk_thread_send_msg(
+                        state.thread,
+                        spdk_ffi::curvine_reactor_exit_handler as spdk_ffi::spdk_thread_fn,
+                        state.thread as *mut std::ffi::c_void,
+                    );
+                }
+            }
+            // Wait for all OS threads to finish
             for state in states.iter() {
                 let mut thread_guard = state.os_thread.lock().unwrap();
                 if let Some(handle) = thread_guard.take() {

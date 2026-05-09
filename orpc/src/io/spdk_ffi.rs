@@ -77,8 +77,8 @@ extern "C" {
     //     stop_flag: *const std::ffi::c_void,
     // );
     // pub fn curvine_spdk_signal_reactor_exit(thread: *mut spdk_thread);
-    pub fn curvine_spdk_set_shutdown_flag();
-    pub fn curvine_spdk_get_shutdown_flag() -> std::ffi::c_int;
+    // Self-exit handler: called via spdk_thread_send_msg to trigger clean loop exit
+    pub fn curvine_reactor_exit_handler(arg: *mut c_void);
 
     // SPDK poller management
     pub fn spdk_poller_register(
