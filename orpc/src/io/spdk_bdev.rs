@@ -237,7 +237,7 @@ impl SpdkBdev {
             // Recover raw SPDK pointers from BdevInfo
             let ctrlr = info.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
             let ns = info.ns as *mut spdk_ffi::spdk_nvme_ns;
-            
+
             // Get I/O channel based on feature flag
             let io_channel = {
                 #[cfg(feature = "spdk_native_reactor")]
@@ -245,18 +245,21 @@ impl SpdkBdev {
                     // Create qpair on reactor thread (SPDK requirement)
                     let owning_thread = env.get_spdk_thread(info.ctrlr_idx as usize);
                     let reactor_state = env.get_reactor_state(info.ctrlr_idx as usize);
-                    
+
                     // Send message to reactor thread to create qpair
                     let qpair_out = std::sync::Arc::new(std::sync::Mutex::new(None));
                     let completion = crate::io::spdk_poller::IoCompletion::new();
-                    
+
                     let create_req = Box::new(crate::io::spdk_poller::QpairCreateRequest {
                         ctrlr,
                         qpair_out: qpair_out.clone(),
                         completion: completion.clone(),
                     });
-                    
-                    info!("[qpair] Sending qpair creation message to thread {:?}", owning_thread);
+
+                    info!(
+                        "[qpair] Sending qpair creation message to thread {:?}",
+                        owning_thread
+                    );
                     let req_ptr = Box::into_raw(create_req);
                     let rc = unsafe {
                         spdk_ffi::spdk_thread_send_msg(
@@ -265,14 +268,16 @@ impl SpdkBdev {
                             req_ptr as *mut std::ffi::c_void,
                         )
                     };
-                    
+
                     if rc != 0 {
-                        unsafe { Box::from_raw(req_ptr); }
+                        unsafe {
+                            Box::from_raw(req_ptr);
+                        }
                         error!("[qpair] spdk_thread_send_msg failed: rc={}", rc);
                         env.release_handle();
                         return err_box!("Failed to send qpair creation message to reactor thread");
                     }
-                    
+
                     info!("[qpair] Waiting for qpair creation completion...");
                     // Wait for qpair creation
                     let status = completion.wait(env.conf().io_timeout_us);
@@ -281,12 +286,12 @@ impl SpdkBdev {
                         env.release_handle();
                         return err_box!("Qpair creation on reactor thread failed");
                     }
-                    
+
                     let qpair = {
                         let mut out = qpair_out.lock().unwrap();
                         out.take()
                     };
-                    
+
                     let qpair = match qpair {
                         Some(qp) => qp,
                         None => {
@@ -294,10 +299,10 @@ impl SpdkBdev {
                             return err_box!("Qpair creation returned null");
                         }
                     };
-                    
+
                     // Add qpair to reactor state so completions get processed
                     reactor_state.qpairs.lock().unwrap().push(qpair);
-                    
+
                     SpdkIoChannel {
                         qpair,
                         owning_thread,
@@ -314,7 +319,7 @@ impl SpdkBdev {
                             return Err(e.into());
                         }
                     };
-                    
+
                     // Get poller for this controller (1:1 mapping)
                     let (poller_tx, eventfd, poller_id) = env.get_poller(info.ctrlr_idx as usize);
                     SpdkIoChannel {
@@ -659,26 +664,23 @@ impl SpdkBdev {
                     bdev_inflight: self.inflight.clone(),
                 };
 
-// Submit based on feature flag
-            #[cfg(feature = "spdk_native_reactor")]
-            {
-                // Native reactor: send message to reactor thread via spdk_thread_send_msg
-                let thread = self.io_channel.owning_thread;
-                info!(
-                    "[SpdkBdev] Sending write: ns={:?}, qpair={:?}, offset={}, len={}",
-                    self.ns,
-                    self.io_channel.qpair,
-                    aligned_off,
-                    aligned_len
-                );
-                let req_ptr = Box::into_raw(Box::new(req));
-                let rc = unsafe {
-                    crate::io::spdk_ffi::spdk_thread_send_msg(
-                        thread,
-                        crate::io::spdk_poller::spdk_native_reactor_msg_handler,
-                        req_ptr as *mut std::ffi::c_void,
-                    )
-                };
+                // Submit based on feature flag
+                #[cfg(feature = "spdk_native_reactor")]
+                {
+                    // Native reactor: send message to reactor thread via spdk_thread_send_msg
+                    let thread = self.io_channel.owning_thread;
+                    info!(
+                        "[SpdkBdev] Sending write: ns={:?}, qpair={:?}, offset={}, len={}",
+                        self.ns, self.io_channel.qpair, aligned_off, aligned_len
+                    );
+                    let req_ptr = Box::into_raw(Box::new(req));
+                    let rc = unsafe {
+                        crate::io::spdk_ffi::spdk_thread_send_msg(
+                            thread,
+                            crate::io::spdk_poller::spdk_native_reactor_msg_handler,
+                            req_ptr as *mut std::ffi::c_void,
+                        )
+                    };
                     if rc != 0 {
                         self.inflight
                             .fetch_sub(1, std::sync::atomic::Ordering::Release);
@@ -1071,9 +1073,12 @@ impl Drop for SpdkBdev {
             {
                 // Remove qpair from reactor state's qpair list
                 let reactor_state = env.get_reactor_state(self.io_channel.ctrlr_idx);
-                reactor_state.qpairs.lock().unwrap()
+                reactor_state
+                    .qpairs
+                    .lock()
+                    .unwrap()
                     .retain(|&qp| qp != self.io_channel.qpair);
-                
+
                 // Free qpair on reactor thread (SPDK requirement)
                 let free_req = Box::new(crate::io::spdk_poller::QpairFreeRequest {
                     qpair: self.io_channel.qpair,
@@ -1087,7 +1092,9 @@ impl Drop for SpdkBdev {
                     )
                 };
                 if rc != 0 {
-                    unsafe { Box::from_raw(req_ptr); }
+                    unsafe {
+                        Box::from_raw(req_ptr);
+                    }
                     error!("Failed to send qpair free message to reactor thread");
                 }
             }
@@ -1129,8 +1136,8 @@ mod test {
             .and_then(|v| v.parse().ok())
             .unwrap_or(128);
         // Read reactor_mask from environment or default to 0x1
-        conf.reactor_mask = std::env::var("SPDK_REACTOR_MASK")
-            .unwrap_or_else(|_| "0x1".to_string());
+        conf.reactor_mask =
+            std::env::var("SPDK_REACTOR_MASK").unwrap_or_else(|_| "0x1".to_string());
 
         if with_nvme {
             let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
@@ -1138,8 +1145,8 @@ mod test {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(4420);
-            let subnqn =
-                std::env::var("SPDK_SUBNQN").unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
+            let subnqn = std::env::var("SPDK_SUBNQN")
+                .unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
             let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
             conf.subsystems = vec![crate::io::spdk_env::NvmeSubsystem {
                 traddr,

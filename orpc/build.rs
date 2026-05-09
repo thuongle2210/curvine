@@ -12,6 +12,9 @@ fn link_spdk() {
         .unwrap_or_else(|| "/usr/local/lib".to_string());
     println!("cargo:rustc-link-search=native={}", lib_dir);
 
+    // Get OUT_DIR for linking compiled C helpers
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+
     // Compile C helper for version-safe opts setters
     let include_dir = spdk_dir
         .as_ref()
@@ -29,6 +32,9 @@ fn link_spdk() {
         .include(&dpdk_include)
         .compile("spdk_opts_helper");
     println!("cargo:rerun-if-changed={}", helper_src);
+    // Explicitly link spdk_opts_helper from OUT_DIR
+    println!("cargo:rustc-link-search=native={}", out_dir);
+    println!("cargo:rustc-link-lib=static=spdk_opts_helper");
 
     // Compile C helper for thread wrapper (spdk_native_reactor)
     #[cfg(feature = "spdk_native_reactor")]
@@ -40,6 +46,9 @@ fn link_spdk() {
             .include(&dpdk_include)
             .compile("spdk_thread_wrapper");
         println!("cargo:rerun-if-changed={}", thread_wrapper_src);
+        // Explicitly link spdk_thread_wrapper from OUT_DIR
+        println!("cargo:rustc-link-search=native={}", out_dir);
+        println!("cargo:rustc-link-lib=static=spdk_thread_wrapper");
     }
 
     // DPDK lib subdirs
@@ -84,7 +93,7 @@ fn link_spdk() {
             println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
         }
     }
-    
+
     // DPDK libs that need --whole-archive (constructors must run)
     // Compute path from spdk_dir since dpdk_dir is defined later
     if let Some(ref dir) = spdk_dir {
@@ -94,7 +103,10 @@ fn link_spdk() {
             // Debug output
             println!("cargo:warning=Checking for: {}", lib_path);
             if std::path::Path::new(&lib_path).exists() {
-                println!("cargo:warning=Found! Adding --whole-archive for {}", lib_path);
+                println!(
+                    "cargo:warning=Found! Adding --whole-archive for {}",
+                    lib_path
+                );
                 println!("cargo:rustc-link-arg=-Wl,--whole-archive");
                 println!("cargo:rustc-link-arg={}", lib_path);
                 println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
