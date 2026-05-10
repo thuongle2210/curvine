@@ -10,6 +10,10 @@ fn link_spdk() {
         .as_ref()
         .map(|d| format!("{}/build/lib", d))
         .unwrap_or_else(|| "/usr/local/lib".to_string());
+    let dpdk_dir = spdk_dir
+        .as_ref()
+        .map(|d| format!("{}/dpdk/build/lib", d))
+        .unwrap_or_else(|| "/usr/local/lib".to_string());
     println!("cargo:rustc-link-search=native={}", lib_dir);
 
     // Get OUT_DIR for linking compiled C helpers
@@ -44,11 +48,8 @@ fn link_spdk() {
     }
 
     // Link SPDK libs (static)
-    // NOTE: rte_mempool_ring needs --whole-archive to ensure its constructor runs
     let whole = ["spdk_nvme", "spdk_sock", "spdk_sock_posix"];
-    // DPDK libs that need --whole-archive (constructors must run)
-    let whole_dpdk = ["rte_mempool_ring", "rte_mempool"];
-    let mut libs = vec![
+    let libs = vec![
         "spdk_trace",
         "spdk_json",
         "spdk_jsonrpc",
@@ -65,37 +66,24 @@ fn link_spdk() {
     #[cfg(feature = "spdk-rdma")]
     libs.extend(["spdk_rdma_provider", "spdk_rdma_utils"]);
 
-    // SPDK libs that need --whole-archive (constructors must run)
+    // SPDK whole libs need --whole-archive so constructors (transport
+    // registration, device drivers, etc.) are included unconditionally.
+    // Also push them via rustc-link-lib=static= so they propagate to
+    // dependent workspace crates (rustc-link-arg does NOT propagate).
+    // Both mechanisms put the same .a files into the link, causing LLD
+    // to see duplicate object definitions — harmless because they resolve
+    // to the same symbols.  The static-link-wrapper.sh adds
+    // --allow-multiple-definition to suppress LLD errors.
     for lib in &whole {
         let lib_path = format!("{}/lib{}.a", lib_dir, lib);
         if std::path::Path::new(&lib_path).exists() {
             println!("cargo:rustc-link-arg=-Wl,--whole-archive");
             println!("cargo:rustc-link-arg={}", lib_path);
             println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+            println!("cargo:rustc-link-lib=static={}", lib);
         }
     }
 
-    // DPDK libs that need --whole-archive (constructors must run)
-    // Compute path from spdk_dir since dpdk_dir is defined later
-    if let Some(ref dir) = spdk_dir {
-        let dpdk_lib_dir = format!("{}/dpdk/build/lib", dir);
-        for lib in &whole_dpdk {
-            let lib_path = format!("{}/lib{}.a", dpdk_lib_dir, lib);
-            // Debug output
-            println!("cargo:warning=Checking for: {}", lib_path);
-            if std::path::Path::new(&lib_path).exists() {
-                println!(
-                    "cargo:warning=Found! Adding --whole-archive for {}",
-                    lib_path
-                );
-                println!("cargo:rustc-link-arg=-Wl,--whole-archive");
-                println!("cargo:rustc-link-arg={}", lib_path);
-                println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
-            } else {
-                println!("cargo:warning=NOT FOUND: {}", lib_path);
-            }
-        }
-    }
     for lib in &libs {
         let path = format!("{}/lib{}.a", lib_dir, lib);
         if std::path::Path::new(&path).exists() {
@@ -103,12 +91,9 @@ fn link_spdk() {
         }
     }
 
-    // DPDK libs
-    let dpdk_dir = spdk_dir
-        .as_ref()
-        .map(|d| format!("{}/dpdk/build/lib", d))
-        .unwrap_or_else(|| "/usr/local/lib".to_string());
     let dpdk_libs = [
+        "rte_mempool",
+        "rte_mempool_ring",
         "rte_eal",
         "rte_ring",
         "rte_mbuf",
@@ -167,6 +152,64 @@ fn link_spdk() {
     #[cfg(feature = "spdk-rdma")]
     for lib in &["ibverbs", "rdmacm"] {
         println!("cargo:rustc-link-lib=dylib={}", lib);
+    }
+
+    // Force-include librte_mempool_ring objects into libspdk_opts_helper.a.
+    // The ring library exports zero global symbols; without --whole-archive
+    // the linker drops all its objects. We globalize the local 'generator'
+    // symbol in the constructor-bearing object so the helper code can
+    // reference it, forcing the linker to include the ring object (which
+    // contains RTE_INIT constructors that register the mempool handler).
+    {
+        let ring_archive = format!("{}/librte_mempool_ring.a", dpdk_dir);
+        let helper_archive = format!("{}/libspdk_opts_helper.a", out_dir);
+        if std::path::Path::new(&ring_archive).exists()
+            && std::path::Path::new(&helper_archive).exists()
+        {
+            let work_dir = format!("{}/ring_embed", out_dir);
+            let _ = std::fs::remove_dir_all(&work_dir);
+            if std::fs::create_dir_all(&work_dir).is_ok() {
+                if std::process::Command::new("ar")
+                    .arg("x")
+                    .arg(&ring_archive)
+                    .current_dir(&work_dir)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    let mut objs = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&work_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().map_or(false, |e| e == "o") {
+                                if let Ok(nm_out) = std::process::Command::new("nm")
+                                    .arg(&path)
+                                    .output()
+                                {
+                                    let nm = String::from_utf8_lossy(&nm_out.stdout);
+                                    if nm.contains("mp_hdlr_init") {
+                                        std::process::Command::new("objcopy")
+                                            .arg("--globalize-symbol=mp_hdlr_init_ops_mp_mc")
+                                            .arg(&path)
+                                            .status()
+                                            .ok();
+                                    }
+                                }
+                                objs.push(path);
+                            }
+                        }
+                    }
+                    if !objs.is_empty() {
+                        let mut ar = std::process::Command::new("ar");
+                        ar.arg("rcs").arg(&helper_archive);
+                        for o in &objs {
+                            ar.arg(o);
+                        }
+                        let _ = ar.status();
+                    }
+                }
+            }
+        }
     }
 
     println!("cargo:rerun-if-env-changed=SPDK_DIR");

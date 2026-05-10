@@ -38,6 +38,8 @@ futures = { workspace = true }
 default = ["fuse3"]
 fuse2 = []
 fuse3 = []
+spdk = ["orpc/spdk"]
+spdk-rdma = ["spdk", "orpc/spdk-rdma"]
 
 [build-dependencies]
 bindgen = { workspace = true }

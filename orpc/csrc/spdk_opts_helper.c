@@ -102,6 +102,16 @@ struct spdk_nvme_ctrlr *curvine_spdk_nvme_connect(struct spdk_nvme_transport_id 
     return spdk_nvme_connect(trid, opts, sizeof(*opts));
 }
 
+// Force-link rte_mempool_ring objects (only local symbols, dropped by
+// --gc-sections without --whole-archive).  'mp_hdlr_init_ops_mp_mc' is
+// globalized via objcopy in build.rs so we can reference it here.
+extern void mp_hdlr_init_ops_mp_mc(void);
+
+void curvine_register_mempool_ring(void) {
+    static void *volatile _ring_ref;
+    _ring_ref = (void *)mp_hdlr_init_ops_mp_mc;
+}
+
 // Force transport registration (static link)
 extern void __attribute__((weak)) _spdk_nvme_transport_register_tcp(void);
 extern void __attribute__((weak)) _spdk_nvme_transport_register_rdma(void);

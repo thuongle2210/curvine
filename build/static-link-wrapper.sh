@@ -3,6 +3,11 @@
 # Needed because crate build scripts (e.g. librocksdb-sys) emit
 # `cargo:rustc-link-lib=stdc++` which lands in the -Bdynamic section.
 #
+# Also adds --allow-multiple-definition to tolerate SPDK/DPDK archives
+# being listed both via -l (for transitive propagation) and via
+# --whole-archive (for constructor retention).  The duplicate object
+# files resolve to the same symbols and the extra definitions are harmless.
+#
 # NOTE: gcc/clang support comma-separated `-Wl,...` lists. This wrapper
 # emits `-Wl,-Bstatic` / `-Wl,-Bdynamic` as separate args around the
 # affected libraries to preserve the intended linker mode transitions.
@@ -24,5 +29,8 @@ for arg in "$@"; do
         NEWARGS+=("$arg")
     fi
 done
+
+# Add --allow-multiple-definition to tolerate SPDK/DPDK whole-archive + -l overlap
+NEWARGS+=("-Wl,--allow-multiple-definition")
 
 exec "${CC:-cc}" "${NEWARGS[@]}"

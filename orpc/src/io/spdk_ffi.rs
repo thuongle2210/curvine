@@ -125,6 +125,8 @@ extern "C" {
     pub fn spdk_nvme_ns_get_sector_size(ns: *mut spdk_nvme_ns) -> u32;
     pub fn spdk_nvme_ns_get_num_sectors(ns: *mut spdk_nvme_ns) -> u64;
     pub fn curvine_spdk_register_transports();
+    // Force linker to include rte_mempool_ring objects (constructors)
+    pub fn curvine_register_mempool_ring();
     // DMA buffer
     pub fn curvine_spdk_dma_malloc(size: u64, align: u64) -> *mut c_void;
     pub fn curvine_spdk_dma_free(buf: *mut c_void);

@@ -1678,6 +1678,9 @@ impl SpdkEnv {
             // Register NVMe transports (TCP, RDMA, PCIe).
             // Must be called after env_init but before nvme_connect.
             spdk_ffi::curvine_spdk_register_transports();
+            // Force rte_mempool_ring link (RTE_INIT constructors register
+            // the ring mempool handler; needed for spdk_thread_lib_init).
+            spdk_ffi::curvine_register_mempool_ring();
         }
         info!("SPDK environment initialized successfully");
         Ok(())

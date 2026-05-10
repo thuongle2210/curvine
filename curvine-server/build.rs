@@ -27,18 +27,7 @@ fn link_spdk() {
             println!("cargo:rustc-link-arg=-Wl,--whole-archive");
             println!("cargo:rustc-link-arg={}", lib_path);
             println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
-        }
-    }
-
-    if let Some(ref dir) = spdk_dir {
-        let dpdk_lib_dir = format!("{}/dpdk/build/lib", dir);
-        for lib in &["rte_mempool_ring", "rte_mempool"] {
-            let lib_path = format!("{}/lib{}.a", dpdk_lib_dir, lib);
-            if std::path::Path::new(&lib_path).exists() {
-                println!("cargo:rustc-link-arg=-Wl,--whole-archive");
-                println!("cargo:rustc-link-arg={}", lib_path);
-                println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
-            }
+            println!("cargo:rustc-link-lib=static={}", lib);
         }
     }
 
