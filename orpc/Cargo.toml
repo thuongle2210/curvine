@@ -49,7 +49,6 @@ num_cpus = "1.16"
 [features]
 spdk = []
 spdk-rdma = ["spdk"]
-spdk_native_reactor = ["spdk"]
 
 [build-dependencies]
 pkg-config = "0.3"

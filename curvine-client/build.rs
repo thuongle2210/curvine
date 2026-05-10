@@ -1,54 +1,48 @@
 fn main() {
-    #[cfg(feature = "spdk")]
-    link_spdk();
+    if std::env::var("CARGO_FEATURE_SPDK_NATIVE_REACTOR").is_ok() {
+        link_spdk();
+    }
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SPDK_NATIVE_REACTOR");
 }
 
-#[cfg(feature = "spdk")]
 fn link_spdk() {
     let spdk_dir = std::env::var("SPDK_DIR").ok();
     let lib_dir = spdk_dir
         .as_ref()
         .map(|d| format!("{}/build/lib", d))
         .unwrap_or_else(|| "/usr/local/lib".to_string());
+
     println!("cargo:rustc-link-search=native={}", lib_dir);
 
-    // Get OUT_DIR for linking compiled C helpers
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-
-    // Compile C helper for version-safe opts setters
-    let include_dir = spdk_dir
-        .as_ref()
-        .map(|d| format!("{}/include", d))
-        .unwrap_or_else(|| "/usr/local/include".to_string());
-    let dpdk_include = spdk_dir
-        .as_ref()
-        .map(|d| format!("{}/dpdk/build/include", d))
-        .unwrap_or_else(|| "/usr/local/include/dpdk".to_string());
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let helper_src = format!("{}/csrc/spdk_opts_helper.c", manifest_dir);
-    cc::Build::new()
-        .file(&helper_src)
-        .include(&include_dir)
-        .include(&dpdk_include)
-        .compile("spdk_opts_helper");
-    println!("cargo:rerun-if-changed={}", helper_src);
-    // Explicitly link spdk_opts_helper from OUT_DIR
-    println!("cargo:rustc-link-search=native={}", out_dir);
-    println!("cargo:rustc-link-lib=static=spdk_opts_helper");
-
-    // DPDK lib subdirs
     if let Some(ref dir) = spdk_dir {
         println!("cargo:rustc-link-search=native={}/dpdk/build/lib", dir);
         println!("cargo:rustc-link-search=native={}/build/lib/dpdk", dir);
         println!("cargo:rustc-link-search=native={}/dpdk/lib", dir);
     }
 
-    // Link SPDK libs (static)
-    // NOTE: rte_mempool_ring needs --whole-archive to ensure its constructor runs
     let whole = ["spdk_nvme", "spdk_sock", "spdk_sock_posix"];
-    // DPDK libs that need --whole-archive (constructors must run)
-    let whole_dpdk = ["rte_mempool_ring", "rte_mempool"];
-    let mut libs = vec![
+    for lib in &whole {
+        let lib_path = format!("{}/lib{}.a", lib_dir, lib);
+        if std::path::Path::new(&lib_path).exists() {
+            println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+            println!("cargo:rustc-link-arg={}", lib_path);
+            println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+        }
+    }
+
+    if let Some(ref dir) = spdk_dir {
+        let dpdk_lib_dir = format!("{}/dpdk/build/lib", dir);
+        for lib in &["rte_mempool_ring", "rte_mempool"] {
+            let lib_path = format!("{}/lib{}.a", dpdk_lib_dir, lib);
+            if std::path::Path::new(&lib_path).exists() {
+                println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+                println!("cargo:rustc-link-arg={}", lib_path);
+                println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
+            }
+        }
+    }
+
+    let spdk_libs = [
         "spdk_trace",
         "spdk_json",
         "spdk_jsonrpc",
@@ -61,49 +55,13 @@ fn link_spdk() {
         "spdk_thread",
         "spdk_dma",
     ];
-
-    #[cfg(feature = "spdk-rdma")]
-    libs.extend(["spdk_rdma_provider", "spdk_rdma_utils"]);
-
-    // SPDK libs that need --whole-archive (constructors must run)
-    for lib in &whole {
-        let lib_path = format!("{}/lib{}.a", lib_dir, lib);
-        if std::path::Path::new(&lib_path).exists() {
-            println!("cargo:rustc-link-arg=-Wl,--whole-archive");
-            println!("cargo:rustc-link-arg={}", lib_path);
-            println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
-        }
-    }
-
-    // DPDK libs that need --whole-archive (constructors must run)
-    // Compute path from spdk_dir since dpdk_dir is defined later
-    if let Some(ref dir) = spdk_dir {
-        let dpdk_lib_dir = format!("{}/dpdk/build/lib", dir);
-        for lib in &whole_dpdk {
-            let lib_path = format!("{}/lib{}.a", dpdk_lib_dir, lib);
-            // Debug output
-            println!("cargo:warning=Checking for: {}", lib_path);
-            if std::path::Path::new(&lib_path).exists() {
-                println!(
-                    "cargo:warning=Found! Adding --whole-archive for {}",
-                    lib_path
-                );
-                println!("cargo:rustc-link-arg=-Wl,--whole-archive");
-                println!("cargo:rustc-link-arg={}", lib_path);
-                println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
-            } else {
-                println!("cargo:warning=NOT FOUND: {}", lib_path);
-            }
-        }
-    }
-    for lib in &libs {
+    for lib in &spdk_libs {
         let path = format!("{}/lib{}.a", lib_dir, lib);
         if std::path::Path::new(&path).exists() {
             println!("cargo:rustc-link-lib=static={}", lib);
         }
     }
 
-    // DPDK libs
     let dpdk_dir = spdk_dir
         .as_ref()
         .map(|d| format!("{}/dpdk/build/lib", d))
@@ -131,7 +89,6 @@ fn link_spdk() {
         }
     }
 
-    // Extra DPDK libs
     let extra = [
         "rte_log",
         "rte_argparse",
@@ -150,23 +107,9 @@ fn link_spdk() {
         }
     }
 
-    // SPDK keyring
     let keyring = format!("{}/libspdk_keyring.a", lib_dir);
     if std::path::Path::new(&keyring).exists() {
         println!("cargo:rustc-link-lib=static=spdk_keyring");
-    }
-
-    // System libs
-    for lib in &[
-        "pthread", "dl", "rt", "numa", "uuid", "fuse3", "isal", "ssl", "crypto",
-    ] {
-        println!("cargo:rustc-link-lib=dylib={}", lib);
-    }
-
-    // RDMA libs (spdk-rdma only)
-    #[cfg(feature = "spdk-rdma")]
-    for lib in &["ibverbs", "rdmacm"] {
-        println!("cargo:rustc-link-lib=dylib={}", lib);
     }
 
     println!("cargo:rerun-if-env-changed=SPDK_DIR");

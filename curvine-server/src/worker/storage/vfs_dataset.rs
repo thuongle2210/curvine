@@ -381,7 +381,7 @@ mod test {
 
     #[test]
     fn sample() -> CommonResult<()> {
-        let ds = create_data_set(true, "sample");
+        let mut ds = create_data_set(true, "sample");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
         let meta = ds.open_block(&block)?;
         assert_eq!(ds.available(), 400);
@@ -393,13 +393,13 @@ mod test {
     }
     #[test]
     fn append() -> CommonResult<()> {
-        let ds = create_data_set(true, "append");
+        let mut ds = create_data_set(true, "append");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
         let meta = ds.open_block(&block)?;
         meta.write_test_data("50B")?;
         block.len = 50;
         ds.finalize_block(&block)?;
-        block.len = 100;
+        block.len = 70;
         let meta2 = ds.open_block(&block)?;
         meta2.write_test_data("20B")?;
         ds.finalize_block(&block)?;
@@ -422,6 +422,8 @@ mod test {
     #[test]
     fn abort_spdk() -> CommonResult<()> {
         use crate::worker::block::BlockMeta;
+        use crate::worker::storage::{DirList, DirState, StorageVersion, VfsDir};
+        use curvine_common::state::FileType;
         use curvine_common::state::StorageType;
         use orpc::sync::AtomicLong;
         use orpc::sys::FsStats;
@@ -437,7 +439,10 @@ mod test {
             offset_alloc: DirState::new_offset_alloc(StorageType::SpdkDisk, 1 << 30, 4096),
         });
         let vfs = VfsDir {
-            version: StorageVersion::with_cluster("t"),
+            version: StorageVersion {
+                dir_id: 1,
+                ..StorageVersion::with_cluster("t")
+            },
             stats: FsStats::new("/tmp"),
             active_dir: PathBuf::from("/tmp/a"),
             staging_dir: PathBuf::from("/tmp/s"),
@@ -465,7 +470,7 @@ mod test {
                 4096,
                 StorageType::SpdkDisk,
                 FileType::File,
-            )?)
+            ))
             .is_ok();
         assert!(ok && ds.block_map.get(&1).is_none());
         Ok(())

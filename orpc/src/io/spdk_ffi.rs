@@ -59,7 +59,7 @@ extern "C" {
     // SPDK thread management (native reactor)
     pub fn spdk_thread_create(name: *const c_char, cpumask: *const c_void) -> *mut spdk_thread;
     pub fn spdk_thread_exit(thread: *mut spdk_thread);
-    // pub fn spdk_thread_destroy(thread: *mut spdk_thread);
+    pub fn spdk_thread_destroy(thread: *mut spdk_thread);
     pub fn spdk_thread_send_msg(
         thread: *mut spdk_thread,
         cb: spdk_thread_fn,
