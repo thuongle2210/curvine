@@ -167,31 +167,17 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 // ---------------------------------------------------------------------------
 
 /// Message handler for native reactor: processes I/O requests sent via spdk_thread_send_msg.
-/// Submits the NVMe command, flushes to wire via transport poller, then polls the qpair
-/// directly in a tight spin to catch the near-immediate completion (common over localhost TCP).
+/// `submit_one` sends the command to the TCP wire synchronously via `spdk_sock_writev_async`.
+/// One `spdk_thread_poll` call gives the transport poller a chance to read the response
+/// (which has usually arrived on localhost). If not, the outer `thread_poll`'s poller phase
+/// or the next reactor loop iteration picks it up. The calling thread waits via Condvar.
 pub unsafe extern "C" fn spdk_native_reactor_msg_handler(arg: *mut c_void) {
     let req = Box::from_raw(arg as *mut IoRequest);
 
-    // Extract qpair before submit_one consumes the req reference
-    let qpair = match &req.op {
-        IoOp::Read { qpair, .. } => *qpair,
-        IoOp::Write { qpair, .. } => *qpair,
-        IoOp::Flush { qpair, .. } => *qpair,
-    };
-
     submit_one(&req, &mut Vec::new());
 
-    // 1) Flush queued command to TCP wire via SPDK transport poller
     let thread = spdk_ffi::spdk_get_thread();
     spdk_ffi::spdk_thread_poll(thread, 0, 0);
-
-    // 2) Poll the qpair directly a couple times to catch near-immediate completions.
-    //    If not yet arrived, the reactor's transport poller catches it within microseconds.
-    for _ in 0..30 {
-        if spdk_ffi::spdk_nvme_qpair_process_completions(qpair, 0) > 0 {
-            break;
-        }
-    }
 }
 
 /// Poller callback: processes completions for ALL qpairs on this reactor.
