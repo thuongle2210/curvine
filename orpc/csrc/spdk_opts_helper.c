@@ -16,7 +16,7 @@
 // This ensures constructors run and mempool drivers are registered.
 // Based on working spdk_native_reactor_highest_perf.c pattern.
 // void curvine_spdk_preload_libs(void) {
-    // fprintf(stderr, "[DEBUG C] Pre-loading SPDK/DPDK libraries...\n");
+    // // fprintf(stderr, "[DEBUG C] Pre-loading SPDK/DPDK libraries...\n");
     // const char *libs[] = {
     //     "/home/thuongle/spdk_project/spdk/dpdk/build/lib/librte_mempool_ring.so",
     //     NULL
@@ -24,9 +24,9 @@
     // for (int i = 0; libs[i]; i++) {
     //     void *handle = dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
     //     if (handle) {
-    //         fprintf(stderr, "[DEBUG C]   Loaded: %s\n", libs[i]);
+    //         // fprintf(stderr, "[DEBUG C]   Loaded: %s\n", libs[i]);
     //     } else {
-    //         fprintf(stderr, "[DEBUG C]   FAILED to load: %s (error=%s)\n", libs[i], dlerror());
+    //         // fprintf(stderr, "[DEBUG C]   FAILED to load: %s (error=%s)\n", libs[i], dlerror());
     //     }
     // }
 // }
@@ -139,13 +139,13 @@ void curvine_spdk_dma_free(void *buf) {
 
 // Debug: check EAL memory availability
 void curvine_check_eal_memory(void) {
-    fprintf(stderr, "[DEBUG C] Checking EAL memory:\n");
+    // fprintf(stderr, "[DEBUG C] Checking EAL memory:\n");
     void *buf = spdk_dma_malloc(4096, 4096, NULL);
     if (buf) {
-        fprintf(stderr, "[DEBUG C]   spdk_dma_malloc(4096) succeeded: %p\n", buf);
+        // fprintf(stderr, "[DEBUG C]   spdk_dma_malloc(4096) succeeded: %p\n", buf);
         spdk_dma_free(buf);
     } else {
-        fprintf(stderr, "[DEBUG C]   spdk_dma_malloc(4096) FAILED - EAL has no memory!\n");
+        // fprintf(stderr, "[DEBUG C]   spdk_dma_malloc(4096) FAILED - EAL has no memory!\n");
     }
 }
 
@@ -154,20 +154,20 @@ void curvine_check_eal_memory(void) {
 // The loop continues until spdk_thread_exit() is called on this thread.
 // Exit is triggered by a self-exit message sent from Rust via spdk_thread_send_msg.
 void curvine_spdk_run_reactor_loop(struct spdk_thread *thread) {
-    fprintf(stderr, "[DEBUG C] Entering reactor poll loop for thread %p...\n", thread);
+    // fprintf(stderr, "[DEBUG C] Entering reactor poll loop for thread %p...\n", thread);
     
     while (!spdk_thread_is_exited(thread)) {
         spdk_thread_poll(thread, 0, 0);
     }
     
-    fprintf(stderr, "[DEBUG C] Reactor loop exiting for thread %p\n", thread);
+    // fprintf(stderr, "[DEBUG C] Reactor loop exiting for thread %p\n", thread);
 }
 
 // Self-exit handler: called via spdk_thread_send_msg from the main thread.
 // Runs on the reactor thread, triggers clean exit of the reactor loop.
 void curvine_reactor_exit_handler(void *arg) {
     struct spdk_thread *thread = (struct spdk_thread *)arg;
-    fprintf(stderr, "[DEBUG C] curvine_reactor_exit_handler: thread=%p\n", thread);
+    // fprintf(stderr, "[DEBUG C] curvine_reactor_exit_handler: thread=%p\n", thread);
     spdk_thread_exit(thread);
 }
 
@@ -175,7 +175,7 @@ void curvine_reactor_exit_handler(void *arg) {
 
 // I/O qpair
 struct spdk_nvme_qpair *curvine_spdk_alloc_io_qpair(struct spdk_nvme_ctrlr *ctrlr) {
-    fprintf(stderr, "[DEBUG C] curvine_spdk_alloc_io_qpair: ctrlr=%p\n", ctrlr);
+    // fprintf(stderr, "[DEBUG C] curvine_spdk_alloc_io_qpair: ctrlr=%p\n", ctrlr);
     if (!ctrlr) {
         fprintf(stderr, "[ERROR C] ctrlr is NULL!\n");
         return NULL;
@@ -183,7 +183,7 @@ struct spdk_nvme_qpair *curvine_spdk_alloc_io_qpair(struct spdk_nvme_ctrlr *ctrl
     struct spdk_nvme_io_qpair_opts opts;
     spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &opts, sizeof(opts));
     struct spdk_nvme_qpair *qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, &opts, sizeof(opts));
-    fprintf(stderr, "[DEBUG C] spdk_nvme_ctrlr_alloc_io_qpair returned: %p\n", qpair);
+    // fprintf(stderr, "[DEBUG C] spdk_nvme_ctrlr_alloc_io_qpair returned: %p\n", qpair);
     if (!qpair) {
         fprintf(stderr, "[ERROR C] Failed to allocate qpair for ctrlr=%p\n", ctrlr);
     }
@@ -227,21 +227,21 @@ static int curvine_poll(struct spdk_nvme_qpair *qpair, struct curvine_io_ctx *ct
 // int curvine_spdk_ns_read(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 //                          void *buf, uint64_t offset, uint64_t nbytes, uint64_t timeout_us) {
 //     uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
-//     fprintf(stderr, "[DEBUG C] curvine_spdk_ns_read: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu\n",
+//     // fprintf(stderr, "[DEBUG C] curvine_spdk_ns_read: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu\n",
 //             ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss);
 //     struct curvine_io_ctx ctx = { .done = false, .status = 0 };
 //     int rc = spdk_nvme_ns_cmd_read(ns, qpair, buf, offset / ss, nbytes / ss, curvine_cb, &ctx, 0);
-//     fprintf(stderr, "[DEBUG C] curvine_spdk_ns_read: spdk_nvme_ns_cmd_read returned rc=%d\n", rc);
+//     // fprintf(stderr, "[DEBUG C] curvine_spdk_ns_read: spdk_nvme_ns_cmd_read returned rc=%d\n", rc);
 //     return rc ? rc : curvine_poll(qpair, &ctx, timeout_us);
 // }
 // int curvine_spdk_ns_write(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 //                           void *buf, uint64_t offset, uint64_t nbytes, uint64_t timeout_us) {
 //     uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
-//     fprintf(stderr, "[DEBUG C] curvine_spdk_ns_write: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu\n",
+//     // fprintf(stderr, "[DEBUG C] curvine_spdk_ns_write: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu\n",
 //             ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss);
 //     struct curvine_io_ctx ctx = { .done = false, .status = 0 };
 //     int rc = spdk_nvme_ns_cmd_write(ns, qpair, buf, offset / ss, nbytes / ss, curvine_cb, &ctx, 0);
-//     fprintf(stderr, "[DEBUG C] curvine_spdk_ns_write: spdk_nvme_ns_cmd_write returned rc=%d\n", rc);
+//     // fprintf(stderr, "[DEBUG C] curvine_spdk_ns_write: spdk_nvme_ns_cmd_write returned rc=%d\n", rc);
 //     return rc ? rc : curvine_poll(qpair, &ctx, timeout_us);
 // }
 // int curvine_spdk_ns_flush(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, uint64_t timeout_us) {
@@ -268,14 +268,14 @@ static void curvine_async_cb_fn(void *arg, const struct spdk_nvme_cpl *cpl) {
 int curvine_spdk_ns_submit_read(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
                                 void *buf, uint64_t offset, uint64_t nbytes, struct curvine_async_ctx *ctx) {
     uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
-    fprintf(stderr, "[DEBUG C] curvine_spdk_ns_submit_read: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu, ctx=%p\n",
+    // fprintf(stderr, "[DEBUG C] curvine_spdk_ns_submit_read: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu, ctx=%p\n",
             ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss, (void*)ctx);
     return spdk_nvme_ns_cmd_read(ns, qpair, buf, offset / ss, nbytes / ss, curvine_async_cb_fn, ctx, 0);
 }
 int curvine_spdk_ns_submit_write(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
                                 void *buf, uint64_t offset, uint64_t nbytes, struct curvine_async_ctx *ctx) {
     uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
-    fprintf(stderr, "[DEBUG C] curvine_spdk_ns_submit_write: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu, ctx=%p\n",
+    // fprintf(stderr, "[DEBUG C] curvine_spdk_ns_submit_write: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu, ctx=%p\n",
             ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss, (void*)ctx);
     return spdk_nvme_ns_cmd_write(ns, qpair, buf, offset / ss, nbytes / ss, curvine_async_cb_fn, ctx, 0);
 }
@@ -292,7 +292,7 @@ size_t curvine_spdk_async_ctx_sizeof(void) {
 void curvine_spdk_async_ctx_init(struct curvine_async_ctx *ctx, curvine_async_cb cb, void *cb_arg) {
     ctx->cb = cb;
     ctx->cb_arg = cb_arg;
-    fprintf(stderr, "[DEBUG C] curvine_spdk_async_ctx_init: ctx=%p, cb=%p, cb_arg=%p\n", (void*)ctx, (void*)(uintptr_t)cb, cb_arg);
+    // fprintf(stderr, "[DEBUG C] curvine_spdk_async_ctx_init: ctx=%p, cb=%p, cb_arg=%p\n", (void*)ctx, (void*)(uintptr_t)cb, cb_arg);
 }
 
 // Thread library init wrapper - uses smaller mempool size to avoid ENOMEM
