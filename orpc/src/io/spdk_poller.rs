@@ -239,19 +239,19 @@ pub unsafe extern "C" fn reactor_poller_cb(arg: *mut c_void) -> c_int {
     let qpair_count = qpairs.len();
 
     if unsafe { CALLBACK_COUNT <= 5 } || CALLBACK_COUNT % 1000000 == 0 {
-        eprintln!(
-            "[Reactor poller #{}] state={:?}, thread={:?}, qpair_count={}",
-            CALLBACK_COUNT, state_ptr, state.thread, qpair_count
-        );
+        // eprintln!(
+        //     "[Reactor poller #{}] state={:?}, thread={:?}, qpair_count={}",
+        //     CALLBACK_COUNT, state_ptr, state.thread, qpair_count
+        // );
     }
 
     if qpair_count == 0 {
         // Only print this occasionally to avoid spam
         if unsafe { CALLBACK_COUNT <= 100 || CALLBACK_COUNT % 1000000 == 0 } {
-            eprintln!(
-                "[Reactor poller #{}] state={:?}: No qpairs registered!",
-                CALLBACK_COUNT, state_ptr
-            );
+            // eprintln!(
+            //     "[Reactor poller #{}] state={:?}: No qpairs registered!",
+            //     CALLBACK_COUNT, state_ptr
+            // );
         }
         return 0;
     }
@@ -262,32 +262,32 @@ pub unsafe extern "C" fn reactor_poller_cb(arg: *mut c_void) -> c_int {
         if !qpair.is_null() {
             let rc = spdk_ffi::spdk_nvme_qpair_process_completions(qpair, 0);
             if rc > 0 && unsafe { CALLBACK_COUNT <= 1000 } {
-                eprintln!(
-                    "[Reactor poller #{}] Processed {} completions for qpair {:?}",
-                    CALLBACK_COUNT, rc, qpair
-                );
+                // eprintln!(
+                //     "[Reactor poller #{}] Processed {} completions for qpair {:?}",
+                //     CALLBACK_COUNT, rc, qpair
+                // );
             } else if rc < 0 {
-                eprintln!(
-                    "[Reactor poller #{}] Error processing qpair {:?}: rc={}",
-                    CALLBACK_COUNT, qpair, rc
-                );
+                // eprintln!(
+                //     "[Reactor poller #{}] Error processing qpair {:?}: rc={}",
+                //     CALLBACK_COUNT, qpair, rc
+                // );
             }
             total_completions += rc;
         } else {
-            eprintln!(
-                "[Reactor poller #{}] Found NULL qpair in list!",
-                CALLBACK_COUNT
-            );
+            // eprintln!(
+            //     "[Reactor poller #{}] Found NULL qpair in list!",
+            //     CALLBACK_COUNT
+            // );
         }
     }
 
     // Return 1 if busy (more completions possible), 0 if idle
     let busy = if total_completions > 0 { 1 } else { 0 };
     if unsafe { CALLBACK_COUNT % 1000000 == 0 } {
-        eprintln!(
-            "[Reactor poller #{}] Total completions: {} across {} qpairs, busy={}",
-            CALLBACK_COUNT, total_completions, qpair_count, busy
-        );
+        // eprintln!(
+        //     "[Reactor poller #{}] Total completions: {} across {} qpairs, busy={}",
+        //     CALLBACK_COUNT, total_completions, qpair_count, busy
+        // );
     }
     busy
 }
