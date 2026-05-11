@@ -167,49 +167,11 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 // ---------------------------------------------------------------------------
 
 /// Message handler for native reactor: processes I/O requests sent via spdk_thread_send_msg.
+/// Submits the NVMe command and returns immediately — the registered `reactor_poller_cb`
+/// processes completions on the normal reactor loop, and the C callback wakes the waiter.
 pub unsafe extern "C" fn spdk_native_reactor_msg_handler(arg: *mut c_void) {
-    eprintln!("[Reactor] spdk_native_reactor_msg_handler called");
     let req = Box::from_raw(arg as *mut IoRequest);
-    let qpair = match &req.op {
-        IoOp::Read { qpair, .. } => *qpair,
-        IoOp::Write { qpair, .. } => *qpair,
-        IoOp::Flush { qpair, .. } => *qpair,
-    };
-    eprintln!(
-        "[Reactor] Received IoRequest: qpair={:?}, submitting I/O",
-        qpair
-    );
     submit_one(&req, &mut Vec::new());
-    eprintln!("[Reactor] submit_one completed, waiting for completion...");
-
-    // Poll via spdk_thread_poll a few times to allow callbacks to execute
-    // The reactor_poller_cb will continue polling in the background
-    for i in 0..10 {
-        let current_thread = spdk_ffi::spdk_get_thread();
-        if !current_thread.is_null() {
-            let msgs = spdk_ffi::spdk_thread_poll(current_thread, 0, 0);
-            if i < 3 {
-                eprintln!("[Reactor] Poll iteration {}, msgs={}", i, msgs);
-            }
-        }
-
-        if req.completion.inner.lock().unwrap().done {
-            let status = req.completion.inner.lock().unwrap().status;
-            eprintln!(
-                "[Reactor] Completion done after {} polls: status={}",
-                i + 1,
-                status
-            );
-            return;
-        }
-    }
-
-    let done = req.completion.inner.lock().unwrap().done;
-    let status = req.completion.inner.lock().unwrap().status;
-    eprintln!(
-        "[Reactor] Completion not done after 10 polls: done={}, status={}",
-        done, status
-    );
 }
 
 /// Register a single poller on the reactor thread for ALL qpairs.

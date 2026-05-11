@@ -182,9 +182,8 @@ fn link_spdk() {
                         for entry in entries.flatten() {
                             let path = entry.path();
                             if path.extension().map_or(false, |e| e == "o") {
-                                if let Ok(nm_out) = std::process::Command::new("nm")
-                                    .arg(&path)
-                                    .output()
+                                if let Ok(nm_out) =
+                                    std::process::Command::new("nm").arg(&path).output()
                                 {
                                     let nm = String::from_utf8_lossy(&nm_out.stdout);
                                     if nm.contains("mp_hdlr_init") {
