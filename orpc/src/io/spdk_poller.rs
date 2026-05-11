@@ -167,11 +167,17 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 // ---------------------------------------------------------------------------
 
 /// Message handler for native reactor: processes I/O requests sent via spdk_thread_send_msg.
-/// Submits the NVMe command and returns immediately — the registered `reactor_poller_cb`
-/// processes completions on the normal reactor loop, and the C callback wakes the waiter.
+/// Submits the NVMe command then runs one reactor poll cycle to process completions
+/// that arrived immediately (common over localhost TCP), avoiding wait for next reactor iteration.
 pub unsafe extern "C" fn spdk_native_reactor_msg_handler(arg: *mut c_void) {
     let req = Box::from_raw(arg as *mut IoRequest);
     submit_one(&req, &mut Vec::new());
+
+    // One non-blocking poll cycle to process completions that arrived near-instantly.
+    // This calls all registered pollers (SPDK transport, reactor_poller_cb, etc.)
+    // and processes any queued messages. Returns immediately (~1μs) if nothing pending.
+    let thread = spdk_ffi::spdk_get_thread();
+    spdk_ffi::spdk_thread_poll(thread, 0, 0);
 }
 
 /// Register a single poller on the reactor thread for ALL qpairs.
