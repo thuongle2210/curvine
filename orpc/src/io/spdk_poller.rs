@@ -167,68 +167,35 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 // ---------------------------------------------------------------------------
 
 /// Message handler for native reactor: processes I/O requests sent via spdk_thread_send_msg.
-/// Submits the NVMe command then runs one reactor poll cycle to process completions
-/// that arrived immediately (common over localhost TCP), avoiding wait for next reactor iteration.
+/// Submits the NVMe command, flushes to wire via transport poller, then polls the qpair
+/// directly in a tight spin to catch the near-immediate completion (common over localhost TCP).
 pub unsafe extern "C" fn spdk_native_reactor_msg_handler(arg: *mut c_void) {
     let req = Box::from_raw(arg as *mut IoRequest);
+
+    // Extract qpair before submit_one consumes the req reference
+    let qpair = match &req.op {
+        IoOp::Read { qpair, .. } => *qpair,
+        IoOp::Write { qpair, .. } => *qpair,
+        IoOp::Flush { qpair, .. } => *qpair,
+    };
+
     submit_one(&req, &mut Vec::new());
 
-    // One non-blocking poll cycle to process completions that arrived near-instantly.
-    // This calls all registered pollers (SPDK transport, reactor_poller_cb, etc.)
-    // and processes any queued messages. Returns immediately (~1μs) if nothing pending.
+    // 1) Flush queued command to TCP wire via SPDK transport poller
     let thread = spdk_ffi::spdk_get_thread();
     spdk_ffi::spdk_thread_poll(thread, 0, 0);
-}
 
-/// Register a single poller on the reactor thread for ALL qpairs.
-/// Called via spdk_thread_send_msg on the reactor thread.
-pub unsafe extern "C" fn reactor_poller_register_handler(arg: *mut c_void) {
-    use crate::io::spdk_ffi;
-    use std::sync::atomic::Ordering;
-
-    info!("[Reactor] Registering poller on reactor thread");
-
-    let state = Arc::from_raw(arg as *const crate::io::spdk_env::ReactorState);
-
-    // Create poller that processes completions for ALL qpairs on this reactor
-    let state_ptr = Arc::into_raw(state.clone()) as *mut c_void;
-    info!("[Reactor] Calling spdk_poller_register");
-    let poller = spdk_ffi::spdk_poller_register(
-        reactor_poller_cb,
-        state_ptr,
-        0, // period_us = 0 means poll every reactor iteration
-    );
-
-    if poller.is_null() {
-        error!("[Reactor] Failed to register reactor poller");
-        return;
-    }
-
-    info!("[Reactor] Poller registered at {:?}", poller);
-
-    // Store poller pointer in state
-    let state_mut = &mut *(arg as *mut crate::io::spdk_env::ReactorState);
-    state_mut.poller = poller;
-
-    info!("[Reactor] Reactor poller registered successfully, stored in state");
-}
-
-/// Unregister the reactor poller.
-pub unsafe extern "C" fn reactor_poller_unregister_handler(arg: *mut c_void) {
-    use crate::io::spdk_ffi;
-
-    let state = &mut *(arg as *mut crate::io::spdk_env::ReactorState);
-
-    if !state.poller.is_null() {
-        let poller = state.poller;
-        spdk_ffi::spdk_poller_unregister(poller);
-        state.poller = std::ptr::null_mut();
-        info!("Reactor poller unregistered");
+    // 2) Poll the qpair directly a couple times to catch near-immediate completions.
+    //    If not yet arrived, the reactor's transport poller catches it within microseconds.
+    for _ in 0..30 {
+        if spdk_ffi::spdk_nvme_qpair_process_completions(qpair, 0) > 0 {
+            break;
+        }
     }
 }
 
 /// Poller callback: processes completions for ALL qpairs on this reactor.
-/// This is called by SPDK reactor on every iteration.
+/// Diagnostic only — not currently registered (I/O uses direct qpair polling in handler).
 pub unsafe extern "C" fn reactor_poller_cb(arg: *mut c_void) -> c_int {
     use crate::io::spdk_ffi;
 
@@ -244,11 +211,22 @@ pub unsafe extern "C" fn reactor_poller_cb(arg: *mut c_void) -> c_int {
 
     let qpair_count = qpairs.len();
 
-    if unsafe { CALLBACK_COUNT <= 5 } || CALLBACK_COUNT % 1000000 == 0 {
-        // eprintln!(
-        //     "[Reactor poller #{}] state={:?}, thread={:?}, qpair_count={}",
-        //     CALLBACK_COUNT, state_ptr, state.thread, qpair_count
-        // );
+    if unsafe { CALLBACK_COUNT <= 100 } || CALLBACK_COUNT % 1000000 == 0 {
+        eprintln!(
+            "[Reactor poller #{}] state={:?}, thread={:?}, qpair_count={}",
+            CALLBACK_COUNT, state_ptr, state.thread, qpair_count
+        );
+    }
+
+    if qpair_count == 0 {
+        // Only print this occasionally to avoid spam
+        if unsafe { CALLBACK_COUNT <= 100 || CALLBACK_COUNT % 1000000 == 0 } {
+            eprintln!(
+                "[Reactor poller #{}] state={:?}: No qpairs registered!",
+                CALLBACK_COUNT, state_ptr
+            );
+        }
+        return 0;
     }
 
     if qpair_count == 0 {
@@ -348,18 +326,6 @@ pub unsafe extern "C" fn qpair_create_handler(arg: *mut c_void) {
         qpair
     );
     info!("[Reactor] Qpair allocated on reactor thread: {:?}", qpair);
-
-    // CRITICAL: Add qpair to reactor state's qpairs list so poller can process it
-    if let Some(ref state) = state {
-        let mut qpairs = state.qpairs.lock().unwrap();
-        qpairs.push(qpair);
-        eprintln!(
-            "[Reactor qpair_create #{QPAIR_CREATE_COUNT}]: Added to state, qpairs.len={}",
-            qpairs.len()
-        );
-    } else {
-        eprintln!("[Reactor qpair_create #{QPAIR_CREATE_COUNT}]: WARNING: could not find reactor state for ctrlr");
-    }
 
     let mut out = req.qpair_out.lock().unwrap();
     *out = Some(qpair);

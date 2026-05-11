@@ -16,12 +16,11 @@ use std::sync::{Mutex, OnceLock};
 // Reactor State (native reactor only)
 // ---------------------------------------------------------------------------
 
-/// Single poller per reactor: processes completions for ALL qpairs on that reactor.
+/// Per-reactor thread state.
 pub struct ReactorState {
     pub thread: *mut spdk_ffi::spdk_thread,
     pub os_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub qpairs: Mutex<Vec<*mut spdk_ffi::spdk_nvme_qpair>>,
-    pub poller: *mut spdk_ffi::spdk_poller,
     pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub reactor_idx: usize,
     /// Controllers attached on this reactor thread (ctrlr_idx -> controller pointer)
@@ -858,7 +857,6 @@ impl SpdkEnv {
                 thread,
                 os_thread: Mutex::new(None),
                 qpairs: Mutex::new(Vec::new()),
-                poller: std::ptr::null_mut(),
                 ready: ready_flag.clone(),
                 controllers: Mutex::new(HashMap::new()),
                 reactor_idx,
@@ -915,28 +913,7 @@ impl SpdkEnv {
                         shared_bdevs.extend(thread_bdevs);
                     }
 
-                    // Register poller on this thread (BEFORE signaling ready)
-                    // IMPORTANT: pass pointer to SAME state that holds controllers and qpairs
-                    // Use Arc::as_ptr() to get the data pointer (stable Rust 1.92+)
-                    // This way poller and controller storage point to same ReactorState
-                    let state_ptr: *mut ReactorState =
-                        Arc::as_ptr(&state_clone) as *mut ReactorState;
-
-                    let poller = spdk_ffi::spdk_poller_register(
-                        crate::io::spdk_poller::reactor_poller_cb,
-                        state_ptr as *mut c_void,
-                        0,
-                    );
-                    if poller.is_null() {
-                        error!("[Reactor-{}] Failed to register poller", reactor_idx);
-                    } else {
-                        info!(
-                            "[Reactor-{}] Poller registered at {:?} with state_ptr={:?}",
-                            reactor_idx, poller, state_ptr
-                        );
-                    }
-
-                    // Now signal that thread is ready (controllers attached AND poller registered)
+                    // Signal that thread is ready (controllers attached)
                     state_clone
                         .ready
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -945,11 +922,6 @@ impl SpdkEnv {
                     info!("[Reactor-{}] Entering reactor loop", reactor_idx);
                     spdk_ffi::curvine_spdk_run_reactor_loop(state_clone.thread);
                     info!("[Reactor-{}] Exited reactor loop", reactor_idx);
-
-                    // Cleanup: unregister poller
-                    if !poller.is_null() {
-                        spdk_ffi::spdk_poller_unregister(poller);
-                    }
 
                     // Destroy SPDK thread (required before spdk_thread_lib_fini)
                     spdk_ffi::spdk_thread_destroy(state_clone.thread);
