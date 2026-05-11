@@ -30,6 +30,10 @@ pub struct ReactorState {
     pub detach_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Registered poller handle (NULL until poller is registered).
     pub poller: Mutex<*mut spdk_ffi::spdk_poller>,
+    /// Cached qpairs per controller (ctrlr_ptr -> Vec<qpair>).
+    /// Allows reopen to reuse a qpair without TCP fabric connect (~21ms).
+    /// Max entries per controller: MAX_CACHED_QPAIRS_PER_CTRLR.
+    pub qpair_cache: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
 }
 
 unsafe impl Send for ReactorState {}
@@ -869,6 +873,7 @@ impl SpdkEnv {
                 reactor_idx,
                 detach_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 poller: Mutex::new(std::ptr::null_mut()),
+                qpair_cache: Mutex::new(HashMap::new()),
             });
 
             // Spawn OS thread to run reactor loop (matching C demo pattern)
@@ -1699,6 +1704,21 @@ impl SpdkEnv {
 /// on the correct SPDK thread (required by SPDK for safe detach).
 pub unsafe extern "C" fn detach_reactor_controllers(arg: *mut c_void) {
     let state = &*(arg as *const ReactorState);
+
+    // Drain qpair cache before detaching controllers
+    {
+        let mut cache = state.qpair_cache.lock().unwrap();
+        let mut total = 0usize;
+        for (_ctrlr_key, qpairs) in cache.drain() {
+            for qpair in qpairs {
+                spdk_ffi::curvine_spdk_free_io_qpair(qpair);
+                total += 1;
+            }
+        }
+        if total > 0 {
+            info!("[Reactor-{}] Freed {} cached qpair(s) during shutdown", state.reactor_idx, total);
+        }
+    }
 
     // Collect controllers under lock, then detach outside lock
     let ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = {

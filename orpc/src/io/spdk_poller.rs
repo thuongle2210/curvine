@@ -248,6 +248,35 @@ pub unsafe extern "C" fn qpair_create_handler(arg: *mut c_void) {
         state.as_ref().map(|s| s.thread)
     );
 
+    // Try cache first — avoids ~21ms TCP fabric connect on reopen
+    if let Some(ref state) = state {
+        let ctrlr_key = req.ctrlr as usize;
+        let mut cache = state.qpair_cache.lock().unwrap();
+        if let Some(qpairs) = cache.get_mut(&ctrlr_key) {
+            if let Some(cached_qpair) = qpairs.pop() {
+                // Cache hit! Reuse this qpair.
+                eprintln!(
+                    "[Reactor qpair_create #{QPAIR_CREATE_COUNT}] cache HIT: reusing qpair={:?}",
+                    cached_qpair
+                );
+                info!("[Reactor] Qpair cache hit, reusing {:?}", cached_qpair);
+
+                // Re-register with poller
+                state.qpairs.lock().unwrap().push(cached_qpair);
+
+                let mut out = req.qpair_out.lock().unwrap();
+                *out = Some(cached_qpair);
+                req.completion.complete(0);
+                return;
+            }
+        }
+    }
+
+    // Cache miss — allocate new qpair (~21ms TCP fabric connect)
+    eprintln!(
+        "[Reactor qpair_create #{QPAIR_CREATE_COUNT}] cache MISS: allocating new qpair"
+    );
+
     let qpair = spdk_ffi::curvine_spdk_alloc_io_qpair(req.ctrlr);
 
     eprintln!(
@@ -283,16 +312,18 @@ pub unsafe extern "C" fn qpair_create_handler(arg: *mut c_void) {
     req.completion.complete(0);
 }
 
-/// Message to free qpair on reactor thread.
+/// Message to free qpair on reactor thread (or cache it for reuse).
 pub struct QpairFreeRequest {
     pub qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    /// Controller the qpair belongs to (needed for caching).
+    pub ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
 }
 
-/// Message handler to free qpair on reactor thread.
+/// Message handler to free qpair on reactor thread (or cache it for reuse).
 pub unsafe extern "C" fn qpair_free_handler(arg: *mut c_void) {
     let req = Box::from_raw(arg as *mut QpairFreeRequest);
     if !req.qpair.is_null() {
-        // Remove from reactor state's qpair list to prevent poller from accessing freed qpair
+        // Remove from reactor state's qpair list so poller stops polling it
         if let Some(states) = crate::io::spdk_env::get_reactor_states().get() {
             if let Ok(guard) = states.lock() {
                 for state in guard.iter() {
@@ -301,8 +332,37 @@ pub unsafe extern "C" fn qpair_free_handler(arg: *mut c_void) {
                 }
             }
         }
+
+        // Cache the qpair for reuse instead of freeing it.
+        // This avoids ~21ms TCP fabric connect on the next open.
+        if let Some(states) = crate::io::spdk_env::get_reactor_states().get() {
+            if let Ok(guard) = states.lock() {
+                for state in guard.iter() {
+                    let controllers = state.controllers.lock().unwrap();
+                    if controllers.values().any(|&c| c == req.ctrlr) {
+                        drop(controllers);
+                        let mut cache = state.qpair_cache.lock().unwrap();
+                        let qpairs = cache.entry(req.ctrlr as usize).or_default();
+                        const MAX_CACHED: usize = 16;
+                        if qpairs.len() < MAX_CACHED {
+                            qpairs.push(req.qpair);
+                            info!("[Reactor] Qpair cached for ctrlr {:p} (size {}/{})",
+                                  req.ctrlr, qpairs.len(), MAX_CACHED);
+                        } else {
+                            // Pool full — free the qpair
+                            spdk_ffi::curvine_spdk_free_io_qpair(req.qpair);
+                            info!("[Reactor] Qpair freed (cache full, {}/{} for ctrlr {:p})",
+                                  qpairs.len(), MAX_CACHED, req.ctrlr);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fallback: no reactor state found — free directly
         spdk_ffi::curvine_spdk_free_io_qpair(req.qpair);
-        info!("[Reactor] Qpair freed on reactor thread: {:?}", req.qpair);
+        info!("[Reactor] Qpair freed on reactor thread (no cache): {:?}", req.qpair);
     }
 }
 

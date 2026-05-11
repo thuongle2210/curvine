@@ -859,6 +859,7 @@ impl Drop for SpdkBdev {
             // Free qpair on reactor thread (SPDK requirement)
             let free_req = Box::new(crate::io::spdk_poller::QpairFreeRequest {
                 qpair: self.io_channel.qpair,
+                ctrlr: self.ctrlr,
             });
             let req_ptr = Box::into_raw(free_req);
             let rc = unsafe {
