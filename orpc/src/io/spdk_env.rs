@@ -28,6 +28,8 @@ pub struct ReactorState {
     /// Set to true when `shutdown()`'s detach-controllers message has been processed
     /// on this reactor thread. Used to synchronize shutdown ordering.
     pub detach_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Registered poller handle (NULL until poller is registered).
+    pub poller: Mutex<*mut spdk_ffi::spdk_poller>,
 }
 
 unsafe impl Send for ReactorState {}
@@ -225,6 +227,11 @@ pub fn find_reactor_for_controller(
         }
     }
     None
+}
+
+/// Get the global reactor states (for poller registration and qpair tracking).
+pub fn get_reactor_states() -> &'static OnceLock<Mutex<Vec<Arc<ReactorState>>>> {
+    &REACTOR_STATES
 }
 
 /// Lifecycle state
@@ -861,6 +868,7 @@ impl SpdkEnv {
                 controllers: Mutex::new(HashMap::new()),
                 reactor_idx,
                 detach_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                poller: Mutex::new(std::ptr::null_mut()),
             });
 
             // Spawn OS thread to run reactor loop (matching C demo pattern)
@@ -918,10 +926,32 @@ impl SpdkEnv {
                         .ready
                         .store(true, std::sync::atomic::Ordering::Release);
 
+                    // Register poller for this reactor — processes qpair completions on every
+                    // spdk_thread_poll iteration.  This is essential for TCP transport (keep-alive,
+                    // async completions) since the poll group is NOT a registered poller.
+                    let poller = spdk_ffi::spdk_poller_register(
+                        crate::io::spdk_poller::reactor_poller_cb,
+                        Arc::as_ptr(&state_clone) as *mut std::ffi::c_void,
+                        0,
+                    );
+                    if !poller.is_null() {
+                        *state_clone.poller.lock().unwrap() = poller;
+                        info!("[Reactor-{}] Poller registered", reactor_idx);
+                    } else {
+                        error!("[Reactor-{}] Failed to register poller", reactor_idx);
+                    }
+
                     // Run reactor loop (C demo pattern: spdk_thread_poll in loop)
                     info!("[Reactor-{}] Entering reactor loop", reactor_idx);
                     spdk_ffi::curvine_spdk_run_reactor_loop(state_clone.thread);
                     info!("[Reactor-{}] Exited reactor loop", reactor_idx);
+
+                    // Unregister poller before thread destruction
+                    let poller = *state_clone.poller.lock().unwrap();
+                    if !poller.is_null() {
+                        spdk_ffi::spdk_poller_unregister(poller);
+                        info!("[Reactor-{}] Poller unregistered", reactor_idx);
+                    }
 
                     // Destroy SPDK thread (required before spdk_thread_lib_fini)
                     spdk_ffi::spdk_thread_destroy(state_clone.thread);

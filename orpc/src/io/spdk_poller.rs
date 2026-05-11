@@ -167,99 +167,59 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 // ---------------------------------------------------------------------------
 
 /// Message handler for native reactor: processes I/O requests sent via spdk_thread_send_msg.
-/// `submit_one` sends the command to the TCP wire synchronously via `spdk_sock_writev_async`.
-/// One `spdk_thread_poll` call gives the transport poller a chance to read the response
-/// (which has usually arrived on localhost). If not, the outer `thread_poll`'s poller phase
-/// or the next reactor loop iteration picks it up. The calling thread waits via Condvar.
+/// `submit_one` sends the NVMe command to the TCP wire immediately via internal
+/// `spdk_sock_writev_async`. The response is read by calling
+/// `spdk_nvme_qpair_process_completions` directly (the TCP transport is NOT a
+/// registered poller — only `spdk_nvme_qpair_process_completions` reaches
+/// `spdk_sock_flush` + `nvme_tcp_read_pdu`).
+///
+/// A short spin covers the localhost TCP RTT for fast synchronous completion.
+/// The per-reactor poller (`reactor_poller_cb`) serves as a safety net: it
+/// processes all qpair completions on every reactor loop iteration, so any
+/// response that arrives after the spin is caught within microseconds.
 pub unsafe extern "C" fn spdk_native_reactor_msg_handler(arg: *mut c_void) {
     let req = Box::from_raw(arg as *mut IoRequest);
 
+    // Extract qpair before submit_one consumes the req reference
+    let qpair = match &req.op {
+        IoOp::Read { qpair, .. } => *qpair,
+        IoOp::Write { qpair, .. } => *qpair,
+        IoOp::Flush { qpair, .. } => *qpair,
+    };
+
     submit_one(&req, &mut Vec::new());
 
-    let thread = spdk_ffi::spdk_get_thread();
-    spdk_ffi::spdk_thread_poll(thread, 0, 0);
+    // Short spin for fast localhost completion; poller catches the rest.
+    for _ in 0..3 {
+        if spdk_ffi::spdk_nvme_qpair_process_completions(qpair, 0) > 0 {
+            break;
+        }
+    }
 }
 
-/// Poller callback: processes completions for ALL qpairs on this reactor.
-/// Diagnostic only — not currently registered (I/O uses direct qpair polling in handler).
+/// Poller callback: processes completions for all qpairs on this reactor.
+/// Called by `spdk_thread_poll` on every reactor loop iteration.
+/// This is the only path that reads the TCP socket between I/O operations,
+/// handling keep-alive, async completions, and other transport events.
 pub unsafe extern "C" fn reactor_poller_cb(arg: *mut c_void) -> c_int {
-    use crate::io::spdk_ffi;
-
-    static mut CALLBACK_COUNT: u64 = 0;
-    unsafe {
-        CALLBACK_COUNT += 1;
-    }
-
-    // Cast arg to ReactorState pointer
-    let state_ptr = arg as *const crate::io::spdk_env::ReactorState;
-    let state = &*state_ptr;
+    let state = &*(arg as *const crate::io::spdk_env::ReactorState);
     let qpairs = state.qpairs.lock().unwrap();
 
-    let qpair_count = qpairs.len();
-
-    if unsafe { CALLBACK_COUNT <= 100 } || CALLBACK_COUNT % 1000000 == 0 {
-        eprintln!(
-            "[Reactor poller #{}] state={:?}, thread={:?}, qpair_count={}",
-            CALLBACK_COUNT, state_ptr, state.thread, qpair_count
-        );
-    }
-
-    if qpair_count == 0 {
-        // Only print this occasionally to avoid spam
-        if unsafe { CALLBACK_COUNT <= 100 || CALLBACK_COUNT % 1000000 == 0 } {
-            eprintln!(
-                "[Reactor poller #{}] state={:?}: No qpairs registered!",
-                CALLBACK_COUNT, state_ptr
-            );
-        }
-        return 0;
-    }
-
-    if qpair_count == 0 {
-        // Only print this occasionally to avoid spam
-        if unsafe { CALLBACK_COUNT <= 100 || CALLBACK_COUNT % 1000000 == 0 } {
-            // eprintln!(
-            //     "[Reactor poller #{}] state={:?}: No qpairs registered!",
-            //     CALLBACK_COUNT, state_ptr
-            // );
-        }
-        return 0;
-    }
-
-    let mut total_completions = 0i32;
-
+    let mut total = 0i32;
     for &qpair in qpairs.iter() {
         if !qpair.is_null() {
             let rc = spdk_ffi::spdk_nvme_qpair_process_completions(qpair, 0);
-            if rc > 0 && unsafe { CALLBACK_COUNT <= 1000 } {
-                // eprintln!(
-                //     "[Reactor poller #{}] Processed {} completions for qpair {:?}",
-                //     CALLBACK_COUNT, rc, qpair
-                // );
-            } else if rc < 0 {
-                // eprintln!(
-                //     "[Reactor poller #{}] Error processing qpair {:?}: rc={}",
-                //     CALLBACK_COUNT, qpair, rc
-                // );
+            if rc > 0 {
+                total += rc;
             }
-            total_completions += rc;
-        } else {
-            // eprintln!(
-            //     "[Reactor poller #{}] Found NULL qpair in list!",
-            //     CALLBACK_COUNT
-            // );
         }
     }
-
-    // Return 1 if busy (more completions possible), 0 if idle
-    let busy = if total_completions > 0 { 1 } else { 0 };
-    if unsafe { CALLBACK_COUNT % 1000000 == 0 } {
-        // eprintln!(
-        //     "[Reactor poller #{}] Total completions: {} across {} qpairs, busy={}",
-        //     CALLBACK_COUNT, total_completions, qpair_count, busy
-        // );
+    // Return 1 if busy (more completions likely), 0 if idle
+    if total > 0 {
+        1
+    } else {
+        0
     }
-    busy
 }
 
 /// Message handler to create qpair on reactor thread.
@@ -313,6 +273,11 @@ pub unsafe extern "C" fn qpair_create_handler(arg: *mut c_void) {
     );
     info!("[Reactor] Qpair allocated on reactor thread: {:?}", qpair);
 
+    // Register qpair in reactor state so the poller processes it
+    if let Some(ref state) = state {
+        state.qpairs.lock().unwrap().push(qpair);
+    }
+
     let mut out = req.qpair_out.lock().unwrap();
     *out = Some(qpair);
     req.completion.complete(0);
@@ -327,6 +292,15 @@ pub struct QpairFreeRequest {
 pub unsafe extern "C" fn qpair_free_handler(arg: *mut c_void) {
     let req = Box::from_raw(arg as *mut QpairFreeRequest);
     if !req.qpair.is_null() {
+        // Remove from reactor state's qpair list to prevent poller from accessing freed qpair
+        if let Some(states) = crate::io::spdk_env::get_reactor_states().get() {
+            if let Ok(guard) = states.lock() {
+                for state in guard.iter() {
+                    let mut qpairs = state.qpairs.lock().unwrap();
+                    qpairs.retain(|&qp| qp != req.qpair);
+                }
+            }
+        }
         spdk_ffi::curvine_spdk_free_io_qpair(req.qpair);
         info!("[Reactor] Qpair freed on reactor thread: {:?}", req.qpair);
     }
