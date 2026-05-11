@@ -269,14 +269,14 @@ int curvine_spdk_ns_submit_read(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair 
                                 void *buf, uint64_t offset, uint64_t nbytes, struct curvine_async_ctx *ctx) {
     uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
     // fprintf(stderr, "[DEBUG C] curvine_spdk_ns_submit_read: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu, ctx=%p\n",
-            ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss, (void*)ctx);
+            // ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss, (void*)ctx);
     return spdk_nvme_ns_cmd_read(ns, qpair, buf, offset / ss, nbytes / ss, curvine_async_cb_fn, ctx, 0);
 }
 int curvine_spdk_ns_submit_write(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
                                 void *buf, uint64_t offset, uint64_t nbytes, struct curvine_async_ctx *ctx) {
     uint32_t ss = spdk_nvme_ns_get_sector_size(ns);
     // fprintf(stderr, "[DEBUG C] curvine_spdk_ns_submit_write: ns=%p, qpair=%p, offset=%lu, nbytes=%lu, ss=%u, lba=%lu, nblocks=%lu, ctx=%p\n",
-            ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss, (void*)ctx);
+            // ns, qpair, offset, nbytes, ss, offset / ss, nbytes / ss, (void*)ctx);
     return spdk_nvme_ns_cmd_write(ns, qpair, buf, offset / ss, nbytes / ss, curvine_async_cb_fn, ctx, 0);
 }
 int curvine_spdk_ns_submit_flush(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
