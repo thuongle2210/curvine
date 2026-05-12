@@ -15,22 +15,31 @@ use crate::err_box;
 use crate::io::block_io::BlockIO;
 use crate::io::spdk_env::SpdkEnv;
 use crate::io::spdk_ffi;
+use crate::io::spdk_poller::IoRequest;
 use crate::io::IOResult;
 use crate::sys::DataSlice;
 use bytes::BytesMut;
+use crossbeam;
 use log::{debug, error, info, warn};
+use nix::sys::eventfd::EventFd;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // SPDK I/O channel — bridge between Tokio and SPDK reactor
 // ---------------------------------------------------------------------------
 
-/// SPDK I/O channel — wraps qpair and owning SPDK thread (native reactor).
+/// SPDK I/O channel — bridges worker threads to the native reactor.
 pub struct SpdkIoChannel {
     pub qpair: *mut crate::io::spdk_ffi::spdk_nvme_qpair,
     /// SPDK thread that owns this qpair (cached from get_spdk_thread)
     pub owning_thread: *mut crate::io::spdk_ffi::spdk_thread,
     /// Index of the controller this qpair belongs to (for reactor state lookup)
     pub ctrlr_idx: usize,
+    /// Lock-free channel for submitting I/O to the reactor poller.
+    /// Replaces spdk_thread_send_msg for the hot I/O path.
+    pub io_tx: crossbeam::channel::Sender<IoRequest>,
+    /// Eventfd for waking the reactor poller on new I/O.
+    pub io_eventfd: Arc<EventFd>,
 }
 unsafe impl Send for SpdkIoChannel {}
 unsafe impl Sync for SpdkIoChannel {}
@@ -220,7 +229,11 @@ impl SpdkBdev {
 
             // Create qpair on reactor thread (SPDK requirement)
             let owning_thread = env.get_spdk_thread(info.ctrlr_idx as usize);
-            let _reactor_state = env.get_reactor_state(info.ctrlr_idx as usize);
+            let reactor_state = env.get_reactor_state(info.ctrlr_idx as usize);
+
+            // Get I/O channel handle for this reactor (lock-free submission path)
+            let io_tx = reactor_state.io_tx.clone();
+            let io_eventfd = reactor_state.io_eventfd.clone();
 
             // Send message to reactor thread to create qpair
             let qpair_out = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -280,6 +293,8 @@ impl SpdkBdev {
                 qpair,
                 owning_thread,
                 ctrlr_idx: info.ctrlr_idx as usize,
+                io_tx,
+                io_eventfd,
             };
             let io_timeout_us = env.conf().io_timeout_us;
             Ok(Self {
@@ -357,25 +372,17 @@ impl SpdkBdev {
         Ok(())
     }
 
-    /// Send I/O request to reactor thread via spdk_thread_send_msg.
-    fn send_to_reactor(&self, req: crate::io::spdk_poller::IoRequest) -> IOResult<()> {
-        let thread = self.io_channel.owning_thread;
-        let req_ptr = Box::into_raw(Box::new(req));
-        let rc = unsafe {
-            crate::io::spdk_ffi::spdk_thread_send_msg(
-                thread,
-                crate::io::spdk_poller::spdk_native_reactor_msg_handler,
-                req_ptr as *mut std::ffi::c_void,
-            )
-        };
-        if rc != 0 {
+    /// Send I/O request to reactor thread via lock-free channel + eventfd.
+    /// Replaces spdk_thread_send_msg for the hot I/O path.
+    fn send_to_reactor(&self, req: IoRequest) -> IOResult<()> {
+        use crate::io::io_error::IOError;
+        self.io_channel.io_tx.send(req).map_err(|_| {
             self.inflight
                 .fetch_sub(1, std::sync::atomic::Ordering::Release);
-            unsafe {
-                Box::from_raw(req_ptr);
-            }
-            return err_box!("Failed to send message to SPDK thread");
-        }
+            IOError::from("Failed to send I/O request: SPDK reactor channel disconnected")
+        })?;
+        // Wake the reactor poller
+        let _ = self.io_channel.io_eventfd.write(1);
         Ok(())
     }
 

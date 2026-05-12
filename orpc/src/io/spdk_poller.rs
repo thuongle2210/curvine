@@ -5,9 +5,11 @@
 /// TODO: SPDK fabric eventfd for immediate detection.
 use crate::io::spdk_ffi;
 use futures::task::AtomicWaker;
+use libc;
 use log::{error, info};
 use std::ffi::{c_int, c_void};
 use std::future::Future;
+use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
@@ -166,45 +168,38 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 // SPDK Native Reactor Support
 // ---------------------------------------------------------------------------
 
-/// Message handler for native reactor: processes I/O requests sent via spdk_thread_send_msg.
-/// `submit_one` sends the NVMe command to the TCP wire immediately via internal
-/// `spdk_sock_writev_async`. The response is read by calling
-/// `spdk_nvme_qpair_process_completions` directly (the TCP transport is NOT a
-/// registered poller — only `spdk_nvme_qpair_process_completions` reaches
-/// `spdk_sock_flush` + `nvme_tcp_read_pdu`).
+/// Poller callback: drains the lock-free I/O channel, submits requests, and
+/// polls all qpairs for completions. Runs every `spdk_thread_poll` iteration.
 ///
-/// A short spin covers the localhost TCP RTT for fast synchronous completion.
-/// The per-reactor poller (`reactor_poller_cb`) serves as a safety net: it
-/// processes all qpair completions on every reactor loop iteration, so any
-/// response that arrives after the spin is caught within microseconds.
-pub unsafe extern "C" fn spdk_native_reactor_msg_handler(arg: *mut c_void) {
-    let req = Box::from_raw(arg as *mut IoRequest);
-
-    // Extract qpair before submit_one consumes the req reference
-    let qpair = match &req.op {
-        IoOp::Read { qpair, .. } => *qpair,
-        IoOp::Write { qpair, .. } => *qpair,
-        IoOp::Flush { qpair, .. } => *qpair,
-    };
-
-    submit_one(&req, &mut Vec::new());
-
-    // Short spin for fast localhost completion; poller catches the rest.
-    for _ in 0..3 {
-        if spdk_ffi::spdk_nvme_qpair_process_completions(qpair, 0) > 0 {
-            break;
-        }
-    }
-}
-
-/// Poller callback: processes completions for all qpairs on this reactor.
-/// Called by `spdk_thread_poll` on every reactor loop iteration.
-/// This is the only path that reads the TCP socket between I/O operations,
-/// handling keep-alive, async completions, and other transport events.
+/// Replaces the old `spdk_native_reactor_msg_handler` + per-message spin with
+/// a batch-oriented approach:
+///   1. Drain ALL pending I/O requests from the channel (lock-free)
+///   2. Submit each via `submit_one`
+///   3. Poll ALL qpairs for completions (catches keep-alive + async completions)
+///
+/// The lock-free channel replaces `spdk_thread_send_msg` for the hot I/O path,
+/// eliminating SPDK message queue lock contention and per-message batch overhead.
 pub unsafe extern "C" fn reactor_poller_cb(arg: *mut c_void) -> c_int {
     let state = &*(arg as *const crate::io::spdk_env::ReactorState);
-    let qpairs = state.qpairs.lock().unwrap();
 
+    // Phase 1: Drain all pending I/O requests from the lock-free channel.
+    // This replaces spdk_thread_send_msg for the hot I/O path.
+    while let Ok(req) = state.io_rx.try_recv() {
+        submit_one(&req, &mut Vec::new());
+    }
+
+    // Drain eventfd so repeated writes don't accumulate
+    let mut buf = [0u8; 8];
+    let _ = libc::read(
+        state.io_eventfd.as_raw_fd(),
+        buf.as_mut_ptr() as *mut libc::c_void,
+        8,
+    );
+
+    // Phase 2: Poll all registered qpairs for completions.
+    // This handles keep-alive, async completions, and the responses
+    // to requests submitted in Phase 1.
+    let qpairs = state.qpairs.lock().unwrap();
     let mut total = 0i32;
     for &qpair in qpairs.iter() {
         if !qpair.is_null() {
@@ -214,8 +209,11 @@ pub unsafe extern "C" fn reactor_poller_cb(arg: *mut c_void) -> c_int {
             }
         }
     }
-    // Return 1 if busy (more completions likely), 0 if idle
-    if total > 0 {
+    drop(qpairs);
+
+    // Return 1 if busy (more completions or more work pending).
+    // This keeps spdk_thread_poll "hot" between iterations.
+    if total > 0 || !state.io_rx.is_empty() {
         1
     } else {
         0
@@ -273,9 +271,7 @@ pub unsafe extern "C" fn qpair_create_handler(arg: *mut c_void) {
     }
 
     // Cache miss — allocate new qpair (~21ms TCP fabric connect)
-    eprintln!(
-        "[Reactor qpair_create #{QPAIR_CREATE_COUNT}] cache MISS: allocating new qpair"
-    );
+    eprintln!("[Reactor qpair_create #{QPAIR_CREATE_COUNT}] cache MISS: allocating new qpair");
 
     let qpair = spdk_ffi::curvine_spdk_alloc_io_qpair(req.ctrlr);
 
@@ -346,13 +342,21 @@ pub unsafe extern "C" fn qpair_free_handler(arg: *mut c_void) {
                         const MAX_CACHED: usize = 16;
                         if qpairs.len() < MAX_CACHED {
                             qpairs.push(req.qpair);
-                            info!("[Reactor] Qpair cached for ctrlr {:p} (size {}/{})",
-                                  req.ctrlr, qpairs.len(), MAX_CACHED);
+                            info!(
+                                "[Reactor] Qpair cached for ctrlr {:p} (size {}/{})",
+                                req.ctrlr,
+                                qpairs.len(),
+                                MAX_CACHED
+                            );
                         } else {
                             // Pool full — free the qpair
                             spdk_ffi::curvine_spdk_free_io_qpair(req.qpair);
-                            info!("[Reactor] Qpair freed (cache full, {}/{} for ctrlr {:p})",
-                                  qpairs.len(), MAX_CACHED, req.ctrlr);
+                            info!(
+                                "[Reactor] Qpair freed (cache full, {}/{} for ctrlr {:p})",
+                                qpairs.len(),
+                                MAX_CACHED,
+                                req.ctrlr
+                            );
                         }
                         return;
                     }
@@ -362,7 +366,10 @@ pub unsafe extern "C" fn qpair_free_handler(arg: *mut c_void) {
 
         // Fallback: no reactor state found — free directly
         spdk_ffi::curvine_spdk_free_io_qpair(req.qpair);
-        info!("[Reactor] Qpair freed on reactor thread (no cache): {:?}", req.qpair);
+        info!(
+            "[Reactor] Qpair freed on reactor thread (no cache): {:?}",
+            req.qpair
+        );
     }
 }
 

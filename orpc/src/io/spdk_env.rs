@@ -3,7 +3,9 @@
 use crate::err_msg;
 use crate::io::spdk_ffi;
 use crate::{err_box, CommonResult};
+use crossbeam;
 use log::{error, info, warn};
+use nix::sys::eventfd::{EfdFlags, EventFd};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -34,6 +36,13 @@ pub struct ReactorState {
     /// Allows reopen to reuse a qpair without TCP fabric connect (~21ms).
     /// Max entries per controller: MAX_CACHED_QPAIRS_PER_CTRLR.
     pub qpair_cache: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
+    /// Lock-free channel for submitting I/O requests from worker threads.
+    /// Replaces spdk_thread_send_msg for the hot I/O path.
+    pub io_tx: crossbeam::channel::Sender<crate::io::spdk_poller::IoRequest>,
+    /// Receiver side — consumed by reactor_poller_cb on the reactor thread.
+    pub io_rx: crossbeam::channel::Receiver<crate::io::spdk_poller::IoRequest>,
+    /// Eventfd for waking the reactor poller on new I/O submissions.
+    pub io_eventfd: std::sync::Arc<EventFd>,
 }
 
 unsafe impl Send for ReactorState {}
@@ -864,6 +873,14 @@ impl SpdkEnv {
             let reactor_subsystems = subsystems_per_reactor[core_idx].clone();
             let reactor_idx = core_idx;
 
+            // Create lock-free channel + eventfd for I/O submission
+            // (replaces spdk_thread_send_msg for the hot path)
+            let (io_tx, io_rx) = crossbeam::channel::unbounded();
+            let io_eventfd = std::sync::Arc::new(
+                EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK)
+                    .expect("Failed to create io_eventfd"),
+            );
+
             let state = Arc::new(ReactorState {
                 thread,
                 os_thread: Mutex::new(None),
@@ -874,6 +891,9 @@ impl SpdkEnv {
                 detach_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 poller: Mutex::new(std::ptr::null_mut()),
                 qpair_cache: Mutex::new(HashMap::new()),
+                io_tx,
+                io_rx,
+                io_eventfd,
             });
 
             // Spawn OS thread to run reactor loop (matching C demo pattern)
@@ -1716,7 +1736,10 @@ pub unsafe extern "C" fn detach_reactor_controllers(arg: *mut c_void) {
             }
         }
         if total > 0 {
-            info!("[Reactor-{}] Freed {} cached qpair(s) during shutdown", state.reactor_idx, total);
+            info!(
+                "[Reactor-{}] Freed {} cached qpair(s) during shutdown",
+                state.reactor_idx, total
+            );
         }
     }
 
