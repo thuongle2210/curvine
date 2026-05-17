@@ -20,11 +20,14 @@ impl Drop for SpdkPoller {
     }
 }
 
+pub struct BatchCtx;
+
 #[derive(Clone)]
 pub struct IoRequest {
     pub op: IoOp,
     pub completion: Arc<IoCompletion>,
     pub bdev_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    pub batch: Option<Arc<BatchCtx>>,
 }
 #[derive(Clone)]
 pub enum IoOp {

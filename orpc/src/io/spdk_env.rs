@@ -261,6 +261,8 @@ pub struct SpdkConf {
     #[serde(skip)]
     pub dma_pool_bytes: u64, // parsed by init()
     pub block_align: u32, // 0 = auto-detect
+    #[serde(default)]
+    pub batch_enabled: bool, // pipeline I/O chunks (batch submission)
 }
 
 impl SpdkConf {
@@ -396,6 +398,7 @@ impl Default for SpdkConf {
             dma_pool_size_str: "64MB".to_string(),
             dma_pool_bytes: 64 * 1024 * 1024,
             block_align: 0,
+            batch_enabled: false,
         }
     }
 }

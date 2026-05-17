@@ -12,6 +12,7 @@ use crate::io::spdk_ffi;
 /// TODO: SPDK fabric eventfd for immediate detection.
 use log::{error, info};
 use nix::sys::eventfd::{EfdFlags, EventFd};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +51,17 @@ pub enum IoOp {
 
 // SAFETY: exclusive ownership - blocks until completion.
 unsafe impl Send for IoOp {}
+
+impl IoOp {
+    pub fn qpair_ptr(&self) -> *mut spdk_ffi::spdk_nvme_qpair {
+        match self {
+            IoOp::Read { qpair, .. } => *qpair,
+            IoOp::Write { qpair, .. } => *qpair,
+            IoOp::Flush { qpair, .. } => *qpair,
+            IoOp::UnregisterQpair { qpair, .. } => *qpair,
+        }
+    }
+}
 
 /// Completion state shared between poller callback and waiting handler.
 pub struct IoCompletion {
@@ -107,12 +119,82 @@ impl IoCompletion {
     }
 }
 
+/// Tracks N in-flight I/O chunks, signals when all complete or any errors.
+pub struct BatchCtx {
+    total: usize,
+    inner: Mutex<BatchCtxInner>,
+    cond: Condvar,
+}
+
+struct BatchCtxInner {
+    completed: usize,
+    first_error: i32,
+}
+
+impl BatchCtx {
+    pub fn new(total: usize) -> Self {
+        Self {
+            total,
+            inner: Mutex::new(BatchCtxInner {
+                completed: 0,
+                first_error: 0,
+            }),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Signals one completed chunk. On first error, force-completes all immediately.
+    pub fn complete_one(&self, status: i32) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.completed == self.total {
+            return;
+        }
+        if status != 0 && inner.first_error == 0 {
+            inner.first_error = status;
+            inner.completed = self.total;
+            self.cond.notify_all();
+            return;
+        }
+        inner.completed += 1;
+        if inner.completed == self.total {
+            self.cond.notify_all();
+        }
+    }
+
+    /// Block until all chunks complete or timeout. Returns first error (0 = ok).
+    pub fn wait(&self, timeout_us: u64) -> i32 {
+        let mut inner = self.inner.lock().unwrap();
+        if timeout_us == 0 {
+            while inner.completed < self.total {
+                inner = self.cond.wait(inner).unwrap();
+            }
+        } else {
+            let timeout = std::time::Duration::from_micros(timeout_us);
+            let deadline = std::time::Instant::now() + timeout;
+            while inner.completed < self.total {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return -libc::ETIMEDOUT;
+                }
+                let (guard, result) = self.cond.wait_timeout(inner, remaining).unwrap();
+                inner = guard;
+                if result.timed_out() && inner.completed < self.total {
+                    return -libc::ETIMEDOUT;
+                }
+            }
+        }
+        inner.first_error
+    }
+}
+
 /// Request sent from handler threads to the poller.
 pub struct IoRequest {
     pub op: IoOp,
     pub completion: Arc<IoCompletion>,
     /// Per-bdev in-flight counter. Decremented on completion.
     pub bdev_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Pipelined I/O batch — callback signals this instead of per-chunk completion.
+    pub batch: Option<Arc<BatchCtx>>,
 }
 
 // SAFETY: exclusive ownership - blocks until completion.
@@ -205,6 +287,7 @@ impl SpdkPoller {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            batch: None,
         };
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
@@ -259,14 +342,8 @@ impl SpdkPoller {
 
             // Active state: drain all pending I/Os and poll completions
             if matches!(state, PollerState::Active) {
-                // Drain pending requests (non-blocking)
-                while let Ok(req) = rx.try_recv() {
-                    if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                        Self::handle_unregister(&req, &mut active_qpairs);
-                    } else {
-                        Self::submit_one(&req, &mut active_qpairs);
-                    }
-                }
+                // Drain all pending, submit grouped by qpair
+                Self::drain_and_submit_all(&rx, &mut active_qpairs);
 
                 // Poll qpairs for completions
                 active_qpairs.retain(|qpair| {
@@ -333,14 +410,8 @@ impl SpdkPoller {
                             libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENTSZ)
                         };
 
-                        // Drain any pending channel data
-                        while let Ok(req) = rx.try_recv() {
-                            if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                                Self::handle_unregister(&req, &mut active_qpairs);
-                            } else {
-                                Self::submit_one(&req, &mut active_qpairs);
-                            }
-                        }
+                        // Drain all pending, submit grouped by qpair
+                        Self::drain_and_submit_all(&rx, &mut active_qpairs);
 
                         // Transition to Active to process work
                         state = PollerState::Active;
@@ -375,6 +446,35 @@ impl SpdkPoller {
         info!("SPDK poller thread exiting");
     }
 
+    /// Drain pending requests and submit grouped by qpair.
+    fn drain_and_submit_all(
+        rx: &crossbeam::channel::Receiver<IoRequest>,
+        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
+    ) {
+        let mut pending: Vec<IoRequest> = Vec::new();
+        while let Ok(req) = rx.try_recv() {
+            if matches!(req.op, IoOp::UnregisterQpair { .. }) {
+                Self::handle_unregister(&req, active_qpairs);
+            } else {
+                pending.push(req);
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        // Group pending requests by qpair and submit all per-qpair
+        let mut by_qpair: HashMap<*mut spdk_ffi::spdk_nvme_qpair, Vec<&IoRequest>> =
+            HashMap::with_capacity(pending.len());
+        for req in &pending {
+            by_qpair.entry(req.op.qpair_ptr()).or_default().push(req);
+        }
+        for (_qpair, reqs) in &by_qpair {
+            for req in reqs {
+                Self::submit_one(req, active_qpairs);
+            }
+        }
+    }
+
     /// Handle unregister request, remove qpair from active set and ack.
     fn handle_unregister(req: &IoRequest, active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>) {
         if let IoOp::UnregisterQpair { qpair, ack } = &req.op {
@@ -396,7 +496,12 @@ impl SpdkPoller {
 
         // Box::into_raw ensures CallbackCtx survives until poller_callback reclaims it
         let cb_ctx = Box::new(CallbackCtx {
-            completion: req.completion.clone(),
+            completion: if req.batch.is_some() {
+                None
+            } else {
+                Some(req.completion.clone())
+            },
+            batch: req.batch.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: req.bdev_inflight.clone(),
         });
@@ -467,9 +572,10 @@ impl SpdkPoller {
     }
 }
 
-/// C callback context. Heap-allocated for SPDK to hold pointer.
+/// C callback context — heap-allocated for SPDK.
 struct CallbackCtx {
-    completion: Arc<IoCompletion>,
+    completion: Option<Arc<IoCompletion>>,
+    batch: Option<Arc<BatchCtx>>,
     async_ctx: spdk_ffi::curvine_async_ctx,
     bdev_inflight: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -478,7 +584,11 @@ struct CallbackCtx {
 unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     let ctx = Box::from_raw(cb_arg as *mut CallbackCtx);
     ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
-    ctx.completion.complete(status);
+    if let Some(batch) = &ctx.batch {
+        batch.complete_one(status);
+    } else if let Some(completion) = &ctx.completion {
+        completion.complete(status);
+    }
 }
 
 impl Drop for SpdkPoller {

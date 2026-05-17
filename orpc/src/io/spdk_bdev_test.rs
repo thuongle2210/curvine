@@ -37,6 +37,7 @@ fn test_spdk_conf() -> SpdkConf {
             .unwrap_or(256),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
 
+        batch_enabled: true, // enable pipelined I/O chunk submission
         targets: vec![NvmeTarget {
             traddr,
             trsvcid,
@@ -135,7 +136,25 @@ fn spdk_full_lifecycle() {
         println!("pass write_region/read_region test");
     }
 
-    // Phase 7: concurrent I/O through poller
+    // Phase 7: multi-chunk batch write/read (exercises pipelined path)
+    {
+        let chunk_size = 256 * 1024; // 256KB — forces 2×128KB pipeline chunks
+        let mut write_buf = vec![0xABu8; chunk_size];
+        let mut bdev = SpdkBdev::open_write(&bdev_name, 0, 0).unwrap();
+        bdev.write_all(&write_buf).unwrap();
+        bdev.flush().unwrap();
+        assert_eq!(bdev.pos(), chunk_size as i64);
+        bdev.seek(0).unwrap();
+        let mut read_buf = vec![0u8; chunk_size];
+        bdev.read_all(&mut read_buf).unwrap();
+        assert_eq!(read_buf, write_buf, "batch multi-chunk data mismatch");
+        println!(
+            "pass batch multi-chunk write/read ({} bytes, 2 pipeline chunks)",
+            chunk_size
+        );
+    }
+
+    // Phase 8: concurrent I/O through poller
     {
         use std::sync::{Arc, Barrier};
 
@@ -169,7 +188,7 @@ fn spdk_full_lifecycle() {
         println!("pass concurrent poller I/O test (8 threads)");
     }
 
-    // Phase 8: shutdown (must be last — destructive)
+    // Phase 9: shutdown (must be last — destructive)
     {
         env.shutdown();
         assert_eq!(env.state(), SpdkEnvState::ShutDown);
