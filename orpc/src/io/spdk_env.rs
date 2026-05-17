@@ -263,6 +263,14 @@ pub struct SpdkConf {
     pub block_align: u32, // 0 = auto-detect
     #[serde(default)]
     pub batch_enabled: bool, // pipeline I/O chunks (batch submission)
+    #[serde(alias = "dma_buf_size", default = "default_dma_buf_size")]
+    pub dma_buf_size_str: String, // per-bdev DMA buf, e.g. "4MB"
+    #[serde(skip)]
+    pub dma_buf_bytes: u64, // parsed by init()
+}
+
+fn default_dma_buf_size() -> String {
+    "1MB".to_string()
 }
 
 impl SpdkConf {
@@ -281,6 +289,9 @@ impl SpdkConf {
 
         let dma_pool = ByteUnit::from_str(&self.dma_pool_size_str)?;
         self.dma_pool_bytes = dma_pool.as_byte();
+
+        let dma_buf = ByteUnit::from_str(&self.dma_buf_size_str)?;
+        self.dma_buf_bytes = dma_buf.as_byte();
 
         Ok(())
     }
@@ -399,6 +410,8 @@ impl Default for SpdkConf {
             dma_pool_bytes: 64 * 1024 * 1024,
             block_align: 0,
             batch_enabled: false,
+            dma_buf_size_str: "1MB".to_string(),
+            dma_buf_bytes: 1 * 1024 * 1024,
         }
     }
 }

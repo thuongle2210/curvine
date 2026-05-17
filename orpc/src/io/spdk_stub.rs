@@ -28,6 +28,12 @@ pub struct SpdkConf {
     pub keep_alive_timeout_str: String,
     #[serde(alias = "dma_pool_size", default)]
     pub dma_pool_size_str: String,
+    #[serde(alias = "dma_buf_size", default = "default_dma_buf_size")]
+    pub dma_buf_size_str: String,
+}
+
+fn default_dma_buf_size() -> String {
+    "1MB".to_string()
 }
 
 impl SpdkConf {

@@ -212,8 +212,8 @@ impl SpdkBdev {
                 );
             }
 
-            // DMA buffers (1MB each) reused across I/O — larger I/Os chunked
-            let buf_size = DmaBuf::align_up(1024 * 1024, block_size as usize);
+            // DMA buffers reused across I/O — larger I/Os chunked
+            let buf_size = DmaBuf::align_up(env.conf().dma_buf_bytes as usize, block_size as usize);
             let read_buf = match DmaBuf::alloc(buf_size, block_size) {
                 Ok(buf) => buf,
                 Err(e) => {
