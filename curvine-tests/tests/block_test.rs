@@ -103,6 +103,24 @@ fn test_remote_file_operations_with_parallelism_and_caching() -> CommonResult<()
 }
 
 #[test]
+fn test_remote_read_parallel_within_block_seek() -> CommonResult<()> {
+    let testing = Testing::default();
+
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+
+    // block_size / slice_size > read_parallel forces non-contiguous slices
+    // per reader, triggering within-block seeks
+    conf.client.block_size = 4 * 1024 * 1024; // 4MB
+    conf.client.read_parallel = 3;
+    conf.client.read_chunk_size = 131072; // 128KB
+    conf.client.read_chunk_num = 4; // slice_size = 512KB
+
+    let path = Path::from_str("/file_parallel_within_block_seek.data")?;
+    run_with_conf(testing, conf, path)
+}
+
+#[test]
 fn test_file_replication_with_three_replicas() -> CommonResult<()> {
     let testing = Testing::default();
 
@@ -208,6 +226,10 @@ fn _abort() -> CommonResult<()> {
 
 fn run(testing: Testing, mut conf: ClusterConf, path: Path) -> CommonResult<()> {
     conf.client.block_size = 1024 * 1024;
+    run_with_conf(testing, conf, path)
+}
+
+fn run_with_conf(testing: Testing, conf: ClusterConf, path: Path) -> CommonResult<()> {
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
     rt.block_on(async move {
