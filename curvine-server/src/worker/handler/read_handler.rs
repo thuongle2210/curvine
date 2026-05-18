@@ -36,6 +36,7 @@ pub struct ReadHandler {
     pub(crate) last_task: Option<ReadAheadTask>,
     pub(crate) io_slow_us: u64,
     pub(crate) enable_send_file: bool,
+    pub(crate) async_enabled: bool,
     pub(crate) metrics: &'static WorkerMetrics,
 }
 
@@ -53,6 +54,7 @@ impl ReadHandler {
             last_task: None,
             io_slow_us: conf.worker.io_slow_us(),
             enable_send_file: conf.worker.enable_send_file,
+            async_enabled: conf.worker.async_enabled,
             metrics,
         }
     }
@@ -189,6 +191,57 @@ impl ReadHandler {
         Ok(msg.success_with_data(None, region))
     }
 
+    pub async fn async_read(&mut self, msg: &Message) -> FsResult<Message> {
+        let file = try_option_mut!(self.file);
+        let context = try_option_mut!(self.context);
+
+        if msg.header_len() > 0 {
+            let header: DataHeaderProto = msg.parse_header()?;
+            let abs_offset = if file.supports_short_circuit() {
+                header.offset
+            } else {
+                context.bdev_offset + context.off + header.offset
+            };
+            if abs_offset != file.pos() {
+                file.seek(abs_offset)?;
+            }
+        }
+
+        let spend = TimeSpent::new();
+        // OS page cache read-ahead is only available for local files
+        if file.supports_read_ahead() {
+            if let Some(local) = file.as_local_mut() {
+                self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
+            }
+        }
+        // SPDK bypasses kernel — sendfile unavailable
+        let enable_send_file = self.enable_send_file && file.supports_send_file();
+        let region = file
+            .async_read_region(enable_send_file, context.chunk_size)
+            .await?;
+        // Post-read read-ahead for next chunk
+        if file.supports_read_ahead() {
+            if let Some(local) = file.as_local_mut() {
+                self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
+            }
+        }
+        let used = spend.used_us();
+
+        if used >= self.io_slow_us {
+            warn!(
+                "Slow read data from disk cost: {}us (threshold={}us), path: {} ",
+                used,
+                self.io_slow_us,
+                file.path()
+            );
+        }
+        self.metrics.read_bytes.inc_by(region.len() as i64);
+        self.metrics.read_time_us.inc_by(used as i64);
+        self.metrics.read_count.inc();
+
+        Ok(msg.success_with_data(None, region))
+    }
+
     // Reading is completed and the file is closed.
     pub fn complete(&mut self, msg: &Message) -> FsResult<Message> {
         let _block_id = match &self.context {
@@ -217,6 +270,16 @@ impl ReadHandler {
 impl MessageHandler for ReadHandler {
     type Error = FsError;
 
+    fn is_sync(&self, msg: &Message) -> bool {
+        if !self.async_enabled {
+            return true;
+        }
+        if msg.request_status() != RequestStatus::Running {
+            return true;
+        }
+        self.file.as_ref().is_none_or(|f| !f.supports_async())
+    }
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let request_status = msg.request_status();
 
@@ -228,6 +291,18 @@ impl MessageHandler for ReadHandler {
             RequestStatus::Complete => self.complete(msg),
 
             _ => err_box!("Unsupported request type"),
+        }
+    }
+
+    async fn async_handle(&mut self, msg: Message) -> FsResult<Message> {
+        let request_status = msg.request_status();
+        let result = match request_status {
+            RequestStatus::Running => self.async_read(&msg).await,
+            _ => self.handle(&msg),
+        };
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(msg.error_ext(&e)),
         }
     }
 }

@@ -96,6 +96,38 @@ impl BlockDevice {
     pub fn supports_short_circuit(&self) -> bool {
         matches!(self, BlockDevice::Local(_))
     }
+    /// Whether this device supports async I/O pipeline.
+    /// Only `SpdkBdev` supports this; `LocalFile` is always sync.
+    pub fn supports_async(&self) -> bool {
+        #[cfg(feature = "spdk")]
+        {
+            matches!(self, BlockDevice::Spdk(_))
+        }
+        #[cfg(not(feature = "spdk"))]
+        {
+            false
+        }
+    }
+    /// Async read region. For LocalFile falls through to sync.
+    pub async fn async_read_region(
+        &mut self,
+        enable_send_file: bool,
+        len: i32,
+    ) -> IOResult<DataSlice> {
+        match self {
+            BlockDevice::Local(f) => f.read_region(enable_send_file, len),
+            #[cfg(feature = "spdk")]
+            BlockDevice::Spdk(b) => b.async_read_region(len).await,
+        }
+    }
+    /// Async write region. For LocalFile falls through to sync.
+    pub async fn async_write_region(&mut self, region: &DataSlice) -> IOResult<()> {
+        match self {
+            BlockDevice::Local(f) => f.write_region(region),
+            #[cfg(feature = "spdk")]
+            BlockDevice::Spdk(b) => b.async_write_region(region).await,
+        }
+    }
     /// Get the inner `LocalFile`, if this is a local device.
     #[allow(unreachable_patterns)]
     pub fn as_local(&self) -> Option<&LocalFile> {
@@ -163,6 +195,7 @@ mod test {
     use super::*;
     use crate::common::Utils;
     use crate::io::LocalFile;
+    use bytes::BytesMut;
     use std::fs::remove_file;
 
     #[test]
@@ -197,6 +230,34 @@ mod test {
         let mut reader2 = BlockDevice::Local(LocalFile::with_read(&path, 0)?);
         reader2.read_all(&mut buf)?;
         assert_eq!(&buf, data);
+
+        remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn async_write_region_local_fallthrough() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        let test_path = std::path::Path::new(&path);
+        if let Some(parent) = test_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = b"hello async fallthrough";
+
+        let mut writer = BlockDevice::Local(LocalFile::with_write(&path, true)?);
+        assert!(!writer.supports_async());
+        assert_eq!(writer.pos(), 0);
+
+        let region = DataSlice::buffer(BytesMut::from(data.as_ref()));
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(writer.async_write_region(&region))?;
+        writer.flush()?;
+        assert_eq!(writer.pos(), data.len() as i64);
+        drop(writer);
+
+        let mut reader = BlockDevice::Local(LocalFile::with_read(&path, 0)?);
+        let read = reader.read_region(false, data.len() as i32)?;
+        assert_eq!(read.as_slice(), data);
 
         remove_file(&path)?;
         Ok(())

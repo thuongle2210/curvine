@@ -261,6 +261,8 @@ pub struct SpdkConf {
     #[serde(skip)]
     pub dma_pool_bytes: u64, // parsed by init()
     pub block_align: u32, // 0 = auto-detect
+    pub hugedir: String,  // hugetlbfs mount dir, empty = default
+    pub no_huge: bool,    // run without hugepages (for testing)
 }
 
 impl SpdkConf {
@@ -396,6 +398,8 @@ impl Default for SpdkConf {
             dma_pool_size_str: "64MB".to_string(),
             dma_pool_bytes: 64 * 1024 * 1024,
             block_align: 0,
+            hugedir: String::new(),
+            no_huge: false,
         }
     }
 }
@@ -855,6 +859,14 @@ impl SpdkEnv {
                 self.conf.mem_channel as i32,
             );
             spdk_ffi::curvine_spdk_env_opts_set_mem_size(&mut opts, self.conf.hugepage_mb as i32);
+            if !self.conf.hugedir.is_empty() {
+                let hugedir = CString::new(self.conf.hugedir.as_str())
+                    .map_err(|e| err_msg!(format!("invalid hugedir: {}", e)))?;
+                spdk_ffi::curvine_spdk_env_opts_set_hugedir(&mut opts, hugedir.as_ptr());
+            }
+            if self.conf.no_huge {
+                spdk_ffi::curvine_spdk_env_opts_set_no_huge(&mut opts, true);
+            }
             let rc = spdk_ffi::curvine_spdk_env_init(&mut opts);
             if rc != 0 {
                 return err_box!("spdk_env_init failed with rc={}", rc);

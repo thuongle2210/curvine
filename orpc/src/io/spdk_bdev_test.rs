@@ -28,6 +28,11 @@ fn test_spdk_conf() -> SpdkConf {
         std::env::var("SPDK_TARGET_NQN").unwrap_or("nqn.2024-01.io.curvine:test".to_string());
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or("tcp".to_string());
 
+    let no_huge = std::env::var("SPDK_NO_HUGE")
+        .ok()
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(true);
+
     SpdkConf {
         enabled: true,
         app_name: "curvine-test".to_string(),
@@ -36,6 +41,7 @@ fn test_spdk_conf() -> SpdkConf {
             .and_then(|v| v.parse().ok())
             .unwrap_or(256),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
+        no_huge,
 
         targets: vec![NvmeTarget {
             traddr,
@@ -169,7 +175,113 @@ fn spdk_full_lifecycle() {
         println!("pass concurrent poller I/O test (8 threads)");
     }
 
-    // Phase 8: shutdown (must be last — destructive)
+    // Phase 8: async write_region via SpdkBdev (covers spdk_write_async internally)
+    {
+        let block_size = 512;
+        let offset = 4096 * 20;
+        let data = Utils::rand_str(block_size);
+        let region = DataSlice::buffer(BytesMut::from(data.as_bytes()));
+
+        let mut bdev = SpdkBdev::open_write(&bdev_name, offset as i64, 0).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(bdev.async_write_region(&region)).unwrap();
+        bdev.flush().unwrap();
+        assert_eq!(bdev.pos(), offset as i64 + block_size as i64);
+        bdev.seek(offset as i64).unwrap();
+        let result = bdev.read_region(false, block_size as i32).unwrap();
+        assert_eq!(result.len(), block_size);
+        assert_eq!(result.as_slice(), data.as_bytes());
+        println!("pass async write_region over SpdkBdev test");
+    }
+
+    // Phase 9: async write_region via BlockDevice::Spdk
+    {
+        let aligned_len = 4096;
+        let offset = aligned_len * 22;
+        let data = Utils::rand_str(aligned_len);
+        let region = DataSlice::buffer(BytesMut::from(data.as_bytes()));
+
+        let mut dev = crate::io::block_io::BlockDevice::Spdk(
+            SpdkBdev::open_write(&bdev_name, offset as i64, 0).unwrap(),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(dev.async_write_region(&region)).unwrap();
+        dev.flush().unwrap();
+        dev.seek(offset as i64).unwrap();
+        let result = dev.read_region(false, aligned_len as i32).unwrap();
+        assert_eq!(result.len(), aligned_len);
+        assert_eq!(result.as_slice(), data.as_bytes());
+        println!("pass BlockDevice async_write_region test");
+    }
+
+    // Phase 10: async read_region via SpdkBdev
+    {
+        let block_size = 512;
+        let offset = 4096 * 24;
+        let data = Utils::rand_str(block_size);
+
+        // Write data synchronously first
+        {
+            let mut bdev = SpdkBdev::open_write(&bdev_name, offset as i64, 0).unwrap();
+            bdev.write_all(data.as_bytes()).unwrap();
+            bdev.flush().unwrap();
+        }
+
+        // Read it back asynchronously
+        {
+            let mut bdev = SpdkBdev::open_read(&bdev_name, offset as u64, 0).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let result = rt
+                .block_on(bdev.async_read_region(block_size as i32))
+                .unwrap();
+            assert_eq!(result.len(), block_size);
+            assert_eq!(result.as_slice(), data.as_bytes());
+            assert_eq!(bdev.pos(), offset as i64 + block_size as i64);
+            println!("pass async read_region over SpdkBdev test");
+        }
+    }
+
+    // Phase 11: async read_region via BlockDevice::Spdk
+    {
+        let block_size = 512;
+        let offset = 4096 * 26;
+        let data = Utils::rand_str(block_size);
+
+        // Write data synchronously first
+        {
+            let mut bdev = SpdkBdev::open_write(&bdev_name, offset as i64, 0).unwrap();
+            bdev.write_all(data.as_bytes()).unwrap();
+            bdev.flush().unwrap();
+        }
+
+        // Read it back asynchronously through BlockDevice
+        {
+            let mut dev = crate::io::block_io::BlockDevice::Spdk(
+                SpdkBdev::open_read(&bdev_name, offset as u64, 0).unwrap(),
+            );
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let result = rt
+                .block_on(dev.async_read_region(false, block_size as i32))
+                .unwrap();
+            assert_eq!(result.len(), block_size);
+            assert_eq!(result.as_slice(), data.as_bytes());
+            println!("pass BlockDevice async_read_region test");
+        }
+    }
+
+    // Phase 12: shutdown (must be last — destructive)
     {
         env.shutdown();
         assert_eq!(env.state(), SpdkEnvState::ShutDown);

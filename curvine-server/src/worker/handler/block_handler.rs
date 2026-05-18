@@ -47,6 +47,14 @@ impl BlockHandler {
 impl MessageHandler for BlockHandler {
     type Error = FsError;
 
+    fn is_sync(&self, msg: &Message) -> bool {
+        match self {
+            Writer(h) => h.is_sync(msg),
+            Reader(h) => h.is_sync(msg),
+            BatchWriter(_) => true,
+        }
+    }
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let response = match self {
             Writer(h) => h.handle(msg),
@@ -57,6 +65,15 @@ impl MessageHandler for BlockHandler {
         match response {
             Ok(v) => Ok(v),
             Err(e) => Ok(msg.error_ext(&e)),
+        }
+    }
+
+    async fn async_handle(&mut self, msg: Message) -> FsResult<Message> {
+        match self {
+            Writer(h) => h.async_handle(msg).await,
+            Reader(h) => h.async_handle(msg).await,
+            // BatchWriter: is_sync returns true, this is unreachable
+            _ => unreachable!("async_handle called on sync-only handler"),
         }
     }
 }

@@ -162,6 +162,10 @@ pub struct WorkerConf {
 
     // SPDK over NVMe-oF/RDMA configuration.
     pub spdk_disk: SpdkConf,
+
+    // Async I/O pipeline: yield on NVMe wait instead of blocking thread.
+    // Dramatically improves throughput with limited io_threads.
+    pub async_enabled: bool,
 }
 
 impl WorkerConf {
@@ -207,6 +211,38 @@ impl Default for WorkerConf {
             block_replication_chunk_size: 1024 * 1024,
             enable_s3_gateway: false,
             spdk_disk: SpdkConf::default(),
+            async_enabled: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::conf::ClusterConf;
+
+    #[test]
+    fn async_enabled_default_false() {
+        let conf = ClusterConf::default();
+        assert!(!conf.worker.async_enabled);
+    }
+
+    #[test]
+    fn async_enabled_roundtrip() {
+        let toml_str = r#"
+            [worker]
+            async_enabled = true
+        "#;
+        let cluster: ClusterConf = toml::from_str(toml_str).unwrap();
+        assert!(cluster.worker.async_enabled);
+    }
+
+    #[test]
+    fn async_enabled_explicit_false() {
+        let toml_str = r#"
+            [worker]
+            async_enabled = false
+        "#;
+        let cluster: ClusterConf = toml::from_str(toml_str).unwrap();
+        assert!(!cluster.worker.async_enabled);
     }
 }

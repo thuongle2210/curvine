@@ -117,6 +117,13 @@ impl Drop for DmaBuf {
     }
 }
 
+/// Wrapper to carry a raw DMA pointer across async await points.
+/// Safety: the allocation is owned by `SpdkBdev` (which is already `Send`),
+/// and SPDK DMA buffers are accessible from any thread.
+#[repr(transparent)]
+struct SendPtr(*mut std::ffi::c_void);
+unsafe impl Send for SendPtr {}
+
 /// Opened SPDK block device. Analogous to LocalFile.
 /// Tracks position and size; I/O via SpdkIoChannel.
 pub struct SpdkBdev {
@@ -497,6 +504,227 @@ impl SpdkBdev {
         Ok(())
     }
 
+    /// Async read: same as spdk_read but yields between chunks instead of blocking.
+    async fn spdk_read_async(&mut self, offset: i64, len: usize) -> IOResult<BytesMut> {
+        let buf_cap = self.read_buf.capacity();
+        let dma_buf = SendPtr(self.read_buf.as_ptr());
+
+        let bs = self.block_size as usize;
+        let mut result = BytesMut::with_capacity(len);
+        let mut remaining = len;
+        let mut cur_off = offset;
+        while remaining > 0 {
+            let aligned_off = self.align_down(cur_off);
+            let head_skip = (cur_off - aligned_off) as usize;
+            debug_assert!(buf_cap > head_skip, "DMA buffer too small");
+            let chunk_data = remaining.min(buf_cap - head_skip);
+            let aligned_len = DmaBuf::align_up(chunk_data + head_skip, bs);
+
+            use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
+            let completion = IoCompletion::new();
+            self.inflight
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            let req = IoRequest {
+                op: IoOp::Read {
+                    ns: self.ns,
+                    qpair: self.io_channel.qpair,
+                    buf: dma_buf.0,
+                    offset: aligned_off as u64,
+                    num_bytes: aligned_len as u64,
+                },
+                completion: completion.clone(),
+                bdev_inflight: self.inflight.clone(),
+            };
+            if self.io_channel.poller_tx.send(req).is_err() {
+                self.inflight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                return err_box!("SPDK poller thread is gone");
+            }
+            if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                if let Err(e) = self.io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                         I/O may be delayed until timeout.",
+                        self.name, e
+                    );
+                }
+            }
+            let rc = completion.wait_async(self.io_timeout_us).await;
+            if rc != 0 {
+                return err_box!(
+                    "NVMe read failed on '{}' at offset={}: {}",
+                    self.name,
+                    aligned_off,
+                    Self::nvme_error_str(rc)
+                );
+            }
+            let slice = unsafe {
+                std::slice::from_raw_parts((dma_buf.0 as *const u8).add(head_skip), chunk_data)
+            };
+            result.extend_from_slice(slice);
+            cur_off += chunk_data as i64;
+            remaining -= chunk_data;
+        }
+        Ok(result)
+    }
+
+    /// Async write: same as spdk_write but yields between chunks instead of blocking.
+    async fn spdk_write_async(&mut self, offset: i64, data: &[u8]) -> IOResult<()> {
+        use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
+
+        if !self.writable {
+            return err_box!("bdev '{}' not opened for writing", self.name);
+        }
+
+        let len = data.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let buf_cap = self.write_buf.capacity();
+        let dma_buf = SendPtr(self.write_buf.as_ptr());
+
+        let bs = self.block_size as usize;
+        let mut written = 0usize;
+        let mut cur_off = offset;
+        while written < len {
+            let aligned_off = self.align_down(cur_off);
+            let head_skip = (cur_off - aligned_off) as usize;
+            let chunk_data = (len - written).min(buf_cap - head_skip);
+            let aligned_len = DmaBuf::align_up(chunk_data + head_skip, bs);
+            if head_skip > 0 || (chunk_data + head_skip) < aligned_len {
+                let completion = IoCompletion::new();
+                self.inflight
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                let req = IoRequest {
+                    op: IoOp::Read {
+                        ns: self.ns,
+                        qpair: self.io_channel.qpair,
+                        buf: dma_buf.0,
+                        offset: aligned_off as u64,
+                        num_bytes: aligned_len as u64,
+                    },
+                    completion: completion.clone(),
+                    bdev_inflight: self.inflight.clone(),
+                };
+                if self.io_channel.poller_tx.send(req).is_err() {
+                    self.inflight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    return err_box!("SPDK poller thread is gone");
+                }
+                if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                    if let Err(e) = self.io_channel.eventfd.write(1) {
+                        warn!(
+                            "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                             I/O may be delayed until timeout.",
+                            self.name, e
+                        );
+                    }
+                }
+                let rc = completion.wait_async(self.io_timeout_us).await;
+                if rc != 0 {
+                    return err_box!(
+                        "Read-modify-write: read failed on '{}' at offset={}: {}",
+                        self.name,
+                        aligned_off,
+                        Self::nvme_error_str(rc)
+                    );
+                }
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data[written..].as_ptr(),
+                    (dma_buf.0 as *mut u8).add(head_skip),
+                    chunk_data,
+                );
+            }
+            let completion = IoCompletion::new();
+            self.inflight
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            let req = IoRequest {
+                op: IoOp::Write {
+                    ns: self.ns,
+                    qpair: self.io_channel.qpair,
+                    buf: dma_buf.0,
+                    offset: aligned_off as u64,
+                    num_bytes: aligned_len as u64,
+                },
+                completion: completion.clone(),
+                bdev_inflight: self.inflight.clone(),
+            };
+            if self.io_channel.poller_tx.send(req).is_err() {
+                self.inflight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                return err_box!("SPDK poller thread is gone");
+            }
+            if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                if let Err(e) = self.io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                         I/O may be delayed until timeout.",
+                        self.name, e
+                    );
+                }
+            }
+            let rc = completion.wait_async(self.io_timeout_us).await;
+            if rc != 0 {
+                return err_box!(
+                    "NVMe write failed on '{}' at offset={}, len={}: {}",
+                    self.name,
+                    aligned_off,
+                    aligned_len,
+                    Self::nvme_error_str(rc)
+                );
+            }
+            cur_off += chunk_data as i64;
+            written += chunk_data;
+        }
+
+        Ok(())
+    }
+
+    /// Async read_region: same as read_region but async.
+    pub async fn async_read_region(&mut self, len: i32) -> IOResult<DataSlice> {
+        if len <= 0 {
+            return Ok(DataSlice::Empty);
+        }
+        let chunk = (len as i64).min(self.size - self.pos);
+        if chunk <= 0 {
+            return err_box!(
+                "offset exceeds bdev length, length={}, offset={}",
+                self.size,
+                self.pos
+            );
+        }
+        let buf = self.spdk_read_async(self.pos, chunk as usize).await?;
+        self.pos += chunk;
+        Ok(DataSlice::Buffer(buf))
+    }
+
+    /// Async write_region: same as write_region but async.
+    pub async fn async_write_region(&mut self, region: &DataSlice) -> IOResult<()> {
+        let data: &[u8] = match region {
+            DataSlice::Empty => return Ok(()),
+            DataSlice::Buffer(bytes) => bytes,
+            DataSlice::IOSlice(_) => {
+                return err_box!(
+                    "DataSlice::IOSlice not supported for SPDK bdev '{}'.",
+                    self.name
+                );
+            }
+            DataSlice::MemSlice(bytes) => bytes.as_slice(),
+            DataSlice::Bytes(bytes) => bytes,
+        };
+
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        self.check_bounds(data.len() as i64)?;
+        self.spdk_write_async(self.pos, data).await?;
+        self.pos += data.len() as i64;
+        Ok(())
+    }
+
     fn spdk_flush(&self) -> IOResult<()> {
         use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
         let completion = IoCompletion::new();
@@ -744,7 +972,9 @@ mod test {
         conf.enabled = true;
         conf.app_name = "curvine-test".to_string();
         conf.hugepage_mb = 64;
-        conf.reactor_mask = "0x1".to_string();
+        conf.no_huge = true;
+        conf.reactor_mask =
+            std::env::var("SPDK_REACTOR_MASK").unwrap_or_else(|_| "0x1".to_string());
         let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
         let trsvcid = std::env::var("SPDK_TARGET_PORT")
             .ok()

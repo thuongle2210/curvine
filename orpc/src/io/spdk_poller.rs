@@ -55,6 +55,7 @@ unsafe impl Send for IoOp {}
 pub struct IoCompletion {
     inner: Mutex<IoCompletionInner>,
     cond: Condvar,
+    notify: tokio::sync::Notify,
 }
 
 struct IoCompletionInner {
@@ -70,6 +71,7 @@ impl IoCompletion {
                 status: 0,
             }),
             cond: Condvar::new(),
+            notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -79,6 +81,7 @@ impl IoCompletion {
         inner.done = true;
         inner.status = status;
         self.cond.notify_one();
+        self.notify.notify_one();
     }
 
     /// Block until complete or timeout. Returns NVMe status.
@@ -104,6 +107,24 @@ impl IoCompletion {
             }
         }
         inner.status
+    }
+
+    /// Async wait: yield until complete or timeout. Returns NVMe status.
+    pub async fn wait_async(&self, timeout_us: u64) -> i32 {
+        let sleep = tokio::time::sleep(std::time::Duration::from_micros(timeout_us));
+        tokio::pin!(sleep);
+        loop {
+            {
+                let inner = self.inner.lock().unwrap();
+                if inner.done {
+                    return inner.status;
+                }
+            }
+            tokio::select! {
+                _ = sleep.as_mut() => return -libc::ETIMEDOUT,
+                _ = self.notify.notified() => {},
+            }
+        }
     }
 }
 
@@ -484,5 +505,30 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 impl Drop for SpdkPoller {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn wait_async_resolves() {
+        let c = IoCompletion::new();
+        let c2 = c.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_micros(100)).await;
+            c2.complete(42);
+        });
+        let rc = c.wait_async(1_000_000).await;
+        assert_eq!(rc, 42);
+    }
+
+    #[tokio::test]
+    async fn wait_async_times_out() {
+        let c = IoCompletion::new();
+        let rc = c.wait_async(1_000).await;
+        assert_eq!(rc, -libc::ETIMEDOUT);
     }
 }

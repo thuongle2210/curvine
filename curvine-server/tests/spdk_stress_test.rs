@@ -52,6 +52,7 @@ fn get_worker() -> &'static ClusterConf {
             app_name: "curvine-spdk-stress".into(),
             hugepage_str: format!("{}MB", hugepage_mb),
             hugepage_mb,
+            no_huge: true,
             reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or_else(|_| "0x2".to_string()),
             targets: vec![NvmeTarget {
                 traddr,

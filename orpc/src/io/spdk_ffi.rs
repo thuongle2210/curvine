@@ -32,6 +32,9 @@ extern "C" {
     pub fn curvine_spdk_env_opts_set_shm_id(opts: *mut spdk_env_opts, shm_id: c_int);
     pub fn curvine_spdk_env_opts_set_mem_channel(opts: *mut spdk_env_opts, mem_channel: c_int);
     pub fn curvine_spdk_env_opts_set_mem_size(opts: *mut spdk_env_opts, mem_size: c_int);
+    pub fn curvine_spdk_env_opts_set_huge_page_size(opts: *mut spdk_env_opts, size_bytes: u64);
+    pub fn curvine_spdk_env_opts_set_hugedir(opts: *mut spdk_env_opts, dir: *const c_char);
+    pub fn curvine_spdk_env_opts_set_no_huge(opts: *mut spdk_env_opts, val: bool);
     pub fn curvine_spdk_env_init(opts: *mut spdk_env_opts) -> c_int;
     pub fn spdk_env_fini();
     // Transport ID (via C helper)

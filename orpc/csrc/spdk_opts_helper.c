@@ -30,6 +30,12 @@ void curvine_spdk_env_opts_set_mem_channel(struct spdk_env_opts *opts, int chann
 void curvine_spdk_env_opts_set_mem_size(struct spdk_env_opts *opts, int size_mb) {
     opts->mem_size = size_mb;
 }
+void curvine_spdk_env_opts_set_hugedir(struct spdk_env_opts *opts, const char *dir) {
+    opts->hugedir = dir;
+}
+void curvine_spdk_env_opts_set_no_huge(struct spdk_env_opts *opts, bool val) {
+    opts->no_huge = val;
+}
 int curvine_spdk_env_init(struct spdk_env_opts *opts) {
     return spdk_env_init(opts);
 }

@@ -34,6 +34,7 @@ pub struct WriteHandler {
     pub(crate) is_commit: bool,
     pub(crate) io_slow_us: u64,
     pub(crate) metrics: &'static WorkerMetrics,
+    pub(crate) async_enabled: bool,
 }
 
 impl WriteHandler {
@@ -47,6 +48,7 @@ impl WriteHandler {
             is_commit: false,
             io_slow_us: conf.worker.io_slow_us(),
             metrics,
+            async_enabled: conf.worker.async_enabled,
         }
     }
 
@@ -274,8 +276,83 @@ impl WriteHandler {
     }
 }
 
+impl WriteHandler {
+    /// Async version of write() — yields during I/O instead of blocking.
+    async fn async_write(&mut self, msg: &Message) -> FsResult<Message> {
+        let file = try_option_mut!(self.file);
+        let context = try_option_mut!(self.context);
+        Self::check_context(context, msg)?;
+
+        if msg.header_len() > 0 {
+            let header: DataHeaderProto = msg.parse_header()?;
+            if !header.flush {
+                if header.offset < 0 || header.offset >= context.block_size {
+                    return err_box!(
+                        "Invalid seek offset: {}, block length: {}",
+                        header.offset,
+                        context.block_size
+                    );
+                }
+                let abs_offset = if file.supports_short_circuit() {
+                    header.offset
+                } else {
+                    (file.len() - context.block_size) + header.offset
+                };
+                file.seek(abs_offset)?;
+            }
+        }
+
+        let data_len = msg.data_len() as i64;
+        if data_len > 0 {
+            let write_limit = if file.supports_short_circuit() {
+                context.block_size
+            } else {
+                file.len()
+            };
+            if file.pos() + data_len > write_limit {
+                return err_box!(
+                    "Write range [{}, {}) exceeds block size {}",
+                    file.pos(),
+                    file.pos() + data_len,
+                    context.block_size
+                );
+            }
+
+            let spend = TimeSpent::new();
+            file.async_write_region(&msg.data).await?;
+
+            let used = spend.used_us();
+            if used >= self.io_slow_us {
+                warn!(
+                    "Slow write data from disk cost: {}us (threshold={}us), path: {} ",
+                    used,
+                    self.io_slow_us,
+                    file.path()
+                );
+            }
+            self.metrics.write_bytes.inc_by(msg.data_len() as i64);
+            self.metrics.write_time_us.inc_by(used as i64);
+            self.metrics.write_count.inc();
+        }
+
+        Ok(msg.success())
+    }
+}
+
 impl MessageHandler for WriteHandler {
     type Error = FsError;
+
+    fn is_sync(&self, msg: &Message) -> bool {
+        if !self.async_enabled {
+            return true;
+        }
+        if msg.request_status() != RequestStatus::Running {
+            return true;
+        }
+        // Only use async path when the backing device supports it (e.g. SPDK).
+        // LocalFile falls through to blocking I/O and must stay on the blocking pool.
+        self.file.as_ref().is_none_or(|f| !f.supports_async())
+    }
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let request_status = msg.request_status();
@@ -290,6 +367,18 @@ impl MessageHandler for WriteHandler {
             RequestStatus::Cancel => self.complete(msg, false),
 
             _ => err_box!("Unsupported request type"),
+        }
+    }
+
+    async fn async_handle(&mut self, msg: Message) -> FsResult<Message> {
+        let request_status = msg.request_status();
+        let result = match request_status {
+            RequestStatus::Running => self.async_write(&msg).await,
+            _ => self.handle(&msg),
+        };
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(msg.error_ext(&e)),
         }
     }
 }
