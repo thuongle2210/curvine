@@ -250,6 +250,8 @@ pub struct SpdkConf {
     pub io_timeout_us: u64, // parsed by init()
     #[serde(default)]
     pub io_retry_count: u32,
+    #[serde(default)]
+    pub pipeline_depth: u32,
     #[serde(alias = "keep_alive_timeout", default)]
     pub keep_alive_timeout_str: String, // e.g. "10s"
     #[serde(skip)]
@@ -360,6 +362,10 @@ impl SpdkConf {
             }
         }
 
+        if self.pipeline_depth == 0 {
+            return err_box!("SpdkConf: pipeline_depth must be > 0");
+        }
+
         // Validate poller interval is reasonable
         if self.poll_interval_ms == 0 {
             return err_box!("SpdkConf: poll_interval_ms must be > 0");
@@ -392,6 +398,7 @@ impl Default for SpdkConf {
             io_timeout_str: "30s".to_string(),
             io_timeout_us: 30_000_000,
             io_retry_count: 4,
+            pipeline_depth: 4,
             keep_alive_timeout_str: "10s".to_string(),
             keep_alive_timeout_ms: 10_000,
             poll_interval_ms: 1000,

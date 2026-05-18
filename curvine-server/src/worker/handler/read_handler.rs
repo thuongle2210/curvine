@@ -24,6 +24,7 @@ use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
 use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
+use orpc::sys::DataSlice;
 use orpc::sys::{CacheManager, ReadAheadTask};
 use orpc::{err_box, ternary, try_option_mut};
 use std::mem;
@@ -38,6 +39,10 @@ pub struct ReadHandler {
     pub(crate) enable_send_file: bool,
     pub(crate) async_enabled: bool,
     pub(crate) metrics: &'static WorkerMetrics,
+    /// Prefetched data for next sequential read chunk (pos, data).
+    prefetch_buf: Option<(i64, DataSlice)>,
+    /// Background prefetch task handle.
+    prefetch_task: Option<tokio::task::JoinHandle<(i64, orpc::io::IOResult<DataSlice>)>>,
 }
 
 impl ReadHandler {
@@ -56,6 +61,8 @@ impl ReadHandler {
             enable_send_file: conf.worker.enable_send_file,
             async_enabled: conf.worker.async_enabled,
             metrics,
+            prefetch_buf: None,
+            prefetch_task: None,
         }
     }
 
@@ -195,13 +202,41 @@ impl ReadHandler {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
 
-        if msg.header_len() > 0 {
+        let needs_seek = if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
             let abs_offset = if file.supports_short_circuit() {
                 header.offset
             } else {
                 context.bdev_offset + context.off + header.offset
             };
+            Some(abs_offset)
+        } else {
+            None
+        };
+
+        // Check prefetch cache: if the requested offset matches cached data, skip I/O
+        if let Some((prefetch_pos, prefetched)) = self.prefetch_buf.take() {
+            let current_pos = match needs_seek {
+                Some(off) => off,
+                None => file.pos(),
+            };
+            if current_pos == prefetch_pos && !prefetched.is_empty() {
+                // Prefetch hit — use cached data, no I/O needed
+                let used = 0u64;
+                let region = prefetched;
+
+                // Advance file position past prefetched data
+                file.seek(current_pos + region.len() as i64)?;
+
+                self.metrics.read_bytes.inc_by(region.len() as i64);
+                self.metrics.read_time_us.inc_by(used as i64);
+                self.metrics.read_count.inc();
+                return Ok(msg.success_with_data(None, region));
+            }
+        }
+
+        // Handle seek
+        if let Some(abs_offset) = needs_seek {
             if abs_offset != file.pos() {
                 file.seek(abs_offset)?;
             }
@@ -223,6 +258,19 @@ impl ReadHandler {
         if file.supports_read_ahead() {
             if let Some(local) = file.as_local_mut() {
                 self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
+            }
+        } else if file.supports_async() {
+            // Prefetch next chunk for SPDK async reads (overlaps I/O with network send)
+            let next_pos = file.pos();
+            let remaining = file.len() - next_pos;
+            if remaining > 0 {
+                let chunk_size = context.chunk_size.min(remaining as i32);
+                match file.async_read_region(enable_send_file, chunk_size).await {
+                    Ok(prefetch_data) if !prefetch_data.is_empty() => {
+                        self.prefetch_buf = Some((next_pos, prefetch_data));
+                    }
+                    _ => { /* prefetch miss is benign */ }
+                }
             }
         }
         let used = spend.used_us();
@@ -261,6 +309,8 @@ impl ReadHandler {
 
         let file = self.file.take();
         drop(file);
+        self.prefetch_buf = None;
+        self.prefetch_task = None;
 
         info!("Read block end for req_id {}", msg.req_id());
         Ok(msg.success())

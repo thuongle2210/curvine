@@ -27,6 +27,8 @@ use orpc::message::{Builder, Message, RequestStatus};
 use orpc::{err_box, ternary, try_option_mut};
 use std::mem;
 
+use bytes::Bytes as TBytes;
+
 pub struct WriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<WriteContext>,
@@ -35,6 +37,9 @@ pub struct WriteHandler {
     pub(crate) io_slow_us: u64,
     pub(crate) metrics: &'static WorkerMetrics,
     pub(crate) async_enabled: bool,
+    /// Deferred write: one chunk buffered ahead. Data from RPC N is written
+    /// during processing of RPC N+1, overlapping I/O with network RTT.
+    pending_write: Option<(i64, Vec<u8>)>,
 }
 
 impl WriteHandler {
@@ -49,6 +54,7 @@ impl WriteHandler {
             io_slow_us: conf.worker.io_slow_us(),
             metrics,
             async_enabled: conf.worker.async_enabled,
+            pending_write: None,
         }
     }
 
@@ -277,12 +283,15 @@ impl WriteHandler {
 }
 
 impl WriteHandler {
-    /// Async version of write() — yields during I/O instead of blocking.
+    /// Async version of write() — defers the actual write by one RPC,
+    /// overlapping I/O with the next request's network round-trip.
     async fn async_write(&mut self, msg: &Message) -> FsResult<Message> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
         Self::check_context(context, msg)?;
 
+        // Parse current request offset
+        let mut current_offset = None;
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
             if !header.flush {
@@ -298,44 +307,91 @@ impl WriteHandler {
                 } else {
                     (file.len() - context.block_size) + header.offset
                 };
-                file.seek(abs_offset)?;
+                current_offset = Some(abs_offset);
             }
         }
 
-        let data_len = msg.data_len() as i64;
+        // Extract data bytes from current message
+        let current_data = if msg.data_len() > 0 {
+            let data_bytes = match &msg.data {
+                orpc::sys::DataSlice::Empty => Vec::new(),
+                orpc::sys::DataSlice::Buffer(b) => b.to_vec(),
+                orpc::sys::DataSlice::MemSlice(v) => v.as_slice().to_vec(),
+                orpc::sys::DataSlice::Bytes(b) => b.to_vec(),
+                orpc::sys::DataSlice::IOSlice(..) => {
+                    return err_box!("IOSlice not supported in async write");
+                }
+            };
+            data_bytes
+        } else {
+            Vec::new()
+        };
+
+        let data_len = current_data.len() as i64;
         if data_len > 0 {
             let write_limit = if file.supports_short_circuit() {
                 context.block_size
             } else {
                 file.len()
             };
-            if file.pos() + data_len > write_limit {
-                return err_box!(
-                    "Write range [{}, {}) exceeds block size {}",
-                    file.pos(),
-                    file.pos() + data_len,
-                    context.block_size
-                );
-            }
 
-            let spend = TimeSpent::new();
-            file.async_write_region(&msg.data).await?;
-
-            let used = spend.used_us();
-            if used >= self.io_slow_us {
-                warn!(
-                    "Slow write data from disk cost: {}us (threshold={}us), path: {} ",
-                    used,
-                    self.io_slow_us,
-                    file.path()
-                );
+            // Validate bounds before starting write
+            if let Some(off) = current_offset {
+                if off + data_len > write_limit {
+                    return err_box!(
+                        "Write range [{}, {}) exceeds block size {}",
+                        off,
+                        off + data_len,
+                        context.block_size
+                    );
+                }
             }
-            self.metrics.write_bytes.inc_by(msg.data_len() as i64);
-            self.metrics.write_time_us.inc_by(used as i64);
-            self.metrics.write_count.inc();
         }
 
+        // Write the PREVIOUSLY pending data (from the RPC before this one)
+        if let Some((prev_offset, prev_data)) = self.pending_write.take() {
+            if !prev_data.is_empty() {
+                let spend = TimeSpent::new();
+                file.seek(prev_offset)?;
+                let slice = orpc::sys::DataSlice::bytes(bytes::Bytes::from(prev_data));
+                file.async_write_region(&slice).await?;
+
+                let used = spend.used_us();
+                if used >= self.io_slow_us {
+                    warn!(
+                        "Slow write data from disk cost: {}us (threshold={}us), path: {} ",
+                        used,
+                        self.io_slow_us,
+                        file.path()
+                    );
+                }
+                self.metrics.write_bytes.inc_by(data_len);
+                self.metrics.write_time_us.inc_by(used as i64);
+                self.metrics.write_count.inc();
+            }
+        }
+
+        // Buffer CURRENT data for the NEXT RPC's deferred write
+        if data_len > 0 {
+            self.pending_write = Some((current_offset.unwrap_or(0), current_data));
+        }
+
+        // Return ack immediately — data will be written on next call
         Ok(msg.success())
+    }
+
+    /// Flush the deferred pending write (data from the previous async_write RPC).
+    async fn flush_pending_async(&mut self) -> FsResult<()> {
+        if let Some((offset, data)) = self.pending_write.take() {
+            if !data.is_empty() {
+                if let Some(file) = self.file.as_mut() {
+                    file.seek(offset)?;
+                    let slice = orpc::sys::DataSlice::bytes(TBytes::from(data));
+                    file.async_write_region(&slice).await?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -374,6 +430,11 @@ impl MessageHandler for WriteHandler {
         let request_status = msg.request_status();
         let result = match request_status {
             RequestStatus::Running => self.async_write(&msg).await,
+            RequestStatus::Complete | RequestStatus::Cancel => {
+                // Flush deferred write before closing file
+                self.flush_pending_async().await?;
+                self.handle(&msg)
+            }
             _ => self.handle(&msg),
         };
         match result {

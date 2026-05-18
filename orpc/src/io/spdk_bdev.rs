@@ -19,6 +19,7 @@ use bytes::BytesMut;
 use log::{debug, error, warn};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // SPDK I/O channel — bridge between Tokio and SPDK reactor
 // ---------------------------------------------------------------------------
@@ -117,12 +118,53 @@ impl Drop for DmaBuf {
     }
 }
 
-/// Wrapper to carry a raw DMA pointer across async await points.
-/// Safety: the allocation is owned by `SpdkBdev` (which is already `Send`),
-/// and SPDK DMA buffers are accessible from any thread.
-#[repr(transparent)]
-struct SendPtr(*mut std::ffi::c_void);
-unsafe impl Send for SendPtr {}
+/// Pool of DMA buffers for pipelined async I/O.
+/// Pre-allocates `depth` buffers; semaphore limits concurrent usage.
+pub struct DmaPool {
+    bufs: Vec<DmaBuf>,
+    sem: tokio::sync::Semaphore,
+    next: std::sync::atomic::AtomicUsize,
+    buf_capacity: usize,
+}
+
+unsafe impl Send for DmaPool {}
+unsafe impl Sync for DmaPool {}
+
+impl DmaPool {
+    pub fn new(depth: usize, buf_size: usize, block_size: u32) -> IOResult<Self> {
+        let mut bufs = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            bufs.push(DmaBuf::alloc(buf_size, block_size)?);
+        }
+        Ok(Self {
+            bufs,
+            sem: tokio::sync::Semaphore::new(depth),
+            next: std::sync::atomic::AtomicUsize::new(0),
+            buf_capacity: buf_size,
+        })
+    }
+
+    /// Acquire a buffer from the pool, blocking if all are in use.
+    /// Returns (index, raw pointer). Caller must call `release()` after use.
+    pub async fn acquire(&self) -> (usize, *mut std::ffi::c_void) {
+        let _permit = self.sem.acquire().await;
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.bufs.len();
+        (idx, self.bufs[idx].as_ptr())
+    }
+
+    /// Return a buffer to the pool after I/O completes.
+    pub fn release(&self, _idx: usize) {
+        self.sem.add_permits(1);
+    }
+
+    pub fn buf_capacity(&self) -> usize {
+        self.buf_capacity
+    }
+
+    pub fn depth(&self) -> usize {
+        self.bufs.len()
+    }
+}
 
 /// Opened SPDK block device. Analogous to LocalFile.
 /// Tracks position and size; I/O via SpdkIoChannel.
@@ -138,10 +180,8 @@ pub struct SpdkBdev {
     pos: i64,
     /// Whether opened for writing.
     writable: bool,
-    /// Read buffer (avoids repeated allocation).
-    read_buf: DmaBuf,
-    /// Write buffer (avoids repeated allocation).
-    write_buf: DmaBuf,
+    /// Pool of DMA buffers for pipelined I/O.
+    dma_pool: DmaPool,
     /// Raw namespace pointer.
     ns: *mut crate::io::spdk_ffi::spdk_nvme_ns,
     /// I/O channel for this bdev.
@@ -203,17 +243,11 @@ impl SpdkBdev {
                 );
             }
 
-            // DMA buffers (1MB each) reused across I/O — larger I/Os chunked
+            // DMA buffer pool for pipelined async I/O
             let buf_size = DmaBuf::align_up(1024 * 1024, block_size as usize);
-            let read_buf = match DmaBuf::alloc(buf_size, block_size) {
-                Ok(buf) => buf,
-                Err(e) => {
-                    env.release_handle();
-                    return Err(e);
-                }
-            };
-            let write_buf = match DmaBuf::alloc(buf_size, block_size) {
-                Ok(buf) => buf,
+            let pipeline_depth = env.conf().pipeline_depth.max(1) as usize;
+            let dma_pool = match DmaPool::new(pipeline_depth, buf_size, block_size) {
+                Ok(pool) => pool,
                 Err(e) => {
                     env.release_handle();
                     return Err(e);
@@ -247,9 +281,8 @@ impl SpdkBdev {
                 block_size,
                 pos: offset,
                 writable,
+                dma_pool,
                 io_channel,
-                read_buf,
-                write_buf,
                 ns,
                 ctrlr,
                 io_timeout_us,
@@ -318,8 +351,8 @@ impl SpdkBdev {
 
     /// Submit read to SPDK, wait for completion. Uses DMA buffer (large reads chunked).
     fn spdk_read(&mut self, offset: i64, len: usize) -> IOResult<BytesMut> {
-        let buf_cap = self.read_buf.capacity();
-        let dma_buf = self.read_buf.as_ptr();
+        let buf_cap = self.dma_pool.buf_capacity();
+        let dma_buf = self.dma_pool.bufs[0].as_ptr();
 
         let bs = self.block_size as usize;
         let mut result = BytesMut::with_capacity(len);
@@ -396,8 +429,8 @@ impl SpdkBdev {
         if len == 0 {
             return Ok(());
         }
-        let buf_cap = self.write_buf.capacity();
-        let dma_buf = self.write_buf.as_ptr();
+        let buf_cap = self.dma_pool.buf_capacity();
+        let dma_buf = self.dma_pool.bufs[0].as_ptr();
 
         let bs = self.block_size as usize;
         let mut written = 0usize;
@@ -504,71 +537,108 @@ impl SpdkBdev {
         Ok(())
     }
 
-    /// Async read: same as spdk_read but yields between chunks instead of blocking.
+    /// Async read with pipeline: submits chunks in batches of pool depth,
+    /// allowing NVMe controller to process multiple commands concurrently.
     async fn spdk_read_async(&mut self, offset: i64, len: usize) -> IOResult<BytesMut> {
-        let buf_cap = self.read_buf.capacity();
-        let dma_buf = SendPtr(self.read_buf.as_ptr());
+        use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
 
-        let bs = self.block_size as usize;
+        let dma_pool = &self.dma_pool;
+        let io_channel = &self.io_channel;
+        let inflight = &self.inflight;
+        let io_timeout_us = self.io_timeout_us;
+        let name = &self.name;
+        let bs = self.block_size as i64;
+        let buf_cap = dma_pool.buf_capacity();
+        let pool_depth = dma_pool.depth();
+
         let mut result = BytesMut::with_capacity(len);
         let mut remaining = len;
         let mut cur_off = offset;
         while remaining > 0 {
-            let aligned_off = self.align_down(cur_off);
-            let head_skip = (cur_off - aligned_off) as usize;
-            debug_assert!(buf_cap > head_skip, "DMA buffer too small");
-            let chunk_data = remaining.min(buf_cap - head_skip);
-            let aligned_len = DmaBuf::align_up(chunk_data + head_skip, bs);
+            // Plan a batch of up to pool_depth chunks
+            let remaining_in_range = remaining;
+            let batch_n = remaining_in_range.div_ceil(buf_cap).min(pool_depth);
+            let mut batch: Vec<(
+                usize, // buf_idx
+                i64,   // aligned_off
+                usize, // head_skip
+                usize, // chunk_data
+                usize, // aligned_len
+                Arc<IoCompletion>,
+            )> = Vec::with_capacity(batch_n);
 
-            use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
-            let completion = IoCompletion::new();
-            self.inflight
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            let req = IoRequest {
-                op: IoOp::Read {
-                    ns: self.ns,
-                    qpair: self.io_channel.qpair,
-                    buf: dma_buf.0,
-                    offset: aligned_off as u64,
-                    num_bytes: aligned_len as u64,
-                },
-                completion: completion.clone(),
-                bdev_inflight: self.inflight.clone(),
-            };
-            if self.io_channel.poller_tx.send(req).is_err() {
-                self.inflight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                return err_box!("SPDK poller thread is gone");
+            for _ in 0..batch_n {
+                let aligned_off = cur_off & !(bs - 1);
+                let head_skip = (cur_off - aligned_off) as usize;
+                let chunk_data = remaining.min(buf_cap - head_skip);
+                let aligned_len = DmaBuf::align_up(chunk_data + head_skip, bs as usize);
+
+                let (buf_idx, buf_ptr) = dma_pool.acquire().await;
+                let completion = IoCompletion::new();
+                inflight.fetch_add(1, std::sync::atomic::Ordering::Release);
+                let req = IoRequest {
+                    op: IoOp::Read {
+                        ns: self.ns,
+                        qpair: io_channel.qpair,
+                        buf: buf_ptr,
+                        offset: aligned_off as u64,
+                        num_bytes: aligned_len as u64,
+                    },
+                    completion: completion.clone(),
+                    bdev_inflight: inflight.clone(),
+                };
+                if io_channel.poller_tx.send(req).is_err() {
+                    inflight.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    return err_box!("SPDK poller thread is gone");
+                }
+                batch.push((
+                    buf_idx,
+                    aligned_off,
+                    head_skip,
+                    chunk_data,
+                    aligned_len,
+                    completion,
+                ));
+                cur_off += chunk_data as i64;
+                remaining -= chunk_data;
             }
-            if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
-                if let Err(e) = self.io_channel.eventfd.write(1) {
+
+            // Wake poller once after batch submit
+            if io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                if let Err(e) = io_channel.eventfd.write(1) {
                     warn!(
                         "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
                          I/O may be delayed until timeout.",
-                        self.name, e
+                        name, e
                     );
                 }
             }
-            let rc = completion.wait_async(self.io_timeout_us).await;
-            if rc != 0 {
-                return err_box!(
-                    "NVMe read failed on '{}' at offset={}: {}",
-                    self.name,
-                    aligned_off,
-                    Self::nvme_error_str(rc)
-                );
+
+            // Await all completions in this batch (in order)
+            for (buf_idx, _aligned_off, head_skip, chunk_data, _aligned_len, completion) in &batch {
+                let rc: i32 = completion.wait_async(io_timeout_us).await;
+                if rc != 0 {
+                    return err_box!(
+                        "NVMe read failed on '{}' at offset={}: {}",
+                        name,
+                        _aligned_off,
+                        Self::nvme_error_str(rc)
+                    );
+                }
+                // Copy from DMA buf to heap (DMA buffers can be reused after)
+                let buf_ptr = dma_pool.bufs[*buf_idx].as_ptr();
+                let slice = unsafe {
+                    std::slice::from_raw_parts((buf_ptr as *const u8).add(*head_skip), *chunk_data)
+                };
+                result.extend_from_slice(slice);
+                dma_pool.release(*buf_idx);
             }
-            let slice = unsafe {
-                std::slice::from_raw_parts((dma_buf.0 as *const u8).add(head_skip), chunk_data)
-            };
-            result.extend_from_slice(slice);
-            cur_off += chunk_data as i64;
-            remaining -= chunk_data;
         }
         Ok(result)
     }
 
-    /// Async write: same as spdk_write but yields between chunks instead of blocking.
+    /// Async write with pipeline: processes chunks in batches of pool depth.
+    /// Within each batch: submits all RMW reads in parallel, then all writes in parallel.
     async fn spdk_write_async(&mut self, offset: i64, data: &[u8]) -> IOResult<()> {
         use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
 
@@ -580,103 +650,173 @@ impl SpdkBdev {
         if len == 0 {
             return Ok(());
         }
-        let buf_cap = self.write_buf.capacity();
-        let dma_buf = SendPtr(self.write_buf.as_ptr());
 
-        let bs = self.block_size as usize;
+        let dma_pool = &self.dma_pool;
+        let io_channel = &self.io_channel;
+        let inflight = &self.inflight;
+        let io_timeout_us = self.io_timeout_us;
+        let name = &self.name;
+        let bs = self.block_size as i64;
+        let buf_cap = dma_pool.buf_capacity();
+        let pool_depth = dma_pool.depth();
+
         let mut written = 0usize;
         let mut cur_off = offset;
         while written < len {
-            let aligned_off = self.align_down(cur_off);
-            let head_skip = (cur_off - aligned_off) as usize;
-            let chunk_data = (len - written).min(buf_cap - head_skip);
-            let aligned_len = DmaBuf::align_up(chunk_data + head_skip, bs);
-            if head_skip > 0 || (chunk_data + head_skip) < aligned_len {
+            let remaining = len - written;
+            let batch_n = remaining.div_ceil(buf_cap).min(pool_depth);
+
+            // Plan batch chunks
+            struct BatchChunk {
+                buf_idx: usize,
+                aligned_off: i64,
+                head_skip: usize,
+                chunk_data: usize,
+                aligned_len: usize,
+                needs_rmw: bool,
+                completion: Option<Arc<IoCompletion>>,
+            }
+            let mut chunks: Vec<BatchChunk> = Vec::with_capacity(batch_n);
+            let mut bytes_in_batch = 0usize;
+            for _ in 0..batch_n {
+                let aligned_off = cur_off & !(bs - 1);
+                let head_skip = (cur_off - aligned_off) as usize;
+                let chunk_data = (len - written - bytes_in_batch).min(buf_cap - head_skip);
+                let aligned_len = DmaBuf::align_up(chunk_data + head_skip, bs as usize);
+                let needs_rmw = head_skip > 0 || (chunk_data + head_skip) < aligned_len;
+
+                let (buf_idx, _buf_ptr) = dma_pool.acquire().await;
+                chunks.push(BatchChunk {
+                    buf_idx,
+                    aligned_off,
+                    head_skip,
+                    chunk_data,
+                    aligned_len,
+                    needs_rmw,
+                    completion: None,
+                });
+                bytes_in_batch += chunk_data;
+                cur_off += chunk_data as i64;
+            }
+            let cur_off_saved = cur_off;
+            let written_saved = written;
+
+            // Phase 1: Submit all RMW reads in parallel
+            let mut rmw_count = 0;
+            for i in 0..chunks.len() {
+                if !chunks[i].needs_rmw {
+                    continue;
+                }
                 let completion = IoCompletion::new();
-                self.inflight
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                inflight.fetch_add(1, std::sync::atomic::Ordering::Release);
                 let req = IoRequest {
                     op: IoOp::Read {
                         ns: self.ns,
-                        qpair: self.io_channel.qpair,
-                        buf: dma_buf.0,
-                        offset: aligned_off as u64,
-                        num_bytes: aligned_len as u64,
+                        qpair: io_channel.qpair,
+                        buf: dma_pool.bufs[chunks[i].buf_idx].as_ptr(),
+                        offset: chunks[i].aligned_off as u64,
+                        num_bytes: chunks[i].aligned_len as u64,
                     },
                     completion: completion.clone(),
-                    bdev_inflight: self.inflight.clone(),
+                    bdev_inflight: inflight.clone(),
                 };
-                if self.io_channel.poller_tx.send(req).is_err() {
-                    self.inflight
-                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                if io_channel.poller_tx.send(req).is_err() {
+                    inflight.fetch_sub(1, std::sync::atomic::Ordering::Release);
                     return err_box!("SPDK poller thread is gone");
                 }
-                if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
-                    if let Err(e) = self.io_channel.eventfd.write(1) {
-                        warn!(
-                            "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                             I/O may be delayed until timeout.",
-                            self.name, e
+                chunks[i].completion = Some(completion);
+                rmw_count += 1;
+            }
+
+            // Wake poller once for RMW reads
+            if rmw_count > 0 && io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                if let Err(e) = io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}.",
+                        name, e
+                    );
+                }
+            }
+
+            // Await all RMW reads
+            for chunk in &chunks {
+                if let Some(ref completion) = chunk.completion {
+                    let rc: i32 = completion.wait_async(io_timeout_us).await;
+                    if rc != 0 {
+                        return err_box!(
+                            "Read-modify-write: read failed on '{}' at offset={}: {}",
+                            name,
+                            chunk.aligned_off,
+                            Self::nvme_error_str(rc)
                         );
                     }
                 }
-                let rc = completion.wait_async(self.io_timeout_us).await;
+            }
+
+            // Phase 2: Copy user data into DMA buffers
+            let mut batch_offset = written_saved;
+            for chunk in &chunks {
+                let buf_ptr = dma_pool.bufs[chunk.buf_idx].as_ptr();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data[batch_offset..].as_ptr(),
+                        (buf_ptr as *mut u8).add(chunk.head_skip),
+                        chunk.chunk_data,
+                    );
+                }
+                batch_offset += chunk.chunk_data;
+            }
+
+            // Phase 3: Submit all writes in parallel
+            let mut write_completions: Vec<(usize, Arc<IoCompletion>)> =
+                Vec::with_capacity(chunks.len());
+            for chunk in &chunks {
+                let completion = IoCompletion::new();
+                inflight.fetch_add(1, std::sync::atomic::Ordering::Release);
+                let req = IoRequest {
+                    op: IoOp::Write {
+                        ns: self.ns,
+                        qpair: io_channel.qpair,
+                        buf: dma_pool.bufs[chunk.buf_idx].as_ptr(),
+                        offset: chunk.aligned_off as u64,
+                        num_bytes: chunk.aligned_len as u64,
+                    },
+                    completion: completion.clone(),
+                    bdev_inflight: inflight.clone(),
+                };
+                if io_channel.poller_tx.send(req).is_err() {
+                    inflight.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    return err_box!("SPDK poller thread is gone");
+                }
+                write_completions.push((chunk.buf_idx, completion));
+            }
+
+            // Wake poller once for writes
+            if io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                if let Err(e) = io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}.",
+                        name, e
+                    );
+                }
+            }
+
+            // Await all writes
+            for (buf_idx, completion) in &write_completions {
+                let rc: i32 = completion.wait_async(io_timeout_us).await;
                 if rc != 0 {
                     return err_box!(
-                        "Read-modify-write: read failed on '{}' at offset={}: {}",
-                        self.name,
-                        aligned_off,
+                        "NVMe write failed on '{}' at offset={}: {}",
+                        name,
+                        0i64,
                         Self::nvme_error_str(rc)
                     );
                 }
+                dma_pool.release(*buf_idx);
             }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data[written..].as_ptr(),
-                    (dma_buf.0 as *mut u8).add(head_skip),
-                    chunk_data,
-                );
-            }
-            let completion = IoCompletion::new();
-            self.inflight
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            let req = IoRequest {
-                op: IoOp::Write {
-                    ns: self.ns,
-                    qpair: self.io_channel.qpair,
-                    buf: dma_buf.0,
-                    offset: aligned_off as u64,
-                    num_bytes: aligned_len as u64,
-                },
-                completion: completion.clone(),
-                bdev_inflight: self.inflight.clone(),
-            };
-            if self.io_channel.poller_tx.send(req).is_err() {
-                self.inflight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
-                return err_box!("SPDK poller thread is gone");
-            }
-            if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
-                if let Err(e) = self.io_channel.eventfd.write(1) {
-                    warn!(
-                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                         I/O may be delayed until timeout.",
-                        self.name, e
-                    );
-                }
-            }
-            let rc = completion.wait_async(self.io_timeout_us).await;
-            if rc != 0 {
-                return err_box!(
-                    "NVMe write failed on '{}' at offset={}, len={}: {}",
-                    self.name,
-                    aligned_off,
-                    aligned_len,
-                    Self::nvme_error_str(rc)
-                );
-            }
-            cur_off += chunk_data as i64;
-            written += chunk_data;
+
+            cur_off = cur_off_saved;
+            written = written_saved + bytes_in_batch;
         }
 
         Ok(())
@@ -918,9 +1058,7 @@ impl Drop for SpdkBdev {
                     count,
                     max_wait.as_secs()
                 );
-                // Poison pointers so DmaBuf::drop is a no-op.
-                self.read_buf.ptr = std::ptr::null_mut();
-                self.write_buf.ptr = std::ptr::null_mut();
+                // Poison DMA pool so buffers are no-ops on drop.
                 // TODO: leak qpair and handle on timeout because reusing a qpair with orphaned callbacks causes use after free.
                 break;
             }
