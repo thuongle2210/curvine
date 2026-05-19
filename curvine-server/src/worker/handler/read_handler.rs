@@ -19,7 +19,7 @@ use curvine_common::error::FsError;
 use curvine_common::proto::{BlockReadResponse, DataHeaderProto};
 use curvine_common::state::StorageType;
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{debug, info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
 use orpc::io::{BlockDevice, BlockIO};
@@ -321,13 +321,21 @@ impl MessageHandler for ReadHandler {
     type Error = FsError;
 
     fn is_sync(&self, msg: &Message) -> bool {
-        if !self.async_enabled {
-            return true;
-        }
-        if msg.request_status() != RequestStatus::Running {
-            return true;
-        }
-        self.file.as_ref().is_none_or(|f| !f.supports_async())
+        let sync = if !self.async_enabled {
+            true
+        } else if msg.request_status() != RequestStatus::Running {
+            true
+        } else {
+            self.file.as_ref().is_none_or(|f| !f.supports_async())
+        };
+        debug!(
+            "is_sync: async_enabled={}, status={:?}, file_supports_async={:?}, result={}",
+            self.async_enabled,
+            msg.request_status(),
+            self.file.as_ref().map(|f| f.supports_async()),
+            sync
+        );
+        sync
     }
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
