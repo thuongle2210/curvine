@@ -408,7 +408,7 @@ impl MessageHandler for WriteHandler {
             // LocalFile falls through to blocking I/O and must stay on the blocking pool.
             self.file.as_ref().is_none_or(|f| !f.supports_async())
         };
-        debug!(
+        info!(
             "is_sync: async_enabled={}, status={:?}, file_supports_async={:?}, result={}",
             self.async_enabled,
             msg.request_status(),
