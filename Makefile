@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid all dist dist-only
+.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-build-spdk-initiator docker-compose-spdk build-spdk all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -40,6 +40,13 @@ help:
 	@echo "CSI (Container Storage Interface):"
 	@echo "  make curvine-csi                 - Build curvine-csi Docker image"
 	@echo ""
+	@echo "SPDK NVMe-oF (Storage Performance Development Kit):"
+	@echo "  make build-spdk                  - Build SPDK from source (default: v25.09, TCP+RDMA)"
+	@echo "  make docker-build-spdk-target    - Build SPDK NVMe-oF target Docker image"
+	@echo "  make docker-build-spdk-initiator - Build Curvine SPDK initiator Docker image"
+	@echo "  make docker-compose-spdk         - Start SPDK target + initiator stack (dev/test)"
+	@echo "  make docker-compose-spdk-down    - Stop SPDK target + initiator stack"
+	@echo ""
 	@echo "Other:"
 	@echo "  make cargo ARGS='<args>'         - Run arbitrary cargo commands"
 	@echo "  make help                        - Show this help message"
@@ -65,6 +72,9 @@ help:
 	@echo "  make cargo ARGS='test --verbose'            - Run cargo test with verbose output"
 	@echo "  make curvine-csi                            - Build curvine-csi Docker image"
 	@echo "  make docker-build-fluid                  - Build unified Fluid Docker image"
+	@echo "  make docker-build-spdk-target             - Build SPDK NVMe-oF target image"
+	@echo "  make docker-build-spdk-initiator          - Build SPDK initiator image"
+	@echo "  make docker-compose-spdk                  - Start SPDK dev/test stack"
 
 # 1. Check build environment dependencies
 check-env:
@@ -182,7 +192,72 @@ curvine-csi-quick-push: curvine-csi-quick
 	docker push curvineio/curvine-csi:latest
 	@echo "✓ Quick-built image pushed successfully: curvineio/curvine-csi:latest"
 
-# 7. HDFS-specific builds
+# 9. SPDK NVMe-oF builds
+.PHONY: build-spdk docker-build-spdk-target docker-build-spdk-initiator docker-compose-spdk docker-compose-spdk-down
+
+# Build SPDK from source (TCP + RDMA)
+build-spdk:
+	@echo "Building SPDK from source..."
+	$(SHELL_CMD) build/build-spdk.sh --rdma --prefix build/spdk/release $(ARGS)
+	@echo "✓ SPDK built and installed to build/spdk/release"
+
+# Build SPDK NVMe-oF target Docker image
+docker-build-spdk-target:
+	@echo "Building SPDK NVMe-oF target Docker image..."
+	docker build \
+		--build-arg SPDK_TAG=v25.09 \
+		-f curvine-docker/spdk/Dockerfile.target \
+		-t curvine-spdk-target:latest .
+	@echo "✓ SPDK target image built: curvine-spdk-target:latest"
+
+# Build Curvine SPDK initiator Docker image
+docker-build-spdk-initiator:
+	@echo "Building Curvine SPDK initiator Docker image..."
+	docker build \
+		-f curvine-docker/spdk/Dockerfile.initiator \
+		-t curvine-spdk-initiator:latest .
+	@echo "✓ SPDK initiator image built: curvine-spdk-initiator:latest"
+
+# Build and run SPDK initiator debug container (interactive shell in /workspace)
+# Useful for debugging cargo build failures or iterating on Rust code
+docker-build-spdk-initiator-debug:
+	@echo "Building SPDK initiator debug image..."
+	docker build \
+		--target debug \
+		-f curvine-docker/spdk/Dockerfile.initiator \
+		-t curvine-spdk-debug:latest .
+	@echo "✓ Debug image built: curvine-spdk-debug:latest"
+	@echo ""
+	@echo "Starting interactive shell... (run 'cargo build ...' manually inside)"
+	@echo "  Example: cargo build --release -p curvine-server \\"
+	@echo "           --no-default-features --features \"spdk-rdma\""
+	@echo ""
+	docker run --rm -it \
+		--mount type=volume,source=curvine-cargo-registry,destination=/root/.cargo/registry \
+		--mount type=volume,source=curvine-cargo-git,destination=/root/.cargo/git \
+		curvine-spdk-debug:latest
+
+# Start SPDK target + initiator stack via docker compose (dev/test only)
+docker-compose-spdk:
+	@echo "Starting SPDK target + initiator stack (dev/test)..."
+	@echo "Note: This runs both target and initiator on the same machine."
+	@echo "      In production, deploy them on separate physical machines."
+	@echo ""
+	@echo "Prerequisites:"
+	@echo "  sudo sysctl -w vm.nr_hugepages=4096"
+	@echo "  sudo modprobe uio_pci_generic"
+	@echo "  sudo modprobe nvme nvme-fabrics nvme-tcp nvme-rdma"
+	@echo ""
+	cd curvine-docker/spdk && docker compose up --build -d
+	@echo "✓ SPDK stack started. Check status with: docker compose -f curvine-docker/spdk/docker-compose.yml ps"
+
+# Stop SPDK target + initiator stack
+docker-compose-spdk-down:
+	@echo "Stopping SPDK target + initiator stack..."
+	cd curvine-docker/spdk && docker compose down
+	@echo "✓ SPDK stack stopped."
+
+# 10. HDFS-specific builds
 .PHONY: build-hdfs build-webhdfs setup-hdfs
 
 # Build with HDFS support (native HDFS + WebHDFS)

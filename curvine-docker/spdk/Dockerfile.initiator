@@ -1,0 +1,187 @@
+# SPDK NVMe-oF Initiator Image
+#
+# Builds SPDK from source and compiles curvine-server with SPDK initiator support.
+# The container connects to a remote NVMe-oF target and uses remote NVMe devices
+# as block storage for Curvine worker.
+#
+# Usage:
+#   docker build -f curvine-docker/spdk/Dockerfile.initiator -t curvine-spdk-initiator:latest .
+#   docker run --privileged --net=host -v /dev/hugepages:/dev/hugepages \
+#     -e TARGET_IP=192.168.1.100 -e TARGET_PORT=4420 \
+#     -e SUBNQN=nqn.2025-03.io.curvine:cnode1 \
+#     -v /path/to/curvine-cluster.toml:/app/curvine/conf/curvine-cluster.toml \
+#     curvine-spdk-initiator:latest worker start
+
+# ============================================================
+# Builder stage: compile SPDK + curvine-server with SPDK features
+# ============================================================
+FROM ghcr.io/curvineio/curvine-compile:rocky9 AS builder
+
+# Add metadata labels
+ARG REPO_URL=https://github.com/curvineio/curvine
+LABEL org.opencontainers.image.source="${REPO_URL}"
+LABEL org.opencontainers.image.description="Curvine SPDK Initiator builder stage"
+
+# Override ENTRYPOINT from compile image to allow RUN commands
+ENTRYPOINT []
+
+# Build isa-l from source (required by SPDK, not available in Rocky 9 aarch64 repos)
+RUN dnf install -y nasm autoconf automake libtool && \
+    cd /tmp && \
+    git clone --depth 1 --branch v2.31.1 https://github.com/intel/isa-l.git isa-l-src && \
+    cd isa-l-src && \
+    ./autogen.sh && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd / && rm -rf /tmp/isa-l-src && \
+    dnf remove -y nasm autoconf automake libtool && \
+    dnf clean all && \
+    echo "isa-l built and installed"
+
+# Step 1: Build SPDK from source
+COPY build/build-spdk.sh /tmp/build-spdk.sh
+RUN chmod +x /tmp/build-spdk.sh && \
+    /tmp/build-spdk.sh --prefix /opt/spdk --rdma --arch native && \
+    echo "SPDK built and installed to /opt/spdk"
+
+# Step 2: Set environment for Curvine build
+ENV SPDK_DIR=/opt/spdk
+ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
+ENV JAVA_HOME=/usr/lib/jvm/java-1.8.0-openjdk
+
+# Step 3: Copy source code
+COPY . /workspace/
+WORKDIR /workspace
+
+FROM builder AS step4
+
+# Step 4: Build curvine-server with SPDK features
+# Cache mounts speed up iteration: cargo registry and compiled deps persist across builds
+RUN --mount=type=cache,target=/workspace/target,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    echo "Building curvine-server with SPDK initiator support..." && \
+    export CURVINE_HOME=/workspace && \
+    mkdir -p /workspace/tmp && \
+    export TMPDIR=/workspace/tmp && \
+    cargo build --release \
+        -p curvine-server \
+        --no-default-features \
+        --features "spdk-rdma" && \
+    echo "curvine-server built with SPDK support" && \
+    # Collect build artifacts
+    mkdir -p /build-output/bin /build-output/lib /build-output/conf && \
+    cp target/release/curvine-server /build-output/lib/ && \
+    cp -r etc/* /build-output/conf/ && \
+    cp -r build/bin/* /build-output/bin/ && \
+    chmod +x /build-output/bin/* && \
+    # Copy SPDK runtime libraries
+    mkdir -p /build-output/spdk && \
+    cp -r /opt/spdk/build/lib /build-output/spdk/lib && \
+    cp -r /opt/spdk/build/bin /build-output/spdk/bin && \
+    cp -r /opt/spdk/scripts /build-output/spdk/scripts && \
+    cp -r /opt/spdk/include /build-output/spdk/include && \
+    # Copy DPDK libraries
+    if [ -d "/opt/spdk/dpdk/build/lib" ]; then \
+        mkdir -p /build-output/spdk/dpdk/lib && \
+        cp -r /opt/spdk/dpdk/build/lib/* /build-output/spdk/dpdk/lib/; \
+    fi && \
+    echo "Build artifacts collected to /build-output" && \
+    rm -rf /workspace/tmp
+
+# ============================================================
+# Debug stage: always succeeds, provides a shell in /workspace
+# ============================================================
+# Usage:
+#   docker build --target debug -t curvine-debug:latest \
+#       -f curvine-docker/spdk/Dockerfile.initiator .
+#   docker run --rm -it curvine-debug:latest
+#   # Inside: manually run cargo build, see full errors, iterate
+FROM builder AS debug
+COPY . /workspace/
+WORKDIR /workspace
+CMD ["/bin/bash"]
+
+# ============================================================
+# Runtime stage: minimal image with SPDK libs + curvine binary
+# ============================================================
+FROM rockylinux:9
+
+# Add metadata labels
+ARG REPO_URL=https://github.com/curvineio/curvine
+LABEL org.opencontainers.image.source="${REPO_URL}"
+LABEL org.opencontainers.image.description="Curvine SPDK NVMe-oF Initiator — connects to remote NVMe-oF targets"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install runtime dependencies
+RUN dnf install -y \
+    fuse3 \
+    procps-ng \
+    numactl-libs \
+    libuuid \
+    libaio \
+    libffi \
+    openssl-libs \
+    nvme-cli \
+    kmod \
+    pciutils \
+    && dnf clean all
+
+# Install RDMA runtime libraries
+RUN dnf install -y \
+    rdma-core \
+    libibverbs \
+    librdmacm \
+    && dnf clean all
+
+# Create curvine directories
+RUN mkdir -p /app/curvine \
+    && mkdir -p /opt/curvine/data/{meta,journal} \
+    && mkdir -p /opt/curvine/logs \
+    && mkdir -p /app/curvine/bin /app/curvine/lib /app/curvine/conf \
+    && mkdir -p /opt/spdk
+
+# Copy build artifacts from builder
+COPY --from=builder /build-output/ /app/curvine/
+
+# Copy SPDK libraries
+COPY --from=builder /build-output/spdk /opt/spdk
+
+# Copy isa-l shared library from builder
+COPY --from=builder /usr/local/lib64/libisal.so* /usr/local/lib64/
+COPY --from=builder /usr/lib64/libisal.so* /usr/lib64/ 2>/dev/null || true
+RUN ldconfig
+
+# Copy entrypoint script
+COPY curvine-docker/spdk/entrypoint-initiator.sh /entrypoint-initiator.sh
+RUN chmod +x /entrypoint-initiator.sh
+
+# Set environment variables
+ENV APP_HOME=/app
+ENV CURVINE_HOME=/app/curvine
+ENV PATH=$PATH:$CURVINE_HOME/bin
+ENV SPDK_DIR=/opt/spdk
+ENV LD_LIBRARY_PATH="/opt/spdk/lib:/opt/spdk/dpdk/lib:/usr/local/lib64"
+ENV ORPC_BIND_HOSTNAME=0.0.0.0
+ENV CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
+
+# NVMe-oF target connection parameters (overridable at runtime)
+ENV TARGET_IP=127.0.0.1
+ENV TARGET_PORT=4420
+ENV SUBNQN=nqn.2025-03.io.curvine:cnode1
+
+# Make all binaries and scripts executable
+RUN find /app/curvine -type f -name "*.sh" -exec chmod +x {} \; \
+    && find /app/curvine -type f -path "*/bin/*" -exec chmod +x {} \; \
+    && find /app/curvine -type f -path "*/lib/*" -exec chmod +x {} \; \
+    && find /opt/spdk -type f -name "*.sh" -exec chmod +x {} \; \
+    && find /opt/spdk -type f -name "*.py" -exec chmod +x {} \; \
+    && chmod +x /entrypoint-initiator.sh
+
+WORKDIR $APP_HOME
+
+ENTRYPOINT ["/entrypoint-initiator.sh"]
+CMD ["worker", "start"]
