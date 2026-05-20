@@ -177,6 +177,16 @@ git submodule update --init
 
 # --- Step 4: Install SPDK-specific dependencies ---
 print_info "Running SPDK pkgdep.sh..."
+
+# Pre-install EPEL from official Fedora CDN for reliability instead of slow community mirrors
+if command -v dnf &>/dev/null && ! rpm -q epel-release &>/dev/null 2>&1; then
+    print_info "Installing EPEL release from official Fedora CDN..."
+    dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+    sed -i 's/^metalink=/#metalink=/g' /etc/yum.repos.d/epel*.repo 2>/dev/null || true
+    sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' /etc/yum.repos.d/epel*.repo 2>/dev/null || true
+    dnf clean all
+fi
+
 if [ $ENABLE_RDMA -eq 1 ]; then
     scripts/pkgdep.sh --rdma
 else

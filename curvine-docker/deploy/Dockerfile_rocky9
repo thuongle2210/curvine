@@ -95,6 +95,15 @@ RUN mkdir -p /build-output && \
 # Runtime stage
 FROM rockylinux:9
 
+# Use official CDN mirrors instead of unreliable community mirrors
+RUN for repo in /etc/yum.repos.d/*.repo; do \
+        [ -f "$repo" ] || continue; \
+        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
+        sed -i 's/^metalink=/#metalink=/g' "$repo"; \
+        sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
+        sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
+    done
+
 RUN dnf install -y --allowerasing \
     fuse3 \
     procps-ng \
