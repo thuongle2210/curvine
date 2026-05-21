@@ -22,7 +22,7 @@
 # curvine worker process.
 #
 # Environment variables:
-#   TARGET_IP       — NVMe-oF target IP (default: 127.0.0.1)
+#   TARGET_IP       — NVMe-oF target IP (default: auto-detect first routable IP)
 #   TARGET_PORT     — NVMe-oF target port (default: 4420)
 #   SUBNQN          — Subsystem NQN to connect (default: nqn.2025-03.io.curvine:cnode1)
 #   TRANSPORT_TYPE  — tcp or rdma (default: tcp)
@@ -33,7 +33,7 @@
 
 set -euo pipefail
 
-TARGET_IP="${TARGET_IP:-127.0.0.1}"
+TARGET_IP="${TARGET_IP:-$(ip -4 addr show scope global 2>/dev/null | grep inet | head -1 | awk '{print $2}' | cut -d/ -f1)}"
 TARGET_PORT="${TARGET_PORT:-4420}"
 SUBNQN="${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
 TRANSPORT_TYPE="${TRANSPORT_TYPE:-tcp}"

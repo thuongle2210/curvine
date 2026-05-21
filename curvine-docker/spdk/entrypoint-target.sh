@@ -19,7 +19,7 @@
 # entrypoint-target.sh — SPDK NVMe-oF target container startup
 #
 # Environment variables:
-#   TARGET_IP       — IP address to bind listeners (default: 127.0.0.1)
+#   TARGET_IP       — IP address to bind listeners (default: auto-detect first routable IP)
 #   TARGET_PORT     — NVMe-oF port (default: 4420)
 #   NVME_PCI_ADDR   — PCI address of NVMe device to export (default: 0000:00:0e.0 — VirtualBox)
 #   SUBNQN          — Subsystem NQN (default: nqn.2025-03.io.curvine:cnode1)
@@ -33,7 +33,7 @@
 set -euo pipefail
 
 SPDK_DIR="${SPDK_DIR:-/opt/spdk}"
-TARGET_IP="${TARGET_IP:-0.0.0.0}"
+TARGET_IP="${TARGET_IP:-$(ip -4 addr show scope global 2>/dev/null | grep inet | head -1 | awk '{print $2}' | cut -d/ -f1)}"
 TARGET_PORT="${TARGET_PORT:-4420}"
 NVME_PCI_ADDR="${NVME_PCI_ADDR:-0000:00:0e.0}"
 SUBNQN="${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
@@ -125,7 +125,7 @@ print_success "Namespace added"
 # --- Step 8: Add listeners ---
 if [ "${TRANSPORT_MODE}" = "tcp" ] || [ "${TRANSPORT_MODE}" = "both" ]; then
     print_info "Adding TCP listener on ${TARGET_IP}:${TARGET_PORT}..."
-    "${RPC}" nvmf_subsystem_add_listener "${SUBNQN}" -t TCP -a "${TARGET_IP}" -s "${TARGET_PORT}"
+    "${RPC}" nvmf_subsystem_add_listener "${SUBNQN}" -t TCP -a "${TARGET_IP}" -s "${TARGET_PORT}" -f ipv4
     print_success "TCP listener added"
 fi
 
