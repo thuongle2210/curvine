@@ -33,7 +33,7 @@
 set -euo pipefail
 
 SPDK_DIR="${SPDK_DIR:-/opt/spdk}"
-TARGET_IP="${TARGET_IP:-127.0.0.1}"
+TARGET_IP="${TARGET_IP:-0.0.0.0}"
 TARGET_PORT="${TARGET_PORT:-4420}"
 NVME_PCI_ADDR="${NVME_PCI_ADDR:-0000:00:0e.0}"
 SUBNQN="${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
