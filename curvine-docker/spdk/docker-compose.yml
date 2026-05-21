@@ -36,7 +36,7 @@ services:
       NVME_PCI_ADDR: "${NVME_PCI_ADDR:-0000:00:1f.0}"
       SUBNQN: "${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
       SERIAL: "${SERIAL:-SPDK0001}"
-      TRANSPORT_MODE: "${TRANSPORT_MODE:-both}"
+      TRANSPORT_MODE: "${TRANSPORT_MODE:-tcp}"
       REACTOR_MASK: "${REACTOR_MASK:-0x3}"
       SHM_ID: "${SHM_ID:--1}"
       MEM_SIZE: "${MEM_SIZE:-1024}"
