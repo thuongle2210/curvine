@@ -21,21 +21,21 @@
 # Environment variables:
 #   TARGET_IP       — IP address to bind listeners (default: 127.0.0.1)
 #   TARGET_PORT     — NVMe-oF port (default: 4420)
-#   NVME_PCI_ADDR   — PCI address of NVMe device to export (default: 0000:00:1f.0)
+#   NVME_PCI_ADDR   — PCI address of NVMe device to export (default: 0000:00:0e.0 — VirtualBox)
 #   SUBNQN          — Subsystem NQN (default: nqn.2025-03.io.curvine:cnode1)
 #   SERIAL          — Serial number (default: SPDK0001)
-#   TRANSPORT_MODE  — tcp, rdma, or both (default: both)
+#   TRANSPORT_MODE  — tcp, rdma, or both (default: tcp)
 #   REACTOR_MASK    — CPU core mask for SPDK reactors (default: 0x3)
 #   SHM_ID          — Shared memory ID (default: -1)
-#   MEM_SIZE        — Memory size in MB (default: 4096)
-#   NR_HUGE_PAGES   — Number of huge pages (default: 4096)
+#   MEM_SIZE        — Memory size in MB (default: 1024)
+#   NR_HUGE_PAGES   — Number of huge pages (default: 1024)
 
 set -euo pipefail
 
 SPDK_DIR="${SPDK_DIR:-/opt/spdk}"
 TARGET_IP="${TARGET_IP:-127.0.0.1}"
 TARGET_PORT="${TARGET_PORT:-4420}"
-NVME_PCI_ADDR="${NVME_PCI_ADDR:-0000:00:1f.0}"
+NVME_PCI_ADDR="${NVME_PCI_ADDR:-0000:00:0e.0}"
 SUBNQN="${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
 SERIAL="${SERIAL:-SPDK0001}"
 TRANSPORT_MODE="${TRANSPORT_MODE:-tcp}"

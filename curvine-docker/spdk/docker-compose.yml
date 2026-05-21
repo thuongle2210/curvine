@@ -12,7 +12,7 @@
 #   cd curvine-docker/spdk
 #   docker compose up --build
 #
-# To override target NVMe PCI address:
+# To override target NVMe PCI address (default: VirtualBox NVMe):
 #   NVME_PCI_ADDR=0000:01:00.0 docker compose up --build
 
 x-network: &spdk-net
@@ -33,7 +33,7 @@ services:
     environment:
       TARGET_IP: "${TARGET_IP:-127.0.0.1}"
       TARGET_PORT: "${TARGET_PORT:-4420}"
-      NVME_PCI_ADDR: "${NVME_PCI_ADDR:-0000:00:1f.0}"
+      NVME_PCI_ADDR: "${NVME_PCI_ADDR:-0000:00:0e.0}"
       SUBNQN: "${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
       SERIAL: "${SERIAL:-SPDK0001}"
       TRANSPORT_MODE: "${TRANSPORT_MODE:-tcp}"
