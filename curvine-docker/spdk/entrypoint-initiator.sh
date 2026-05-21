@@ -60,6 +60,12 @@ print_error() {
 discover_target() {
     print_info "Discovering NVMe-oF target at ${TARGET_IP}:${TARGET_PORT}..."
 
+    if [ ! -e /dev/nvme-fabrics ]; then
+        print_info "/dev/nvme-fabrics not found — kernel NVMe-oF initiator unavailable"
+        print_info "SPDK initiator will connect at the application level via curvine-server"
+        return 0
+    fi
+
     if command -v nvme &>/dev/null; then
         nvme discover -t "${TRANSPORT_TYPE}" -a "${TARGET_IP}" -s "${TARGET_PORT}" 2>/dev/null || {
             print_error "Discovery failed. Is the target running at ${TARGET_IP}:${TARGET_PORT}?"
@@ -73,6 +79,12 @@ discover_target() {
 # --- Connect to NVMe-oF target ---
 connect_target() {
     print_info "Connecting to NVMe-oF target ${SUBNQN} at ${TARGET_IP}:${TARGET_PORT}..."
+
+    if [ ! -e /dev/nvme-fabrics ]; then
+        print_info "/dev/nvme-fabrics not found — kernel NVMe-oF initiator unavailable"
+        print_info "SPDK initiator will connect at the application level via curvine-server"
+        return 0
+    fi
 
     if command -v nvme &>/dev/null; then
         nvme connect -t "${TRANSPORT_TYPE}" -n "${SUBNQN}" -a "${TARGET_IP}" -s "${TARGET_PORT}" || {

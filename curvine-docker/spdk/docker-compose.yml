@@ -39,8 +39,8 @@ services:
       TRANSPORT_MODE: "${TRANSPORT_MODE:-both}"
       REACTOR_MASK: "${REACTOR_MASK:-0x3}"
       SHM_ID: "${SHM_ID:--1}"
-      MEM_SIZE: "${MEM_SIZE:-4096}"
-      NR_HUGE_PAGES: "${NR_HUGE_PAGES:-4096}"
+      MEM_SIZE: "${MEM_SIZE:-1024}"
+      NR_HUGE_PAGES: "${NR_HUGE_PAGES:-1024}"
     volumes:
       - /dev:/dev
       - /lib/modules:/lib/modules
