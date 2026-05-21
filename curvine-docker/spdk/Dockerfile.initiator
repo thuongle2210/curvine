@@ -25,9 +25,21 @@ LABEL org.opencontainers.image.description="Curvine SPDK Initiator builder stage
 # Override ENTRYPOINT from compile image to allow RUN commands
 ENTRYPOINT []
 
+ENV PIP_NO_HASH_CHECK=1
+ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
 
-# Build isa-l from source (required by SPDK, not available in Rocky 9 aarch64 repos)
-RUN dnf install -y nasm autoconf automake libtool && \
+# Step 1: Build nasm from source (not available in EPEL 9 for aarch64)
+RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.gz | \
+    tar -xz -C /tmp && \
+    cd /tmp/nasm-2.16.03 && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    rm -rf /tmp/nasm-2.16.03 && \
+    echo "nasm 2.16.03 built and installed"
+
+# Step 2: Build isa-l from source (required by SPDK, not available in Rocky 9 aarch64 repos)
+RUN dnf install -y autoconf automake libtool && \
     cd /tmp && \
     git clone --depth 1 --branch v2.31.1 https://github.com/intel/isa-l.git isa-l-src && \
     cd isa-l-src && \
@@ -37,22 +49,22 @@ RUN dnf install -y nasm autoconf automake libtool && \
     make install && \
     ldconfig && \
     cd / && rm -rf /tmp/isa-l-src && \
-    dnf remove -y nasm autoconf automake libtool && \
+    dnf remove -y autoconf automake libtool && \
     dnf clean all && \
     echo "isa-l built and installed"
 
-# Step 1: Build SPDK from source
+# Step 3: Build SPDK from source
 COPY build/build-spdk.sh /tmp/build-spdk.sh
 RUN chmod +x /tmp/build-spdk.sh && \
     /tmp/build-spdk.sh --prefix /opt/spdk --rdma --arch native && \
     echo "SPDK built and installed to /opt/spdk"
 
-# Step 2: Set environment for Curvine build
+# Step 4: Set environment for Curvine build
 ENV SPDK_DIR=/opt/spdk
 ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
 ENV JAVA_HOME=/usr/lib/jvm/java-1.8.0-openjdk
 
-# Step 3: Copy source code
+# Step 5: Copy source code
 COPY . /workspace/
 WORKDIR /workspace
 
@@ -155,14 +167,13 @@ RUN mkdir -p /app/curvine \
     && mkdir -p /opt/spdk
 
 # Copy build artifacts from builder
-COPY --from=builder /build-output/ /app/curvine/
+COPY --from=step4 /build-output/ /app/curvine/
 
 # Copy SPDK libraries
-COPY --from=builder /build-output/spdk /opt/spdk
+COPY --from=step4 /build-output/spdk /opt/spdk
 
 # Copy isa-l shared library from builder
-COPY --from=builder /usr/local/lib64/libisal.so* /usr/local/lib64/
-COPY --from=builder /usr/lib64/libisal.so* /usr/lib64/ 2>/dev/null || true
+COPY --from=step4 /usr/lib64/libisal.so* /usr/lib64/
 RUN ldconfig
 
 # Copy entrypoint script
@@ -174,7 +185,7 @@ ENV APP_HOME=/app
 ENV CURVINE_HOME=/app/curvine
 ENV PATH=$PATH:$CURVINE_HOME/bin
 ENV SPDK_DIR=/opt/spdk
-ENV LD_LIBRARY_PATH="/opt/spdk/lib:/opt/spdk/dpdk/lib:/usr/local/lib64"
+ENV LD_LIBRARY_PATH="/opt/spdk/lib:/opt/spdk/dpdk/lib:/usr/local/lib64:/usr/local/lib"
 ENV ORPC_BIND_HOSTNAME=0.0.0.0
 ENV CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
 

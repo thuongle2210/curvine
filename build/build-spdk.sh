@@ -193,10 +193,24 @@ else
     scripts/pkgdep.sh
 fi
 
-# --- Step 4.1: Build isa-l from source (required by SPDK, not available in Rocky 9 aarch64 repos) ---
+# --- Step 4.1: Build nasm from source (not available in EPEL 9 for aarch64) ---
+print_info "Building nasm from source..."
+if ! command -v nasm &>/dev/null; then
+    wget -qO- https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.gz | tar -xz -C /tmp
+    cd /tmp/nasm-2.16.03
+    ./configure
+    make -j "${JOBS}"
+    make install
+    rm -rf /tmp/nasm-2.16.03
+    print_success "nasm built and installed"
+else
+    print_info "nasm already installed, skipping"
+fi
+
+# --- Step 4.2: Build isa-l from source (required by SPDK, not available in Rocky 9 aarch64 repos) ---
 if ! pkg-config --exists libisal 2>/dev/null; then
     print_info "Building isa-l from source..."
-    dnf install -y nasm autoconf automake libtool
+    dnf install -y autoconf automake libtool
     cd /tmp
     git clone --depth 1 --branch v2.31.1 https://github.com/intel/isa-l.git isa-l-src
     cd isa-l-src
@@ -207,7 +221,7 @@ if ! pkg-config --exists libisal 2>/dev/null; then
     ldconfig
     cd /
     rm -rf /tmp/isa-l-src
-    dnf remove -y nasm autoconf automake libtool
+    dnf remove -y autoconf automake libtool
     dnf clean all
     print_success "isa-l built and installed"
 else
@@ -216,12 +230,13 @@ fi
 
 # --- Step 5: Install Python dependencies for RPC tools ---
 print_info "Installing Python dependencies for SPDK RPC tools..."
-pip3 install --break-system-packages grpcio-tools==1.51.3 protobuf==4.22.1 2>/dev/null || \
-    pip3 install grpcio-tools==1.51.3 protobuf==4.22.1 2>/dev/null || \
+pip3 install --break-system-packages grpcio-tools protobuf 2>/dev/null || \
+    pip3 install grpcio-tools protobuf 2>/dev/null || \
     print_info "pip install for grpcio-tools skipped (may already be installed)"
 
 # --- Step 6: Configure SPDK ---
 print_info "Configuring SPDK..."
+cd "${SPDK_SRC_DIR}"
 CONFIGURE_CMD="./configure --disable-tests --target-arch=${TARGET_ARCH}"
 
 if [ $ENABLE_RDMA -eq 1 ]; then

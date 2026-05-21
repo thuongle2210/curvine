@@ -71,8 +71,6 @@ services:
     volumes:
       - /dev/hugepages:/dev/hugepages
       - /lib/modules:/lib/modules
-      # Mount custom curvine config if provided
-      - "${CURVINE_CONF:-./curvine-cluster-spdk.toml}:/app/curvine/conf/curvine-cluster.toml:ro"
     cap_add:
       - SYS_ADMIN
       - IPC_LOCK

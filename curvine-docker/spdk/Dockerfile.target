@@ -41,7 +41,9 @@ ENV NR_HUGE_PAGES=4096
 
 # --- Install base dependencies ---
 # Note: rockylinux:9 ships curl-minimal; using curl causes a conflict
-RUN dnf install -y \
+# nasm requires EPEL (not in base Rocky Linux repos)
+RUN dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
+    dnf install -y \
     gcc gcc-c++ make pkg-config \
     libaio-devel libuuid-devel \
     openssl-devel numactl-devel \
@@ -50,8 +52,18 @@ RUN dnf install -y \
     libffi-devel kmod \
     pciutils \
     procps-ng \
-    nasm autoconf automake libtool \
+    autoconf automake libtool \
     && dnf clean all
+
+# --- Build nasm from source (not available in EPEL 9 for aarch64) ---
+RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.gz | \
+    tar -xz -C /tmp && \
+    cd /tmp/nasm-2.16.03 && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    rm -rf /tmp/nasm-2.16.03 && \
+    echo "nasm 2.16.03 built and installed"
 
 # --- Build isa-l from source (required by SPDK, not available in Rocky 9 aarch64 repos) ---
 RUN cd /tmp && \
@@ -69,9 +81,6 @@ RUN cd /tmp && \
 RUN dnf install -y \
     rdma-core-devel libibverbs-devel librdmacm-devel \
     && dnf clean all
-
-# --- Install Python dependencies for SPDK RPC tools ---
-RUN pip3 install grpcio-tools==1.51.3 protobuf==4.22.1
 
 # --- Clone and build SPDK from source ---
 ARG SPDK_TAG=v25.09
