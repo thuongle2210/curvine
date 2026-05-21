@@ -33,7 +33,7 @@
 set -euo pipefail
 
 SPDK_DIR="${SPDK_DIR:-/opt/spdk}"
-TARGET_IP="${TARGET_IP:-$(ip -4 addr show scope global 2>/dev/null | grep inet | head -1 | awk '{print $2}' | cut -d/ -f1)}"
+TARGET_IP="${TARGET_IP:-$(hostname -I | awk '{print $1}')}"
 TARGET_PORT="${TARGET_PORT:-4420}"
 NVME_PCI_ADDR="${NVME_PCI_ADDR:-0000:00:0e.0}"
 SUBNQN="${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
