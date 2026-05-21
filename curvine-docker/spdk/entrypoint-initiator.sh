@@ -216,26 +216,32 @@ print_info "  Subsystem NQN: ${SUBNQN}"
 print_info "  Transport:     ${TRANSPORT_TYPE}"
 
 case "$SERVER_TYPE" in
-    worker)
+    worker|master)
         case "$ACTION_TYPE" in
             start)
-                # Discover and connect to target first
-                discover_target || true
-                connect_target || true
-                # Start curvine worker
-                start_service "worker"
+                if [ "$SERVER_TYPE" = "worker" ]; then
+                    discover_target || true
+                    connect_target || true
+                fi
+                start_service "$SERVER_TYPE"
                 ;;
             stop)
-                stop_service "worker"
-                disconnect_target
+                stop_service "$SERVER_TYPE"
+                if [ "$SERVER_TYPE" = "worker" ]; then
+                    disconnect_target
+                fi
                 ;;
             restart)
-                stop_service "worker"
-                disconnect_target
+                stop_service "$SERVER_TYPE"
+                if [ "$SERVER_TYPE" = "worker" ]; then
+                    disconnect_target
+                fi
                 sleep 2
-                discover_target || true
-                connect_target || true
-                start_service "worker"
+                if [ "$SERVER_TYPE" = "worker" ]; then
+                    discover_target || true
+                    connect_target || true
+                fi
+                start_service "$SERVER_TYPE"
                 ;;
             *)
                 print_error "Unsupported action: $ACTION_TYPE (expected: start|stop|restart)"

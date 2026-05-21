@@ -1,10 +1,10 @@
-# SPDK NVMe-oF Target + Initiator Docker Compose
+# Curvine Full Stack (Master + SPDK NVMe-oF Target + Initiator)
 #
-# Dev/test only — runs both target (storage node) and initiator (compute node)
+# Dev/test only — runs master, SPDK target (storage node), and initiator (compute node)
 # on the same machine. In production, these are deployed on separate physical machines.
 #
 # Prerequisites (run on host before docker-compose up):
-#   sudo sysctl -w vm.nr_hugepages=4096
+#   sudo sysctl -w vm.nr_hugepages=4096   (1024 for Vagrant VMs)
 #   sudo modprobe uio_pci_generic
 #   sudo modprobe nvme nvme-fabrics nvme-tcp nvme-rdma
 #
@@ -19,7 +19,38 @@ x-network: &spdk-net
   name: spdk-net
   driver: bridge
 
+x-env: &common-env
+  CURVINE_CONF_FILE: "/app/curvine/conf/curvine-cluster.toml"
+  SPDK_DIR: "/opt/spdk"
+  LD_LIBRARY_PATH: "/opt/spdk/lib:/opt/spdk/dpdk/lib"
+  TARGET_IP: "${TARGET_IP:-}"
+  TARGET_PORT: "${TARGET_PORT:-4420}"
+  SUBNQN: "${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
+
+x-cap: &common-cap
+  cap_add:
+    - SYS_ADMIN
+    - IPC_LOCK
+
 services:
+  # ============================================================
+  # Curvine Master (Metadata Server)
+  # ============================================================
+  master:
+    build:
+      context: ../..
+      dockerfile: curvine-docker/spdk/Dockerfile.initiator
+    container_name: spdk-master
+    privileged: true
+    network_mode: "host"
+    environment:
+      <<: *common-env
+    <<: *common-cap
+    volumes:
+      - /dev/hugepages:/dev/hugepages
+    command: ["master", "start"]
+    restart: "no"
+
   # ============================================================
   # SPDK NVMe-oF Target (Storage Node)
   # ============================================================
@@ -31,23 +62,19 @@ services:
     privileged: true
     network_mode: "host"
     environment:
-      TARGET_IP: "${TARGET_IP:-}"
-      TARGET_PORT: "${TARGET_PORT:-4420}"
       NVME_PCI_ADDR: "${NVME_PCI_ADDR:-0000:00:0e.0}"
-      SUBNQN: "${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
       SERIAL: "${SERIAL:-SPDK0001}"
       TRANSPORT_MODE: "${TRANSPORT_MODE:-tcp}"
       REACTOR_MASK: "${REACTOR_MASK:-0x3}"
       SHM_ID: "${SHM_ID:--1}"
       MEM_SIZE: "${MEM_SIZE:-1024}"
       NR_HUGE_PAGES: "${NR_HUGE_PAGES:-1024}"
+      <<: *common-env
+    <<: *common-cap
     volumes:
       - /dev:/dev
       - /lib/modules:/lib/modules
       - /dev/hugepages:/dev/hugepages
-    cap_add:
-      - SYS_ADMIN
-      - IPC_LOCK
     restart: "no"
 
   # ============================================================
@@ -61,19 +88,14 @@ services:
     privileged: true
     network_mode: "host"
     environment:
-      TARGET_IP: "${TARGET_IP:-}"
-      TARGET_PORT: "${TARGET_PORT:-4420}"
-      SUBNQN: "${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
       TRANSPORT_TYPE: "${TRANSPORT_TYPE:-tcp}"
-      CURVINE_CONF_FILE: "/app/curvine/conf/curvine-cluster.toml"
-      SPDK_DIR: "/opt/spdk"
-      LD_LIBRARY_PATH: "/opt/spdk/lib:/opt/spdk/dpdk/lib"
+      <<: *common-env
+    <<: *common-cap
     volumes:
       - /dev/hugepages:/dev/hugepages
       - /lib/modules:/lib/modules
-    cap_add:
-      - SYS_ADMIN
-      - IPC_LOCK
     depends_on:
+      - master
       - target
+    command: ["worker", "start"]
     restart: "no"
