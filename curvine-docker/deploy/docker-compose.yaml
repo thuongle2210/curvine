@@ -1,5 +1,3 @@
-version: "3.8"
-
 # All cluster config comes from curvine-cluster.toml.
 # Set CURVINE_TOML to your config path, or place it at ./curvine-cluster.toml.
 # Service names resolve via Docker DNS (e.g., "storage-target", "master").
@@ -8,7 +6,7 @@ version: "3.8"
 # (shared layers from deps/build/spdk-full reuse cached builds)
 #
 # Usage:
-#   CURVINE_TOML=./my-cluster.toml docker compose up --build
+#   CURVINE_TOML=./example/conf/curvine-cluster-spdk.toml docker compose up --build
 
 x-init-common: &init-common
   privileged: true
@@ -31,16 +29,13 @@ services:
     volumes:
       - /dev:/dev
       - /dev/hugepages:/dev/hugepages
+      - ${CURVINE_TOML:-./curvine-cluster.toml}:/etc/curvine/cluster.toml
     environment:
-      - NVME_PCI_ADDR=${NVME_PCI_ADDR:-0000:00:0e.0}
-      - TARGET_PORT=4420
-      - TRANSPORT_MODE=tcp
-      - REACTOR_MASK=0x3
-      - NR_HUGE_PAGES=1024
+      - NVME_PCI_ADDR=${NVME_PCI_ADDR:-}
+      - CURVINE_CONF_FILE=/etc/curvine/cluster.toml
+    restart: unless-stopped
     networks:
       spdk:
-    deploy:
-      replicas: 1
 
   # ============================================================
   # Curvine Master (metadata server) — builds second
@@ -53,6 +48,7 @@ services:
     volumes:
       - ${CURVINE_TOML:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
     command: ["master", "start"]
+    restart: unless-stopped
     depends_on:
       - storage-target
     networks:
@@ -71,6 +67,7 @@ services:
       - master
       - storage-target
     command: ["worker", "start"]
+    restart: unless-stopped
     deploy:
       replicas: 1
 

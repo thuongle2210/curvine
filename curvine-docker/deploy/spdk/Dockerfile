@@ -204,4 +204,7 @@ LABEL stage="target-runtime"
 COPY curvine-docker/deploy/spdk/entrypoint-target.sh /entrypoint-target.sh
 RUN chmod +x /entrypoint-target.sh
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD /opt/spdk/scripts/rpc.py -s /var/tmp/spdk.sock rpc_get_methods >/dev/null 2>&1 || exit 1
+
 ENTRYPOINT ["/entrypoint-target.sh"]
