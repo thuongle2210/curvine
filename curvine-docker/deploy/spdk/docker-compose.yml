@@ -26,6 +26,7 @@ x-target-base: &target-base
   privileged: true
   volumes:
     - /sys:/sys:rw
+    - /lib/modules:/lib/modules:ro
     - /dev/vfio:/dev/vfio
     - /dev/hugepages:/dev/hugepages
   restart: unless-stopped
