@@ -205,37 +205,21 @@ build-spdk:
 docker-build-spdk-target:
 	@echo "Building SPDK NVMe-oF target Docker image..."
 	docker build \
-		--build-arg SPDK_TAG=v25.09 \
-		-f curvine-docker/spdk/Dockerfile.target \
-		-t curvine-spdk-target:latest .
+		--target target-runtime \
+		-f curvine-docker/deploy/spdk/Dockerfile \
+		-t curvine-spdk-target:latest \
+		curvine-docker/deploy/spdk/../../..
 	@echo "✓ SPDK target image built: curvine-spdk-target:latest"
 
 # Build Curvine SPDK initiator Docker image
 docker-build-spdk-initiator:
 	@echo "Building Curvine SPDK initiator Docker image..."
 	docker build \
-		-f curvine-docker/spdk/Dockerfile.initiator \
-		-t curvine-spdk-initiator:latest .
+		--target initiator-runtime \
+		-f curvine-docker/deploy/spdk/Dockerfile \
+		-t curvine-spdk-initiator:latest \
+		curvine-docker/deploy/spdk/../../..
 	@echo "✓ SPDK initiator image built: curvine-spdk-initiator:latest"
-
-# Build and run SPDK initiator debug container (interactive shell in /workspace)
-# Useful for debugging cargo build failures or iterating on Rust code
-docker-build-spdk-initiator-debug:
-	@echo "Building SPDK initiator debug image..."
-	docker build \
-		--target debug \
-		-f curvine-docker/spdk/Dockerfile.initiator \
-		-t curvine-spdk-debug:latest .
-	@echo "✓ Debug image built: curvine-spdk-debug:latest"
-	@echo ""
-	@echo "Starting interactive shell... (run 'cargo build ...' manually inside)"
-	@echo "  Example: cargo build --release -p curvine-server \\"
-	@echo "           --no-default-features --features \"spdk-rdma\""
-	@echo ""
-	docker run --rm -it \
-		--mount type=volume,source=curvine-cargo-registry,destination=/root/.cargo/registry \
-		--mount type=volume,source=curvine-cargo-git,destination=/root/.cargo/git \
-		curvine-spdk-debug:latest
 
 # Start SPDK target + initiator stack via docker compose (dev/test only)
 docker-compose-spdk:
@@ -248,13 +232,13 @@ docker-compose-spdk:
 	@echo "  sudo modprobe uio_pci_generic"
 	@echo "  sudo modprobe nvme nvme-fabrics nvme-tcp nvme-rdma"
 	@echo ""
-	cd curvine-docker/spdk && docker compose up --build -d
-	@echo "✓ SPDK stack started. Check status with: docker compose -f curvine-docker/spdk/docker-compose.yml ps"
+	cd curvine-docker/deploy/spdk && docker compose up --build -d
+	@echo "✓ SPDK stack started. Check status with: docker compose -f curvine-docker/deploy/spdk/docker-compose.yml ps"
 
 # Stop SPDK target + initiator stack
 docker-compose-spdk-down:
 	@echo "Stopping SPDK target + initiator stack..."
-	cd curvine-docker/spdk && docker compose down
+	cd curvine-docker/deploy/spdk && docker compose down
 	@echo "✓ SPDK stack stopped."
 
 # 10. HDFS-specific builds
