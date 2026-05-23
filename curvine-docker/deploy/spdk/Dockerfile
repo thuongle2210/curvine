@@ -9,13 +9,10 @@
 #   docker build --target spdk-runtime -t spdk-runtime:latest .
 
 # ============================================================
-# Stage 0: Install dependencies & clone SPDK
+# Base image with CDN mirror fix (avoid geolocated mirrorlist issues)
 # ============================================================
-FROM rockylinux:9 AS deps
+FROM rockylinux:9 AS rocky-base
 
-ARG SPDK_VERSION=v25.09
-
-# Mirror fix + EPEL
 RUN for repo in /etc/yum.repos.d/*.repo; do \
         [ -f "$repo" ] || continue; \
         sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
@@ -23,6 +20,13 @@ RUN for repo in /etc/yum.repos.d/*.repo; do \
         sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
         sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
     done
+
+# ============================================================
+# Stage 0: Install dependencies & clone SPDK
+# ============================================================
+FROM rocky-base AS deps
+
+ARG SPDK_VERSION=v25.09
 
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
@@ -79,15 +83,7 @@ RUN ./configure \
 # ============================================================
 # Stage 2: Full runtime for NVMe-oF Target nodes
 # ============================================================
-FROM rockylinux:9 AS spdk-full
-
-RUN for repo in /etc/yum.repos.d/*.repo; do \
-        [ -f "$repo" ] || continue; \
-        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
-        sed -i 's/^metalink=/#metalink=/g' "$repo"; \
-        sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
-        sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
-    done
+FROM rocky-base AS spdk-full
 
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
@@ -112,15 +108,7 @@ EXPOSE 4420
 # ============================================================
 # Stage 3: Minimal runtime for Initiator/Compute nodes
 # ============================================================
-FROM rockylinux:9 AS spdk-runtime
-
-RUN for repo in /etc/yum.repos.d/*.repo; do \
-        [ -f "$repo" ] || continue; \
-        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
-        sed -i 's/^metalink=/#metalink=/g' "$repo"; \
-        sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
-        sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
-    done
+FROM rocky-base AS spdk-runtime
 
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
