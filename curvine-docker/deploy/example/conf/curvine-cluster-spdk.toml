@@ -67,9 +67,9 @@ block_align = 0
 [[worker.spdk_disk.targets]]
 trtype = "tcp"
 adrfam = "ipv4"
-traddr = "storage-target"
+traddr = "target"
 trsvcid = 4420
-subnqn = "nqn.2025-03.io.curvine:cnode1"
+subnqn = "nqn.2026-05.curvine:cnode1"
 hostnqn = ""
 io_queues = 0
 keep_alive_timeout_ms = 0

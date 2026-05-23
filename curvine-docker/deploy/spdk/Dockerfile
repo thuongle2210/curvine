@@ -188,7 +188,7 @@ RUN chmod +x /entrypoint-initiator.sh && \
 
 ENV CURVINE_HOME=/app/curvine
 ENV PATH=$PATH:$CURVINE_HOME/bin
-ENV LD_LIBRARY_PATH="/opt/spdk/lib:/opt/spdk/dpdk/lib:/usr/local/lib64:/usr/local/lib"
+ENV LD_LIBRARY_PATH="/opt/spdk/build/lib:/opt/spdk/dpdk/lib:/usr/local/lib64:/usr/local/lib"
 
 RUN mkdir -p /app/curvine/logs /app/curvine/conf /app/curvine/bin
 

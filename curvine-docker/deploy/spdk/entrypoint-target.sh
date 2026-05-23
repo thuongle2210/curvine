@@ -62,9 +62,9 @@ if [ -n "$CURVINE_CONF_FILE" ] && [ -f "$CURVINE_CONF_FILE" ]; then
     TRANSPORT_MODE=$(grep -A2 '\[\[worker.spdk_disk.targets\]\]' "$CURVINE_CONF_FILE" | grep trtype | head -1 | sed 's/.*= *"\(.*\)"/\1/')
 fi
 
-SUBNQN="${SUBNQN:-${SUBNQN_ENV:-nqn.2025-03.io.curvine:cnode1}}"
-TARGET_PORT="${TARGET_PORT:-${TARGET_PORT_ENV:-4420}}"
-TRANSPORT_MODE="${TRANSPORT_MODE:-${TRANSPORT_MODE_ENV:-tcp}}"
+SUBNQN="${SUBNQN:-nqn.2026-05.curvine:cnode1}"
+TARGET_PORT="${TARGET_PORT:-4420}"
+TRANSPORT_MODE="${TRANSPORT_MODE:-tcp}"
 TARGET_IP="${TARGET_IP:-0.0.0.0}"
 
 export TARGET_IP TARGET_PORT SUBNQN NVME_PCI_ADDR
@@ -142,10 +142,16 @@ else
 fi
 print_success "Namespace added"
 
-# Add listener
-print_info "Adding TCP listener on $TARGET_IP:$TARGET_PORT..."
-"$RPC" nvmf_subsystem_add_listener "$SUBNQN" -t TCP -a "$TARGET_IP" -s "$TARGET_PORT"
-print_success "Listener added"
+# Add listeners matching TRANSPORT_MODE
+if [ "$TRANSPORT_MODE" = "tcp" ] || [ "$TRANSPORT_MODE" = "both" ]; then
+    print_info "Adding TCP listener on $TARGET_IP:$TARGET_PORT..."
+    "$RPC" nvmf_subsystem_add_listener "$SUBNQN" -t TCP -a "$TARGET_IP" -s "$TARGET_PORT"
+fi
+
+if [ "$TRANSPORT_MODE" = "rdma" ] || [ "$TRANSPORT_MODE" = "both" ]; then
+    print_info "Adding RDMA listener on $TARGET_IP:$TARGET_PORT..."
+    "$RPC" nvmf_subsystem_add_listener "$SUBNQN" -t RDMA -a "$TARGET_IP" -s "$TARGET_PORT"
+fi
 
 # Start I/O processing
 print_info "Starting I/O processing..."
