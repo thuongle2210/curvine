@@ -111,6 +111,7 @@ RUN ldconfig && \
     mkdir -p /var/log/spdk /var/run/spdk
 
 ENV SPDK_DIR=/opt/spdk
+ENV LD_LIBRARY_PATH="/opt/spdk/build/lib"
 EXPOSE 4420
 
 # ============================================================

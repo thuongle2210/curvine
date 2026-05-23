@@ -50,23 +50,7 @@ services:
     environment:
       <<: *shared-env
       MEM_SIZE: "1024"
-      NVME_PCI_ADDR: "0000:01:00.0"
-
-  target-2:
-    <<: *target-base
-    hostname: target-2
-    environment:
-      <<: *shared-env
-      MEM_SIZE: "2048"
       NVME_PCI_ADDR: "0000:02:00.0"
-
-  target-3:
-    <<: *target-base
-    hostname: target-3
-    environment:
-      <<: *shared-env
-      MEM_SIZE: "2048"
-      NVME_PCI_ADDR: "0000:03:00.0"
 
   # ============================================================
   # Curvine Master (Metadata Server)
@@ -82,8 +66,6 @@ services:
     restart: unless-stopped
     depends_on:
       - target-1
-      - target-2
-      - target-3
     networks:
       spdk:
 
@@ -95,16 +77,13 @@ services:
       context: ../../..
       dockerfile: curvine-docker/deploy/spdk/Dockerfile
       target: initiator-runtime
-    cap_add:
-      - IPC_LOCK
+    privileged: true
     volumes:
       - /dev/hugepages:/dev/hugepages
       - ${CURVINE_CONF_FILE:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
     depends_on:
       - master
       - target-1
-      - target-2
-      - target-3
     command: ["worker", "start"]
     restart: unless-stopped
     networks:
