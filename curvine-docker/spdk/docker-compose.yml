@@ -6,8 +6,11 @@
 #
 # Prerequisites (run on host before starting):
 #   sudo sysctl -w vm.nr_hugepages=1024
-#   sudo modprobe uio_pci_generic
+#   sudo modprobe vfio-pci
+#   sudo driverctl set-override <NVMe-PCI-ADDR> vfio-pci   # bind NVMe to VFIO for userspace driver
 #   sudo modprobe nvme nvme-fabrics nvme-tcp
+#
+# KVM (Intel): intel_iommu=on in kernel cmdline. Cloud VMs usually have this already.
 #
 # Usage:
 #   cd curvine-docker/spdk
@@ -15,9 +18,24 @@
 #
 # To use a custom config:
 #   CURVINE_TOML=./my-cluster.toml docker compose up --build
-#
-# To override target NVMe PCI address:
-#   NVME_PCI_ADDR=0000:01:00.0 docker compose up --build
+
+x-target-base: &target-base
+  build:
+    context: ../..
+    dockerfile: curvine-docker/deploy/spdk/Dockerfile
+    target: target-runtime
+  cap_add:
+    - IPC_LOCK
+    - SYS_ADMIN
+  volumes:
+    - /dev/vfio:/dev/vfio
+    - /dev/hugepages:/dev/hugepages
+    - ${CURVINE_TOML:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
+  environment:
+    CURVINE_CONF_FILE: /app/curvine/conf/curvine-cluster.toml
+  restart: unless-stopped
+  networks:
+    spdk:
 
 networks:
   spdk:
@@ -25,26 +43,28 @@ networks:
 
 services:
   # ============================================================
-  # SPDK NVMe-oF Target (Storage Node)
+  # SPDK NVMe-oF Targets (Storage Nodes) — one per physical device
   # ============================================================
-  target:
-    build:
-      context: ../..
-      dockerfile: curvine-docker/deploy/spdk/Dockerfile
-      target: target-runtime
-    cap_add:
-      - IPC_LOCK
-      - SYS_ADMIN
-    volumes:
-      - /dev:/dev
-      - /dev/hugepages:/dev/hugepages
-      - ${CURVINE_TOML:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
+  target-1:
+    <<: *target-base
     environment:
-      NVME_PCI_ADDR: "${NVME_PCI_ADDR:-}"
       CURVINE_CONF_FILE: /app/curvine/conf/curvine-cluster.toml
-    restart: unless-stopped
-    networks:
-      spdk:
+      MEM_SIZE: "1024"
+      NVME_PCI_ADDR: "0000:01:00.0"
+
+  target-2:
+    <<: *target-base
+    environment:
+      CURVINE_CONF_FILE: /app/curvine/conf/curvine-cluster.toml
+      MEM_SIZE: "2048"
+      NVME_PCI_ADDR: "0000:02:00.0"
+
+  target-3:
+    <<: *target-base
+    environment:
+      CURVINE_CONF_FILE: /app/curvine/conf/curvine-cluster.toml
+      MEM_SIZE: "2048"
+      NVME_PCI_ADDR: "0000:03:00.0"
 
   # ============================================================
   # Curvine Master (Metadata Server)
@@ -59,7 +79,9 @@ services:
     command: ["master", "start"]
     restart: unless-stopped
     depends_on:
-      - target
+      - target-1
+      - target-2
+      - target-3
     networks:
       spdk:
 
@@ -78,7 +100,9 @@ services:
       - ${CURVINE_TOML:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
     depends_on:
       - master
-      - target
+      - target-1
+      - target-2
+      - target-3
     command: ["worker", "start"]
     restart: unless-stopped
     networks:

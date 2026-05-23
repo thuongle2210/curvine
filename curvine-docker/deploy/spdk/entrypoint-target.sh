@@ -18,15 +18,17 @@
 
 # entrypoint-target.sh — SPDK NVMe-oF target
 #
-# Reads config from curvine-cluster.toml (shared with initiator) or env vars.
-# Starts nvmf_tgt with --wait-for-rpc, runs setup via RPC, then starts I/O.
+# Reads its own identity from curvine-cluster.toml by matching $(hostname -s)
+# against the traddr field in [[worker.spdk_disk.targets]].
+# Then starts nvmf_tgt with --wait-for-rpc, runs setup via RPC, and starts I/O.
 # On SIGTERM, cleans up subsystem and kills nvmf_tgt gracefully.
 #
 # Environment variables (machine-specific, not in TOML):
-#   NVME_PCI_ADDR   — PCI address of NVMe device (optional — creates malloc bdev if empty)
+#   NVME_PCI_ADDR   — PCI address of NVMe device (optional — creates malloc bdev if empty).
+#                     Host must bind the device to vfio-pci before starting the container.
+#                     Example: sudo driverctl set-override <ADDR> vfio-pci
 #   REACTOR_MASK    — CPU core mask (default: 0x3)
 #   MEM_SIZE        — Memory size in MB (default: 1024)
-#   NR_HUGE_PAGES   — Number of huge pages (default: 1024)
 
 set -euo pipefail
 
@@ -48,26 +50,33 @@ print_success() { echo -e "\033[32m[TARGET]\033[0m $1"; }
 print_error()   { echo -e "\033[31m[TARGET]\033[0m $1"; }
 
 # ============================================================
-# Read cluster config from TOML (shared with initiator)
+# Read target identity from TOML, matched by container hostname
 # ============================================================
 CURVINE_CONF_FILE="${CURVINE_CONF_FILE:-}"
+MY_HOSTNAME="$(hostname -s)"
 SUBNQN=""
 TARGET_PORT=""
-TRANSPORT_MODE=""
+TRTYPE=""
 
 if [ -n "$CURVINE_CONF_FILE" ] && [ -f "$CURVINE_CONF_FILE" ]; then
-    print_info "Reading target config from $CURVINE_CONF_FILE"
-    SUBNQN=$(grep -A2 '\[\[worker.spdk_disk.targets\]\]' "$CURVINE_CONF_FILE" | grep subnqn | head -1 | sed 's/.*= *"\(.*\)"/\1/')
-    TARGET_PORT=$(grep -A2 '\[\[worker.spdk_disk.targets\]\]' "$CURVINE_CONF_FILE" | grep trsvcid | head -1 | sed 's/.*= *\([0-9]*\)/\1/')
-    TRANSPORT_MODE=$(grep -A2 '\[\[worker.spdk_disk.targets\]\]' "$CURVINE_CONF_FILE" | grep trtype | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+    print_info "Looking up target config for hostname '$MY_HOSTNAME' in $CURVINE_CONF_FILE"
+    TARGET_BLOCK=$(awk -v RS= -v host="$MY_HOSTNAME" '
+        /spdk_disk\.targets/ && index($0, "traddr = \"" host "\"") { print; exit }
+    ' "$CURVINE_CONF_FILE")
+    if [ -n "$TARGET_BLOCK" ]; then
+        SUBNQN=$(echo "$TARGET_BLOCK" | grep subnqn | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+        TARGET_PORT=$(echo "$TARGET_BLOCK" | grep trsvcid | head -1 | sed 's/.*= *\([0-9]*\)/\1/')
+        TRTYPE=$(echo "$TARGET_BLOCK" | grep trtype | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+        print_info "Matched: SUBNQN=$SUBNQN TRTYPE=$TRTYPE PORT=$TARGET_PORT"
+    else
+        print_info "No TOML block for hostname '$MY_HOSTNAME' — using defaults"
+    fi
 fi
 
-SUBNQN="${SUBNQN:-nqn.2026-05.curvine:cnode1}"
+SUBNQN="${SUBNQN:-nqn.2026-05.curvine:${MY_HOSTNAME}}"
 TARGET_PORT="${TARGET_PORT:-4420}"
-TRANSPORT_MODE="${TRANSPORT_MODE:-tcp}"
+TRTYPE="${TRTYPE:-tcp}"
 TARGET_IP="${TARGET_IP:-0.0.0.0}"
-
-export TARGET_IP TARGET_PORT SUBNQN NVME_PCI_ADDR
 
 # ============================================================
 # Hugepages (host-side, needs privileged or IPC_LOCK)
@@ -116,16 +125,17 @@ else
     print_success "Malloc bdev created as Malloc0"
 fi
 
-# Create transport
-if [ "$TRANSPORT_MODE" = "tcp" ] || [ "$TRANSPORT_MODE" = "both" ]; then
-    print_info "Creating TCP transport..."
-    "$RPC" nvmf_create_transport -t TCP -u 16384 -m 8 -c 8192
-fi
-
-if [ "$TRANSPORT_MODE" = "rdma" ] || [ "$TRANSPORT_MODE" = "both" ]; then
-    print_info "Creating RDMA transport..."
-    "$RPC" nvmf_create_transport -t RDMA -u 16384 -m 8 -c 8192
-fi
+# Create transport matching TRTYPE
+case "$TRTYPE" in
+    tcp)
+        print_info "Creating TCP transport..."
+        "$RPC" nvmf_create_transport -t TCP -u 16384 -m 8 -c 8192
+        ;;
+    rdma)
+        print_info "Creating RDMA transport..."
+        "$RPC" nvmf_create_transport -t RDMA -u 16384 -m 8 -c 8192
+        ;;
+esac
 
 # Create subsystem
 print_info "Creating subsystem $SUBNQN..."
@@ -142,16 +152,17 @@ else
 fi
 print_success "Namespace added"
 
-# Add listeners matching TRANSPORT_MODE
-if [ "$TRANSPORT_MODE" = "tcp" ] || [ "$TRANSPORT_MODE" = "both" ]; then
-    print_info "Adding TCP listener on $TARGET_IP:$TARGET_PORT..."
-    "$RPC" nvmf_subsystem_add_listener "$SUBNQN" -t TCP -a "$TARGET_IP" -s "$TARGET_PORT"
-fi
-
-if [ "$TRANSPORT_MODE" = "rdma" ] || [ "$TRANSPORT_MODE" = "both" ]; then
-    print_info "Adding RDMA listener on $TARGET_IP:$TARGET_PORT..."
-    "$RPC" nvmf_subsystem_add_listener "$SUBNQN" -t RDMA -a "$TARGET_IP" -s "$TARGET_PORT"
-fi
+# Add listener matching TRTYPE
+case "$TRTYPE" in
+    tcp)
+        print_info "Adding TCP listener on $TARGET_IP:$TARGET_PORT..."
+        "$RPC" nvmf_subsystem_add_listener "$SUBNQN" -t TCP -a "$TARGET_IP" -s "$TARGET_PORT"
+        ;;
+    rdma)
+        print_info "Adding RDMA listener on $TARGET_IP:$TARGET_PORT..."
+        "$RPC" nvmf_subsystem_add_listener "$SUBNQN" -t RDMA -a "$TARGET_IP" -s "$TARGET_PORT"
+        ;;
+esac
 
 # Start I/O processing
 print_info "Starting I/O processing..."

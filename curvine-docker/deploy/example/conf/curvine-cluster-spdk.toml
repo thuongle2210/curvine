@@ -63,13 +63,33 @@ poll_interval = 1000
 dma_pool_size = "64MB"
 block_align = 0
 
-# NVMe-oF target — points to storage-target service
+# NVMe-oF targets — trtype/traddr matched by each target's hostname
 [[worker.spdk_disk.targets]]
 trtype = "tcp"
 adrfam = "ipv4"
-traddr = "target"
+traddr = "target-1"
 trsvcid = 4420
 subnqn = "nqn.2026-05.curvine:cnode1"
+hostnqn = ""
+io_queues = 0
+keep_alive_timeout_ms = 0
+
+[[worker.spdk_disk.targets]]
+trtype = "tcp"
+adrfam = "ipv4"
+traddr = "target-2"
+trsvcid = 4420
+subnqn = "nqn.2026-05.curvine:cnode2"
+hostnqn = ""
+io_queues = 0
+keep_alive_timeout_ms = 0
+
+[[worker.spdk_disk.targets]]
+trtype = "tcp"
+adrfam = "ipv4"
+traddr = "target-3"
+trsvcid = 4420
+subnqn = "nqn.2026-05.curvine:cnode3"
 hostnqn = ""
 io_queues = 0
 keep_alive_timeout_ms = 0
