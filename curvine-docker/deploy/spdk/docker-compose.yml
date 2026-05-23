@@ -6,8 +6,7 @@
 #
 # Prerequisites (run on host before starting):
 #   sudo sysctl -w vm.nr_hugepages=1024
-#   sudo modprobe vfio-pci
-#   sudo driverctl set-override <NVMe-PCI-ADDR> vfio-pci   # bind NVMe to VFIO for userspace driver
+#   sudo modprobe uio_pci_generic
 #   sudo modprobe nvme nvme-fabrics nvme-tcp
 #
 # KVM (Intel): intel_iommu=on in kernel cmdline. Cloud VMs usually have this already.
@@ -26,6 +25,7 @@ x-target-base: &target-base
     target: target-runtime
   privileged: true
   volumes:
+    - /sys:/sys:rw
     - /dev/vfio:/dev/vfio
     - /dev/hugepages:/dev/hugepages
   restart: unless-stopped
@@ -48,7 +48,7 @@ services:
       TRTYPE: "tcp"
       TARGET_PORT: "4420"
       MEM_SIZE: "1024"
-      NVME_PCI_ADDR: "0000:02:00.0"
+      NVME_PCI_ADDR: "0000:00:0e.0"
 
   # ============================================================
   # Curvine Master (Metadata Server)

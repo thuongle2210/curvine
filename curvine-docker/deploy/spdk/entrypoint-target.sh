@@ -20,13 +20,13 @@
 #
 # Configures itself from environment variables (set via docker-compose.yml).
 # No cluster TOML parsing — the target is standalone.
-# Starts nvmf_tgt with --wait-for-rpc, runs setup via RPC, and starts I/O.
+# Binds NVMe device to uio_pci_generic, starts nvmf_tgt with --wait-for-rpc,
+# runs setup via RPC, and starts I/O.
 # On SIGTERM, detaches NVMe bdev, deletes subsystem, and kills nvmf_tgt.
 #
 # Environment variables:
 #   NVME_PCI_ADDR   — PCI address of NVMe device (required).
-#                     Host must bind the device to vfio-pci before starting.
-#                     Example: sudo driverctl set-override <ADDR> vfio-pci
+#                     Bound to uio_pci_generic automatically inside the container.
 #   SUBNQN          — NVMe-oF subsystem NQN (default: nqn.2026-05.curvine:target-1)
 #   TRTYPE          — Transport type: tcp or rdma (default: tcp)
 #   TARGET_PORT     — NVMe-oF listener port (default: 4420)
@@ -78,6 +78,25 @@ sysctl -w vm.nr_hugepages="$NR_HUGE_PAGES" || {
 # ============================================================
 # Clean up stale socket from previous run
 rm -f /var/tmp/spdk.sock
+
+# Load uio_pci_generic and bind NVMe device
+modprobe uio_pci_generic 2>/dev/null || true
+if [ -n "$NVME_PCI_ADDR" ]; then
+    CURRENT_DRIVER=$(basename "$(readlink /sys/bus/pci/devices/"$NVME_PCI_ADDR"/driver 2>/dev/null)" 2>/dev/null)
+    if [ "$CURRENT_DRIVER" != "uio_pci_generic" ]; then
+        print_info "Binding $NVME_PCI_ADDR to uio_pci_generic..."
+        [ -n "$CURRENT_DRIVER" ] && echo "$NVME_PCI_ADDR" > /sys/bus/pci/devices/"$NVME_PCI_ADDR"/driver/unbind 2>/dev/null || true
+        echo "uio_pci_generic" > /sys/bus/pci/devices/"$NVME_PCI_ADDR"/driver_override 2>/dev/null || true
+        echo "$NVME_PCI_ADDR" > /sys/bus/pci/drivers/uio_pci_generic/bind 2>/dev/null || {
+            print_error "Failed to bind $NVME_PCI_ADDR to uio_pci_generic"
+            exit 1
+        }
+        echo "" > /sys/bus/pci/devices/"$NVME_PCI_ADDR"/driver_override 2>/dev/null || true
+        print_success "Device $NVME_PCI_ADDR bound to uio_pci_generic"
+    else
+        print_info "Device $NVME_PCI_ADDR already bound to uio_pci_generic"
+    fi
+fi
 
 print_info "Starting nvmf_tgt (reactor_mask=$REACTOR_MASK, mem=${MEM_SIZE}MB)..."
 "$NVMF_TGT" \
@@ -168,7 +187,7 @@ trap cleanup TERM INT
 print_success "SPDK NVMe-oF Target running"
 print_info "  Subsystem: $SUBNQN"
 print_info "  Listener:  $TARGET_IP:$TARGET_PORT"
-print_info "  NVMe:      $NVME_PCI_ADDR"
+print_info "  PCI Addr:   $NVME_PCI_ADDR"
 
 # ============================================================
 # Wait for nvmf_tgt to exit

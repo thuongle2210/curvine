@@ -230,7 +230,7 @@ docker-compose-spdk:
 	@echo "Prerequisites:"
 	@echo "  sudo sysctl -w vm.nr_hugepages=4096"
 	@echo "  sudo modprobe uio_pci_generic"
-	@echo "  sudo modprobe nvme nvme-fabrics nvme-tcp nvme-rdma"
+	@echo "  sudo modprobe nvme nvme-fabrics nvme-tcp"
 	@echo ""
 	cd curvine-docker/deploy/spdk && docker compose up --build -d
 	@echo "✓ SPDK stack started. Check status with: docker compose -f curvine-docker/deploy/spdk/docker-compose.yml ps"
