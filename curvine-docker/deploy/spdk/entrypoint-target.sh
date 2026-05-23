@@ -18,18 +18,22 @@
 
 # entrypoint-target.sh — SPDK NVMe-oF target
 #
-# Reads its own identity from curvine-cluster.toml by matching $(hostname -s)
-# against the traddr field in [[worker.spdk_disk.targets]].
-# Then starts nvmf_tgt with --wait-for-rpc, runs setup via RPC, and starts I/O.
-# On SIGTERM, cleans up subsystem and kills nvmf_tgt gracefully.
+# Configures itself from environment variables (set via docker-compose.yml).
+# No cluster TOML parsing — the target is standalone.
+# Starts nvmf_tgt with --wait-for-rpc, runs setup via RPC, and starts I/O.
+# On SIGTERM, detaches NVMe bdev, deletes subsystem, and kills nvmf_tgt.
 #
-# Environment variables (machine-specific, not in TOML):
-#   NVME_PCI_ADDR   — PCI address of NVMe device (optional — creates malloc bdev if empty).
-#                     Host must bind the device to vfio-pci before starting the container.
+# Environment variables:
+#   NVME_PCI_ADDR   — PCI address of NVMe device (required).
+#                     Host must bind the device to vfio-pci before starting.
 #                     Example: sudo driverctl set-override <ADDR> vfio-pci
+#   SUBNQN          — NVMe-oF subsystem NQN (default: nqn.2026-05.curvine:target-1)
+#   TRTYPE          — Transport type: tcp or rdma (default: tcp)
+#   TARGET_PORT     — NVMe-oF listener port (default: 4420)
 #   REACTOR_MASK    — CPU core mask (default: 0x3)
 #   MEM_SIZE        — Memory size in MB (default: 1024)
 #   NR_HUGE_PAGES   — Number of 2MB hugepages to allocate (default: 1024)
+#   SERIAL          — NVMe subsystem serial number (default: SPDK0001)
 
 set -euo pipefail
 
@@ -51,33 +55,14 @@ print_success() { echo -e "\033[32m[TARGET]\033[0m $1"; }
 print_error()   { echo -e "\033[31m[TARGET]\033[0m $1"; }
 
 # ============================================================
-# Read target identity from TOML, matched by container hostname
+# Target identity — set via environment variables
 # ============================================================
-CURVINE_CONF_FILE="${CURVINE_CONF_FILE:-}"
-MY_HOSTNAME="$(hostname -s)"
-SUBNQN=""
-TARGET_PORT=""
-TRTYPE=""
-
-if [ -n "$CURVINE_CONF_FILE" ] && [ -f "$CURVINE_CONF_FILE" ]; then
-    print_info "Looking up target config for hostname '$MY_HOSTNAME' in $CURVINE_CONF_FILE"
-    TARGET_BLOCK=$(awk -v RS= -v host="$MY_HOSTNAME" '
-        /spdk_disk\.targets/ && index($0, "traddr = \"" host "\"") { print; exit }
-    ' "$CURVINE_CONF_FILE")
-    if [ -n "$TARGET_BLOCK" ]; then
-        SUBNQN=$(echo "$TARGET_BLOCK" | grep subnqn | head -1 | sed 's/.*= *"\(.*\)"/\1/')
-        TARGET_PORT=$(echo "$TARGET_BLOCK" | grep trsvcid | head -1 | sed 's/.*= *\([0-9]*\)/\1/')
-        TRTYPE=$(echo "$TARGET_BLOCK" | grep trtype | head -1 | sed 's/.*= *"\(.*\)"/\1/')
-        print_info "Matched: SUBNQN=$SUBNQN TRTYPE=$TRTYPE PORT=$TARGET_PORT"
-    else
-        print_info "No TOML block for hostname '$MY_HOSTNAME' — using defaults"
-    fi
-fi
-
-SUBNQN="${SUBNQN:-nqn.2026-05.curvine:${MY_HOSTNAME}}"
+SUBNQN="${SUBNQN:-nqn.2026-05.curvine:$(hostname -s)}"
 TARGET_PORT="${TARGET_PORT:-4420}"
 TRTYPE="${TRTYPE:-tcp}"
 TARGET_IP="${TARGET_IP:-0.0.0.0}"
+
+print_info "Config: SUBNQN=$SUBNQN TRTYPE=$TRTYPE PORT=$TARGET_PORT PCI=$NVME_PCI_ADDR"
 
 # ============================================================
 # Hugepages (host-side, needs privileged or IPC_LOCK)
@@ -91,6 +76,9 @@ sysctl -w vm.nr_hugepages="$NR_HUGE_PAGES" || {
 # ============================================================
 # Start nvmf_tgt with --wait-for-rpc
 # ============================================================
+# Clean up stale socket from previous run
+rm -f /var/tmp/spdk.sock
+
 print_info "Starting nvmf_tgt (reactor_mask=$REACTOR_MASK, mem=${MEM_SIZE}MB)..."
 "$NVMF_TGT" \
     -m "$REACTOR_MASK" \
@@ -112,19 +100,8 @@ fi
 print_success "nvmf_tgt RPC socket ready"
 
 # ============================================================
-# Setup via RPC
+# Phase 1: Pre-framework configuration (works with --wait-for-rpc)
 # ============================================================
-
-# Attach NVMe controller or create malloc bdev
-if [ -n "$NVME_PCI_ADDR" ]; then
-    print_info "Attaching NVMe controller at $NVME_PCI_ADDR..."
-    "$RPC" bdev_nvme_attach_controller -b Nvme0 -t PCIe -a "$NVME_PCI_ADDR"
-    print_success "NVMe controller attached as Nvme0"
-else
-    print_info "No NVME_PCI_ADDR — creating malloc bdev (128 MB)..."
-    "$RPC" bdev_malloc_create -b Malloc0 128 4096
-    print_success "Malloc bdev created as Malloc0"
-fi
 
 # Create transport matching TRTYPE
 case "$TRTYPE" in
@@ -143,16 +120,6 @@ print_info "Creating subsystem $SUBNQN..."
 "$RPC" nvmf_create_subsystem "$SUBNQN" -a -s "$SERIAL"
 print_success "Subsystem created"
 
-# Add namespace
-if [ -n "$NVME_PCI_ADDR" ]; then
-    print_info "Adding Nvme0n1 to subsystem..."
-    "$RPC" nvmf_subsystem_add_ns "$SUBNQN" Nvme0n1
-else
-    print_info "Adding Malloc0 to subsystem..."
-    "$RPC" nvmf_subsystem_add_ns "$SUBNQN" Malloc0
-fi
-print_success "Namespace added"
-
 # Add listener matching TRTYPE
 case "$TRTYPE" in
     tcp)
@@ -165,16 +132,31 @@ case "$TRTYPE" in
         ;;
 esac
 
-# Start I/O processing
+# ============================================================
+# Phase 2: Start framework (initializes bdev modules)
+# ============================================================
 print_info "Starting I/O processing..."
 "$RPC" framework_start_init
 print_success "framework_start_init complete"
+
+# ============================================================
+# Phase 3: Post-framework configuration (bdevs + namespaces)
+# ============================================================
+
+print_info "Attaching NVMe controller at $NVME_PCI_ADDR..."
+"$RPC" bdev_nvme_attach_controller -b Nvme0 -t PCIe -a "$NVME_PCI_ADDR"
+print_success "NVMe controller attached as Nvme0"
+
+print_info "Adding Nvme0n1 to subsystem..."
+"$RPC" nvmf_subsystem_add_ns "$SUBNQN" Nvme0n1
+print_success "Namespace added"
 
 # ============================================================
 # Graceful shutdown handler
 # ============================================================
 cleanup() {
     print_info "Shutting down..."
+    "$RPC" bdev_nvme_detach_controller Nvme0 2>/dev/null || true
     "$RPC" nvmf_delete_subsystem "$SUBNQN" 2>/dev/null || true
     kill -TERM "$NVMF_PID" 2>/dev/null || true
     wait "$NVMF_PID" 2>/dev/null || true
@@ -188,7 +170,7 @@ trap cleanup TERM INT
 print_success "SPDK NVMe-oF Target running"
 print_info "  Subsystem: $SUBNQN"
 print_info "  Listener:  $TARGET_IP:$TARGET_PORT"
-print_info "  NVMe:      ${NVME_PCI_ADDR:-Malloc0 (test)}"
+print_info "  NVMe:      $NVME_PCI_ADDR"
 
 # ============================================================
 # Wait for nvmf_tgt to exit

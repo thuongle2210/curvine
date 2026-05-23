@@ -19,9 +19,6 @@
 # To use a custom config:
 #   CURVINE_CONF_FILE=./my-cluster.toml docker compose up --build
 
-x-shared-env: &shared-env
-  CURVINE_CONF_FILE: /app/curvine/conf/curvine-cluster.toml
-
 x-target-base: &target-base
   build:
     context: ../../..
@@ -31,7 +28,6 @@ x-target-base: &target-base
   volumes:
     - /dev/vfio:/dev/vfio
     - /dev/hugepages:/dev/hugepages
-    - ${CURVINE_CONF_FILE:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
   restart: unless-stopped
   networks:
     spdk:
@@ -48,7 +44,9 @@ services:
     <<: *target-base
     hostname: target-1
     environment:
-      <<: *shared-env
+      SUBNQN: "nqn.2026-05.curvine:cnode1"
+      TRTYPE: "tcp"
+      TARGET_PORT: "4420"
       MEM_SIZE: "1024"
       NVME_PCI_ADDR: "0000:02:00.0"
 
