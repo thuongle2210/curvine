@@ -106,7 +106,6 @@ RUN dnf install -y epel-release && \
 
 COPY --from=build /opt/spdk /opt/spdk
 COPY --from=build /usr/local/lib64/libisal* /usr/local/lib64/
-COPY --from=build /usr/lib64/libisal* /usr/lib64/ 2>/dev/null || true
 
 RUN ldconfig && \
     mkdir -p /var/log/spdk /var/run/spdk
@@ -142,7 +141,6 @@ COPY --from=build /opt/spdk/scripts /opt/spdk/scripts
 COPY --from=build /opt/spdk/include /opt/spdk/include
 RUN cp /opt/spdk/build/bin/spdk_bdev /opt/spdk/build/bin/ 2>/dev/null || true
 COPY --from=build /usr/local/lib64/libisal* /usr/local/lib64/
-COPY --from=build /usr/lib64/libisal* /usr/lib64/ 2>/dev/null || true
 RUN ldconfig
 
 ENV SPDK_DIR=/opt/spdk
