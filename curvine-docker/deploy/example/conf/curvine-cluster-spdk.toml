@@ -2,7 +2,7 @@
 #
 # Service names resolve via Docker DNS on the "spdk" bridge network.
 # Place this file at curvine-docker/deploy/curvine-cluster.toml
-# or set: CURVINE_TOML=./example/conf/curvine-cluster-spdk.toml
+# or set: CURVINE_CONF_FILE=./example/conf/curvine-cluster-spdk.toml
 # Then:   docker compose up --build
 
 format_master = false
