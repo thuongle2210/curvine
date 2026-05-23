@@ -1,81 +1,67 @@
 # Curvine Full Stack (Master + SPDK NVMe-oF Target + Initiator)
 #
-# Dev/test only — runs master, SPDK target (storage node), and initiator (compute node)
-# on the same machine. In production, these are deployed on separate physical machines.
+# All cluster config comes from curvine-cluster.toml.
+# Set CURVINE_TOML to your config path, or place it at ./curvine-cluster.toml.
+# Service names resolve via Docker DNS on the "spdk" bridge network.
 #
-# Prerequisites (run on host before docker-compose up):
-#   sudo sysctl -w vm.nr_hugepages=4096   (1024 for Vagrant VMs)
+# Prerequisites (run on host before starting):
+#   sudo sysctl -w vm.nr_hugepages=1024
 #   sudo modprobe uio_pci_generic
-#   sudo modprobe nvme nvme-fabrics nvme-tcp nvme-rdma
+#   sudo modprobe nvme nvme-fabrics nvme-tcp
 #
 # Usage:
 #   cd curvine-docker/spdk
 #   docker compose up --build
 #
-# To override target NVMe PCI address (default: VirtualBox NVMe):
+# To use a custom config:
+#   CURVINE_TOML=./my-cluster.toml docker compose up --build
+#
+# To override target NVMe PCI address:
 #   NVME_PCI_ADDR=0000:01:00.0 docker compose up --build
 
-x-network: &spdk-net
-  name: spdk-net
-  driver: bridge
-
-x-env: &common-env
-  CURVINE_CONF_FILE: "/app/curvine/conf/curvine-cluster.toml"
-  SPDK_DIR: "/opt/spdk"
-  LD_LIBRARY_PATH: "/opt/spdk/lib:/opt/spdk/dpdk/lib"
-  TARGET_IP: "${TARGET_IP:-}"
-  TARGET_PORT: "${TARGET_PORT:-4420}"
-  SUBNQN: "${SUBNQN:-nqn.2025-03.io.curvine:cnode1}"
-
-x-cap: &common-cap
-  cap_add:
-    - SYS_ADMIN
-    - IPC_LOCK
+networks:
+  spdk:
+    name: spdk
 
 services:
-  # ============================================================
-  # Curvine Master (Metadata Server)
-  # ============================================================
-  master:
-    build:
-      context: ../..
-      dockerfile: curvine-docker/spdk/Dockerfile.initiator
-    container_name: spdk-master
-    privileged: true
-    network_mode: "host"
-    environment:
-      <<: *common-env
-    <<: *common-cap
-    volumes:
-      - /dev/hugepages:/dev/hugepages
-    command: ["master", "start"]
-    restart: "no"
-
   # ============================================================
   # SPDK NVMe-oF Target (Storage Node)
   # ============================================================
   target:
     build:
       context: ../..
-      dockerfile: curvine-docker/spdk/Dockerfile.target
-    container_name: spdk-target
-    privileged: true
-    network_mode: "host"
-    environment:
-      NVME_PCI_ADDR: "${NVME_PCI_ADDR:-0000:00:0e.0}"
-      SERIAL: "${SERIAL:-SPDK0001}"
-      TRANSPORT_MODE: "${TRANSPORT_MODE:-tcp}"
-      REACTOR_MASK: "${REACTOR_MASK:-0x3}"
-      SHM_ID: "${SHM_ID:--1}"
-      MEM_SIZE: "${MEM_SIZE:-1024}"
-      NR_HUGE_PAGES: "${NR_HUGE_PAGES:-1024}"
-      <<: *common-env
-    <<: *common-cap
+      dockerfile: curvine-docker/deploy/spdk/Dockerfile
+      target: target-runtime
+    cap_add:
+      - IPC_LOCK
+      - SYS_ADMIN
     volumes:
       - /dev:/dev
-      - /lib/modules:/lib/modules
       - /dev/hugepages:/dev/hugepages
-    restart: "no"
+      - ${CURVINE_TOML:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
+    environment:
+      NVME_PCI_ADDR: "${NVME_PCI_ADDR:-}"
+      CURVINE_CONF_FILE: /app/curvine/conf/curvine-cluster.toml
+    restart: unless-stopped
+    networks:
+      spdk:
+
+  # ============================================================
+  # Curvine Master (Metadata Server)
+  # ============================================================
+  master:
+    build:
+      context: ../..
+      dockerfile: curvine-docker/deploy/spdk/Dockerfile
+      target: initiator-runtime
+    volumes:
+      - ${CURVINE_TOML:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
+    command: ["master", "start"]
+    restart: unless-stopped
+    depends_on:
+      - target
+    networks:
+      spdk:
 
   # ============================================================
   # SPDK NVMe-oF Initiator (Compute Node — Curvine Worker)
@@ -83,19 +69,17 @@ services:
   initiator:
     build:
       context: ../..
-      dockerfile: curvine-docker/spdk/Dockerfile.initiator
-    container_name: spdk-initiator
-    privileged: true
-    network_mode: "host"
-    environment:
-      TRANSPORT_TYPE: "${TRANSPORT_TYPE:-tcp}"
-      <<: *common-env
-    <<: *common-cap
+      dockerfile: curvine-docker/deploy/spdk/Dockerfile
+      target: initiator-runtime
+    cap_add:
+      - IPC_LOCK
     volumes:
       - /dev/hugepages:/dev/hugepages
-      - /lib/modules:/lib/modules
+      - ${CURVINE_TOML:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
     depends_on:
       - master
       - target
     command: ["worker", "start"]
-    restart: "no"
+    restart: unless-stopped
+    networks:
+      spdk:
