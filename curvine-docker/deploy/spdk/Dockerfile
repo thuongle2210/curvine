@@ -27,6 +27,8 @@ RUN for repo in /etc/yum.repos.d/*.repo; do \
 FROM rocky-base AS deps
 
 ARG SPDK_VERSION=v25.09
+ARG NASM_VERSION=2.16.03
+ARG ISAL_VERSION=v2.31.1
 
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
@@ -43,17 +45,17 @@ RUN scripts/pkgdep.sh --rdma && \
     dnf clean all
 
 # Build nasm from source (needed by ISA-L, not available in EPEL 9 for aarch64)
-RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.gz | \
+RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
     tar -xz -C /tmp && \
-    cd /tmp/nasm-2.16.03 && \
+    cd /tmp/nasm-$NASM_VERSION && \
     ./configure && \
     make -j$(nproc) && \
     make install && \
-    rm -rf /tmp/nasm-2.16.03
+    rm -rf /tmp/nasm-$NASM_VERSION
 
 # Build isa-l from source (needed by SPDK, not available in all Rocky 9 arches)
 RUN cd /tmp && \
-    git clone --depth 1 --branch v2.31.1 https://github.com/intel/isa-l.git isa-l-src && \
+    git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src && \
     cd isa-l-src && \
     ./autogen.sh && \
     ./configure && \

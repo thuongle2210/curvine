@@ -26,6 +26,8 @@ set -euo pipefail
 
 # Defaults
 SPDK_TAG="v25.09"
+NASM_VERSION="2.16.03"
+ISAL_VERSION="v2.31.1"
 PREFIX="/opt/spdk"
 TARGET_ARCH="native"
 JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -196,12 +198,12 @@ fi
 # --- Step 4.1: Build nasm from source (not available in EPEL 9 for aarch64) ---
 print_info "Building nasm from source..."
 if ! command -v nasm &>/dev/null; then
-    wget -qO- https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.gz | tar -xz -C /tmp
-    cd /tmp/nasm-2.16.03
+    wget -qO- https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | tar -xz -C /tmp
+    cd /tmp/nasm-$NASM_VERSION
     ./configure
     make -j "${JOBS}"
     make install
-    rm -rf /tmp/nasm-2.16.03
+    rm -rf /tmp/nasm-$NASM_VERSION
     print_success "nasm built and installed"
 else
     print_info "nasm already installed, skipping"
@@ -212,7 +214,7 @@ if ! pkg-config --exists libisal 2>/dev/null; then
     print_info "Building isa-l from source..."
     dnf install -y autoconf automake libtool
     cd /tmp
-    git clone --depth 1 --branch v2.31.1 https://github.com/intel/isa-l.git isa-l-src
+    git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src
     cd isa-l-src
     ./autogen.sh
     ./configure
