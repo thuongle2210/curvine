@@ -24,6 +24,7 @@ log = { level = "info", log_dir = "./logs", file_name = "master.log" }
 # Journal (Raft consensus)
 # ============================================================
 [journal]
+hostname = "master"
 rpc_port = 8996
 journal_addrs = [
     { id = 1, hostname = "master", port = 8996 }
