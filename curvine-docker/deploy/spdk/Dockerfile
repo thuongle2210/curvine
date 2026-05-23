@@ -68,10 +68,6 @@ WORKDIR /spdk
 
 RUN ./configure \
     --disable-tests \
-    --with-vhost \
-    --with-virtio \
-    --with-sma \
-    --with-vfio-user \
     --with-rdma \
     --target-arch=native \
     --with-shared && \
@@ -97,7 +93,7 @@ RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
     libaio numactl-libs libuuid ncurses-libs openssl-libs \
-    python3 python3-pip \
+    python3 \
     kmod pciutils procps-ng \
     libffi \
     rdma-core libibverbs librdmacm \
@@ -110,7 +106,7 @@ RUN ldconfig && \
     mkdir -p /var/log/spdk /var/run/spdk
 
 ENV SPDK_DIR=/opt/spdk
-ENV LD_LIBRARY_PATH="/opt/spdk/build/lib:/opt/spdk/dpdk/build/lib:/opt/spdk/isa-l/.libs:/opt/spdk/isa-l-crypto/.libs:/opt/spdk/build/libvfio-user/usr/local/lib"
+ENV LD_LIBRARY_PATH="/opt/spdk/build/lib:/opt/spdk/dpdk/build/lib:/opt/spdk/isa-l/.libs:/opt/spdk/isa-l-crypto/.libs"
 EXPOSE 4420
 
 # ============================================================
