@@ -105,13 +105,12 @@ RUN dnf install -y epel-release && \
     && dnf clean all
 
 COPY --from=build /opt/spdk /opt/spdk
-COPY --from=build /usr/local/lib64/libisal* /usr/local/lib64/
 
 RUN ldconfig && \
     mkdir -p /var/log/spdk /var/run/spdk
 
 ENV SPDK_DIR=/opt/spdk
-ENV LD_LIBRARY_PATH="/opt/spdk/build/lib:/opt/spdk/dpdk/build/lib:/usr/local/lib64"
+ENV LD_LIBRARY_PATH="/opt/spdk/build/lib:/opt/spdk/dpdk/build/lib:/opt/spdk/isa-l/.libs:/opt/spdk/isa-l-crypto/.libs:/opt/spdk/build/libvfio-user/usr/local/lib"
 EXPOSE 4420
 
 # ============================================================
@@ -140,7 +139,6 @@ COPY --from=build /opt/spdk/build/lib/*.so* /opt/spdk/build/lib/
 COPY --from=build /opt/spdk/scripts /opt/spdk/scripts
 COPY --from=build /opt/spdk/include /opt/spdk/include
 RUN cp /opt/spdk/build/bin/spdk_bdev /opt/spdk/build/bin/ 2>/dev/null || true
-COPY --from=build /usr/local/lib64/libisal* /usr/local/lib64/
 RUN ldconfig
 
 ENV SPDK_DIR=/opt/spdk
