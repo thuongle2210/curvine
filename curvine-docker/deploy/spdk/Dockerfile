@@ -75,6 +75,7 @@ WORKDIR /spdk
 RUN ./configure \
     --disable-tests \
     --with-rdma \
+    --without-vfio-user \
     --target-arch=native \
     --with-shared && \
     make -j$(nproc) && \
