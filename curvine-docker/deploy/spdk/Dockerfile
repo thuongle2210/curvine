@@ -138,6 +138,8 @@ RUN dnf install -y epel-release && \
 COPY --from=build /opt/spdk/build/lib/*.so* /opt/spdk/build/lib/
 COPY --from=build /opt/spdk/scripts /opt/spdk/scripts
 COPY --from=build /opt/spdk/include /opt/spdk/include
+COPY --from=build /opt/spdk/isa-l/.libs/*.so* /opt/spdk/isa-l/.libs/
+COPY --from=build /opt/spdk/isa-l-crypto/.libs/*.so* /opt/spdk/isa-l-crypto/.libs/
 RUN cp /opt/spdk/build/bin/spdk_bdev /opt/spdk/build/bin/ 2>/dev/null || true
 RUN ldconfig
 
@@ -187,7 +189,7 @@ RUN chmod +x /entrypoint-initiator.sh && \
 
 ENV CURVINE_HOME=/app/curvine
 ENV PATH=$PATH:$CURVINE_HOME/bin
-ENV LD_LIBRARY_PATH="/opt/spdk/build/lib:/opt/spdk/dpdk/lib:/usr/local/lib64:/usr/local/lib"
+ENV LD_LIBRARY_PATH="/opt/spdk/build/lib:/opt/spdk/dpdk/build/lib:/opt/spdk/isa-l/.libs:/opt/spdk/isa-l-crypto/.libs:/usr/local/lib64:/usr/local/lib"
 
 RUN mkdir -p /app/curvine/logs /app/curvine/conf /app/curvine/bin
 
