@@ -13,7 +13,7 @@
 # KVM (Intel): intel_iommu=on in kernel cmdline. Cloud VMs usually have this already.
 #
 # Usage:
-#   cd curvine-docker/spdk
+#   cd curvine-docker/deploy/spdk
 #   docker compose up --build
 #
 # To use a custom config:
@@ -24,7 +24,7 @@ x-shared-env: &shared-env
 
 x-target-base: &target-base
   build:
-    context: ../..
+    context: ../../..
     dockerfile: curvine-docker/deploy/spdk/Dockerfile
     target: target-runtime
   cap_add:
