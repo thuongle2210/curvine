@@ -27,8 +27,7 @@ x-target-base: &target-base
   volumes:
     - /sys:/sys:rw
     - /lib/modules:/lib/modules:ro
-    - /dev/vfio:/dev/vfio
-    - /dev/hugepages:/dev/hugepages
+    - /dev:/dev
   restart: unless-stopped
   networks:
     spdk:
