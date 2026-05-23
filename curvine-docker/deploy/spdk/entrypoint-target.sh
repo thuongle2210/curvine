@@ -100,7 +100,14 @@ fi
 print_success "nvmf_tgt RPC socket ready"
 
 # ============================================================
-# Phase 1: Pre-framework configuration (works with --wait-for-rpc)
+# Framework init must come first (req'd by all RPCs in v25.09)
+# ============================================================
+print_info "Starting I/O processing..."
+"$RPC" framework_start_init
+print_success "framework_start_init complete"
+
+# ============================================================
+# Configure transport, subsystem, listener, bdev, namespace
 # ============================================================
 
 # Create transport matching TRTYPE
@@ -132,21 +139,12 @@ case "$TRTYPE" in
         ;;
 esac
 
-# ============================================================
-# Phase 2: Start framework (initializes bdev modules)
-# ============================================================
-print_info "Starting I/O processing..."
-"$RPC" framework_start_init
-print_success "framework_start_init complete"
-
-# ============================================================
-# Phase 3: Post-framework configuration (bdevs + namespaces)
-# ============================================================
-
+# Attach NVMe controller
 print_info "Attaching NVMe controller at $NVME_PCI_ADDR..."
 "$RPC" bdev_nvme_attach_controller -b Nvme0 -t PCIe -a "$NVME_PCI_ADDR"
 print_success "NVMe controller attached as Nvme0"
 
+# Add namespace to subsystem
 print_info "Adding Nvme0n1 to subsystem..."
 "$RPC" nvmf_subsystem_add_ns "$SUBNQN" Nvme0n1
 print_success "Namespace added"
