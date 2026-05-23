@@ -39,6 +39,9 @@ web_port = 9000
 dir_reserved = "10GB"
 data_dir = [
     "[SSD]/data/data1",
+    "[spdk_disk]/data/spdk-1",
+    "[spdk_disk]/data/spdk-2",
+    "[spdk_disk]/data/spdk-3",
 ]
 log = { level = "info", log_dir = "./logs", file_name = "worker.log" }
 

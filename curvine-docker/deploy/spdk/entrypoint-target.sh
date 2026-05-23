@@ -29,6 +29,7 @@
 #                     Example: sudo driverctl set-override <ADDR> vfio-pci
 #   REACTOR_MASK    — CPU core mask (default: 0x3)
 #   MEM_SIZE        — Memory size in MB (default: 1024)
+#   NR_HUGE_PAGES   — Number of 2MB hugepages to allocate (default: 1024)
 
 set -euo pipefail
 
