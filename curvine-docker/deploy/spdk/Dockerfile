@@ -142,6 +142,18 @@ COPY --from=spdk-full /opt/spdk /opt/spdk
 ENV SPDK_DIR=/opt/spdk
 ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
 
+# Install system libs needed for linking curvine-server with SPDK
+RUN dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y numactl-devel libuuid-devel rdma-core-devel \
+    libibverbs-devel librdmacm-devel && \
+    dnf clean all
+
+# Make ISA-L shared libs findable by the linker
+RUN cp /opt/spdk/isa-l/.libs/*.so* /usr/lib64/ && \
+    cp /opt/spdk/isa-l-crypto/.libs/*.so* /usr/lib64/ && \
+    ldconfig
+
 COPY . /workspace/
 WORKDIR /workspace
 

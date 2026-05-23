@@ -1,0 +1,109 @@
+format_master = true
+format_worker = true
+
+[master]
+hostname = "localhost"
+rpc_port = 8995
+web_port = 9000
+meta_dir = "testing/meta"
+io_threads = 32
+worker_threads = 32
+log = { level = "info", log_dir = "stdout", file_name = "master.log" }
+
+[master.rocksdb]
+base_dir = "testing/db/master"
+data_dir = "testing/db/master/data"
+disable_wal = true
+
+[journal]
+enable = true
+group_name = "raft-group"
+hostname = "localhost"
+rpc_port = 8996
+journal_dir = "testing/journal"
+io_threads = 8
+worker_threads = 8
+
+[[journal.journal_addrs]]
+id = 1
+hostname = "localhost"
+port = 8996
+
+[journal.rocksdb]
+base_dir = "testing/db/journal"
+data_dir = "testing/db/journal/data"
+disable_wal = false
+
+[worker]
+hostname = "localhost"
+rpc_port = 8997
+web_port = 9001
+dir_reserved = "0"
+data_dir = [
+    "[SPDK_DISK]testing/data",
+]
+io_threads = 2
+worker_threads = 2
+async_enabled = true
+log = { level = "debug", log_dir = "stdout", file_name = "worker.log" }
+enable_s3_gateway = false
+
+[worker.spdk_disk]
+enabled = true
+app_name = "curvine"
+hugepage = "900MB"
+reactor_mask = "0x30"
+shm_id = -1
+mem_channel = 0
+io_queue_depth = 128
+io_queue_requests = 512
+io_timeout = "30s"
+io_retry_count = 4
+keep_alive_timeout = "10000s"
+poll_interval_ms = 100
+dma_pool_size = "64MB"
+block_align = 0
+dma_buf_size = "4MB"
+pipeline_depth = 4
+
+[[worker.spdk_disk.targets]]
+trtype = "tcp"
+adrfam = "ipv4"
+traddr = "10.0.2.15"
+trsvcid = 4420
+subnqn = "nqn.2025-03.io.curvine:cnode1"
+keep_alive_timeout_ms = 10000000
+io_queues = 10240
+
+[client]
+hostname = "localhost"
+io_threads = 16
+worker_threads = 16
+short_circuit = false
+write_chunk_size = "4MB"
+block_size = "128MB"
+
+[[client.master_addrs]]
+hostname = "localhost"
+port = 8995
+
+[fuse]
+io_threads = 32
+worker_threads = 32
+mnt_path = "/curvine-fuse"
+
+[log]
+level = "debug"
+log_dir = "stdout"
+file_name = "curvine.log"
+
+[s3_gateway]
+listen = "0.0.0.0:9900"
+region = "us-east-1"
+put_temp_dir = "/tmp/curvine-temp"
+put_memory_buffer_threshold = 1048576
+put_max_memory_buffer = 16777216
+get_chunk_size_mb = 1.0
+
+[cli]
+log = { level = "warn", log_dir = "stdout", file_name = "cli.log" }
