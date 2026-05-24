@@ -1,22 +1,14 @@
 # Curvine Full Stack (Master + Worker + SPDK NVMe-oF Target)
 #
-# Target uses spdk/Dockerfile. Master and Worker use Dockerfile_rocky9
-# (same image built for K8s deployment, with SPDK initiator support).
-#
-# Set CURVINE_CONF_FILE to your config path, or place it at ./curvine-cluster.toml.
-# Service names resolve via Docker DNS on the "spdk" bridge network.
-#
 # Prerequisites (run on host before starting):
 #   sudo sysctl -w vm.nr_hugepages=1024
 #   sudo modprobe uio_pci_generic
 #   sudo modprobe nvme nvme-fabrics nvme-tcp
 #
-# Usage:
-#   cd curvine-docker/deploy/spdk
-#   docker compose up --build
+# make docker-compose-spdk
 #
 # To use a custom config:
-#   CURVINE_CONF_FILE=./my-cluster.toml docker compose up --build
+#   CURVINE_CONF_FILE=./my-cluster.toml make docker-compose-spdk
 
 x-target-base: &target-base
   build:
@@ -51,7 +43,7 @@ services:
       NVME_PCI_ADDR: "${NVME_PCI_ADDR?Set NVME_PCI_ADDR to your NVMe device PCI address}"
 
   # ============================================================
-  # Curvine Master (Metadata Server) — from K8s deploy image
+  # Curvine Master
   # ============================================================
   master:
     build:
@@ -67,7 +59,7 @@ services:
       spdk:
 
   # ============================================================
-  # Curvine Worker (Compute Node — NVMe-oF Initiator) from K8s deploy image
+  # Curvine Worker
   # ============================================================
   worker:
     build:

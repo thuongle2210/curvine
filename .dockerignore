@@ -1,6 +1,5 @@
 curvine-libsdk/java/target/
 **/target/
-**/node_modules/
 # Keep .git directory for version info during build
 # **/.git/
 **/.staging/

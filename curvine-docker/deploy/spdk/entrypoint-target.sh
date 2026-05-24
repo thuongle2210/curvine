@@ -3,10 +3,6 @@
 # entrypoint-target.sh — SPDK NVMe-oF target
 #
 # Configures itself from environment variables (set via docker-compose.yml).
-# No cluster TOML parsing — the target is standalone.
-# Binds NVMe device to uio_pci_generic, starts nvmf_tgt with --wait-for-rpc,
-# runs setup via RPC, and starts I/O.
-# On SIGTERM, detaches NVMe bdev, deletes subsystem, and kills nvmf_tgt.
 #
 # Environment variables:
 #   NVME_PCI_ADDR   — PCI address of NVMe device (required).
@@ -103,7 +99,7 @@ fi
 print_success "nvmf_tgt RPC socket ready"
 
 # ============================================================
-# Framework init must come first (req'd by all RPCs in v25.09)
+# Framework init
 # ============================================================
 print_info "Starting I/O processing..."
 "$RPC" framework_start_init

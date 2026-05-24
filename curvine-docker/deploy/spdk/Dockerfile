@@ -1,11 +1,7 @@
 # SPDK Target Image
 #
-# Builds SPDK with RDMA and produces a runtime image for NVMe-oF target nodes.
-# The initiator (worker) build has moved to Dockerfile_rocky9.
+# Builds SPDK with TCP&RDMA and produces a runtime image for NVMe-oF target nodes.
 #
-# Usage:
-#   docker build --target target-runtime -t curvine-spdk-target:latest .
-
 # ============================================================
 # Base image with CDN mirror fix (avoid geolocated mirrorlist issues)
 # ============================================================
@@ -34,12 +30,12 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf install -y git && \
     dnf clean all
 
-# Clone SPDK with full tag history (needed for `git describe --tags` version detection)
+# Clone SPDK
 RUN git clone --branch "$SPDK_VERSION" https://github.com/spdk/spdk.git /spdk
 WORKDIR /spdk
 RUN git submodule update --init --depth 1
 
-# Install SPDK build deps via pkgdep.sh (devel repo disabled — not needed for ./configure && make)
+# Install SPDK build deps
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf config-manager --set-disabled devel 2>/dev/null || true && \
     scripts/pkgdep.sh --rdma && \

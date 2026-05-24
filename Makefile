@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-build-k8s docker-compose-spdk all dist dist-only
+.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-compose-spdk all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -42,7 +42,6 @@ help:
 	@echo ""
 	@echo "SPDK NVMe-oF (Storage Performance Development Kit):"
 	@echo "  make docker-build-spdk-target    - Build SPDK NVMe-oF target Docker image"
-	@echo "  make docker-build-k8s           - Build K8s deploy image with SPDK initiator support"
 	@echo "  make docker-compose-spdk         - Start SPDK target + initiator stack (dev/test)"
 	@echo "  make docker-compose-spdk-down    - Stop SPDK target + initiator stack"
 
@@ -207,17 +206,6 @@ docker-build-spdk-target:
 
 
 
-# Build K8s deploy image with SPDK initiator support (self-contained build)
-.PHONY: docker-build-k8s
-docker-build-k8s:
-	@echo "Building K8s deploy image with SPDK initiator support..."
-	docker build \
-		--shm-size=2g \
-		-f curvine-docker/deploy/Dockerfile_rocky9 \
-		-t curvine-k8s:latest \
-		.
-	@echo "✓ K8s deploy image built: curvine-k8s:latest"
-
 # Start SPDK target + initiator stack via docker compose (dev/test only)
 docker-compose-spdk:
 	@echo "Starting SPDK target + initiator stack (dev/test)..."
@@ -246,10 +234,10 @@ build-hdfs: check-env
 	@echo "Building Curvine with HDFS support..."
 	$(SHELL_CMD) build/build.sh --ufs opendal-hdfs --ufs opendal-webhdfs $(ARGS)
 
-# 8. All in one
+# 11. All in one
 all: build
 
-# 9. Distribution packaging
+# 12. Distribution packaging
 dist: all
 	@$(MAKE) dist-only
 
