@@ -2,7 +2,6 @@
 
 # entrypoint-target.sh — SPDK NVMe-oF target
 #
-#
 # Environment variables:
 #   NVME_PCI_ADDR   — PCI address of NVMe device (required).
 #                     Bound to uio_pci_generic automatically inside the container.
