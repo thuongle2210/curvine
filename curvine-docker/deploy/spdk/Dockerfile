@@ -28,7 +28,8 @@ ARG SPDK_VERSION=v25.09
 ARG NASM_VERSION=2.16.03
 ARG ISAL_VERSION=v2.31.1
 
-RUN dnf install -y epel-release && \
+RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
+    dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y git && \
     dnf clean all
@@ -39,7 +40,8 @@ WORKDIR /spdk
 RUN git submodule update --init --depth 1
 
 # Install SPDK build deps via pkgdep.sh (devel repo disabled — not needed for ./configure && make)
-RUN dnf config-manager --set-disabled devel 2>/dev/null || true && \
+RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
+    dnf config-manager --set-disabled devel 2>/dev/null || true && \
     scripts/pkgdep.sh --rdma && \
     dnf clean all
 
@@ -87,7 +89,8 @@ RUN ./configure \
 # ============================================================
 FROM rocky-base AS spdk-full
 
-RUN dnf install -y epel-release && \
+RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
+    dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
     libaio numactl-libs libuuid ncurses-libs openssl-libs \

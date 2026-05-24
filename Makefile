@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-build-k8s docker-compose-spdk build-spdk all dist dist-only
+.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-build-k8s docker-compose-spdk all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -41,13 +41,11 @@ help:
 	@echo "  make curvine-csi                 - Build curvine-csi Docker image"
 	@echo ""
 	@echo "SPDK NVMe-oF (Storage Performance Development Kit):"
-	@echo "  make build-spdk                  - Build SPDK from source (default: v25.09, TCP+RDMA)"
 	@echo "  make docker-build-spdk-target    - Build SPDK NVMe-oF target Docker image"
 	@echo "  make docker-build-k8s           - Build K8s deploy image with SPDK initiator support"
 	@echo "  make docker-compose-spdk         - Start SPDK target + initiator stack (dev/test)"
 	@echo "  make docker-compose-spdk-down    - Stop SPDK target + initiator stack"
-	@echo "  make docker-compose-k8s          - Start Curvine K8s-style cluster + SPDK target"
-	@echo "  make docker-compose-k8s-down     - Stop K8s-style cluster"
+
 	@echo ""
 	@echo "Other:"
 	@echo "  make cargo ARGS='<args>'         - Run arbitrary cargo commands"
@@ -75,7 +73,7 @@ help:
 	@echo "  make curvine-csi                            - Build curvine-csi Docker image"
 	@echo "  make docker-build-fluid                  - Build unified Fluid Docker image"
 	@echo "  make docker-build-spdk-target             - Build SPDK NVMe-oF target image"
-	@echo "  make docker-build-spdk-initiator          - Build SPDK initiator image"
+
 	@echo "  make docker-compose-spdk                  - Start SPDK dev/test stack"
 
 # 1. Check build environment dependencies
@@ -195,13 +193,7 @@ curvine-csi-quick-push: curvine-csi-quick
 	@echo "✓ Quick-built image pushed successfully: curvineio/curvine-csi:latest"
 
 # 9. SPDK NVMe-oF builds
-.PHONY: build-spdk docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down docker-compose-k8s docker-compose-k8s-down
-
-# Build SPDK from source (TCP + RDMA)
-build-spdk:
-	@echo "Building SPDK from source..."
-	$(SHELL_CMD) build/build-spdk.sh --rdma --prefix build/spdk/release $(ARGS)
-	@echo "✓ SPDK built and installed to build/spdk/release"
+.PHONY: docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down
 
 # Build SPDK NVMe-oF target Docker image
 docker-build-spdk-target:
@@ -245,24 +237,6 @@ docker-compose-spdk-down:
 	@echo "Stopping SPDK target + initiator stack..."
 	cd curvine-docker/deploy/spdk && docker compose down
 	@echo "✓ SPDK stack stopped."
-
-# Start K8s-style cluster + SPDK target (prerequisite: curvine-spdk-build)
-docker-compose-k8s:
-	@echo "Starting Curvine K8s-style cluster + SPDK target..."
-	@echo ""
-	@echo "SPDK build is self-contained in Dockerfile_rocky9 (inline stages)."
-	@echo ""
-	@echo "Hugepages recommended (run on host):"
-	@echo "  sudo sysctl -w vm.nr_hugepages=1024"
-	@echo ""
-	cd curvine-docker/deploy && docker compose -f docker-compose-k8s.yml up --build -d
-	@echo "✓ K8s-style cluster started."
-
-# Stop K8s-style cluster + SPDK target
-docker-compose-k8s-down:
-	@echo "Stopping K8s-style cluster + SPDK target..."
-	cd curvine-docker/deploy && docker compose -f docker-compose-k8s.yml down
-	@echo "✓ K8s-style cluster stopped."
 
 # 10. HDFS-specific builds
 .PHONY: build-hdfs build-webhdfs setup-hdfs
