@@ -2,7 +2,6 @@
 
 # entrypoint-target.sh — SPDK NVMe-oF target
 #
-# Configures itself from environment variables (set via docker-compose.yml).
 #
 # Environment variables:
 #   NVME_PCI_ADDR   — PCI address of NVMe device (required).
