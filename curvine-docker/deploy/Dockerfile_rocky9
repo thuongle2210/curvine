@@ -1,7 +1,3 @@
-# ============================================================
-# SPDK build stages for NVMe-oF initiator support
-# ============================================================
-
 FROM rockylinux:9 AS spdk-rocky-base
 
 RUN for repo in /etc/yum.repos.d/*.repo; do \

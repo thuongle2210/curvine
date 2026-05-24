@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-compose-spdk all dist dist-only
+.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -203,8 +203,6 @@ docker-build-spdk-target:
 		-t curvine-spdk-target:latest \
 		curvine-docker/deploy/spdk/../../..
 	@echo "✓ SPDK target image built: curvine-spdk-target:latest"
-
-
 
 # Start SPDK target + initiator stack via docker compose (dev/test only)
 docker-compose-spdk:
