@@ -1,0 +1,88 @@
+# Curvine K8s-Style Cluster + SPDK NVMe-oF Target
+#
+# Uses deploy/Dockerfile_rocky9 for master/worker (same image used in K8s)
+# and spdk/Dockerfile for the NVMe-oF target.
+#
+# Prerequisites:
+#   - sudo sysctl -w vm.nr_hugepages=1024
+#   - sudo modprobe uio_pci_generic
+#   - sudo modprobe nvme nvme-fabrics nvme-tcp
+#   - docker build -t curvine-spdk-build:latest -f spdk/Dockerfile.initiator spdk/
+#   - Set NVME_PCI_ADDR to your NVMe device PCI address (e.g. 0000:00:0e.0)
+#
+# Usage:
+#   NVME_PCI_ADDR=0000:00:0e.0 \
+#     docker compose -f docker-compose-k8s.yml up --build
+#
+# With custom config:
+#   CURVINE_CONF_FILE=./example/conf/curvine-cluster-spdk.toml \
+#     docker compose -f docker-compose-k8s.yml up --build
+
+x-curvine-common: &curvine-common
+  build:
+    context: ../..
+    dockerfile: curvine-docker/deploy/Dockerfile_rocky9
+  volumes:
+    - ${CURVINE_CONF_FILE:-./example/conf/curvine-cluster-spdk.toml}:/app/curvine/conf/curvine-cluster.toml
+    - /dev/hugepages:/dev/hugepages
+  restart: unless-stopped
+  networks:
+    curvine:
+
+services:
+  # ============================================================
+  # SPDK NVMe-oF Target (Storage Node)
+  # ============================================================
+  target-1:
+    build:
+      context: ../..
+      dockerfile: curvine-docker/deploy/spdk/Dockerfile
+      target: target-runtime
+    privileged: true
+    hostname: target-1
+    volumes:
+      - /sys:/sys:rw
+      - /lib/modules:/lib/modules:ro
+      - /dev:/dev
+    environment:
+      SUBNQN: "nqn.2026-05.curvine:cnode1"
+      TRTYPE: "tcp"
+      TARGET_PORT: "4420"
+      MEM_SIZE: "1024"
+      NVME_PCI_ADDR: "${NVME_PCI_ADDR?Set NVME_PCI_ADDR to your NVMe device PCI address}"
+    restart: unless-stopped
+    networks:
+      curvine:
+
+  # ============================================================
+  # Curvine Master (Metadata Server)
+  # ============================================================
+  master:
+    <<: *curvine-common
+    hostname: master
+    command: ["master", "start"]
+    ports:
+      - "8995:8995"
+      - "8996:8996"
+      - "9000:9000"
+    depends_on:
+      - target-1
+
+  # ============================================================
+  # Curvine Worker (Compute Node — NVMe-oF Initiator)
+  # ============================================================
+  worker:
+    <<: *curvine-common
+    hostname: worker
+    privileged: true
+    command: ["worker", "start"]
+    ports:
+      - "8997:8997"
+      - "9001:9001"
+    depends_on:
+      - master
+      - target-1
+
+networks:
+  curvine:
+    name: curvine

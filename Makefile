@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-build-spdk-initiator docker-compose-spdk build-spdk all dist dist-only
+.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-build-spdk-initiator docker-build-spdk-build docker-build-k8s docker-compose-spdk build-spdk all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -44,8 +44,12 @@ help:
 	@echo "  make build-spdk                  - Build SPDK from source (default: v25.09, TCP+RDMA)"
 	@echo "  make docker-build-spdk-target    - Build SPDK NVMe-oF target Docker image"
 	@echo "  make docker-build-spdk-initiator - Build Curvine SPDK initiator Docker image"
+	@echo "  make docker-build-spdk-build    - Build SPDK build image (static libs + headers)"
+	@echo "  make docker-build-k8s           - Build K8s deploy image with SPDK initiator support"
 	@echo "  make docker-compose-spdk         - Start SPDK target + initiator stack (dev/test)"
 	@echo "  make docker-compose-spdk-down    - Stop SPDK target + initiator stack"
+	@echo "  make docker-compose-k8s          - Start Curvine K8s-style cluster + SPDK target"
+	@echo "  make docker-compose-k8s-down     - Stop K8s-style cluster"
 	@echo ""
 	@echo "Other:"
 	@echo "  make cargo ARGS='<args>'         - Run arbitrary cargo commands"
@@ -193,7 +197,7 @@ curvine-csi-quick-push: curvine-csi-quick
 	@echo "✓ Quick-built image pushed successfully: curvineio/curvine-csi:latest"
 
 # 9. SPDK NVMe-oF builds
-.PHONY: build-spdk docker-build-spdk-target docker-build-spdk-initiator docker-compose-spdk docker-compose-spdk-down
+.PHONY: build-spdk docker-build-spdk-target docker-build-spdk-initiator docker-compose-spdk docker-compose-spdk-down docker-compose-k8s docker-compose-k8s-down
 
 # Build SPDK from source (TCP + RDMA)
 build-spdk:
@@ -221,6 +225,27 @@ docker-build-spdk-initiator:
 		curvine-docker/deploy/spdk/../../..
 	@echo "✓ SPDK initiator image built: curvine-spdk-initiator:latest"
 
+# Build SPDK build image (static libs + headers for Dockerfile_rocky9)
+.PHONY: docker-build-spdk-build
+docker-build-spdk-build:
+	@echo "Building SPDK build image..."
+	docker build \
+		-f curvine-docker/deploy/spdk/Dockerfile.initiator \
+		-t curvine-spdk-build:latest \
+		curvine-docker/deploy/spdk
+	@echo "✓ SPDK build image built: curvine-spdk-build:latest"
+
+# Build K8s deploy image with SPDK initiator support (depends on SPDK build)
+.PHONY: docker-build-k8s
+docker-build-k8s: docker-build-spdk-build
+	@echo "Building K8s deploy image with SPDK initiator support..."
+	docker build \
+		--shm-size=2g \
+		-f curvine-docker/deploy/Dockerfile_rocky9 \
+		-t curvine-k8s:latest \
+		.
+	@echo "✓ K8s deploy image built: curvine-k8s:latest"
+
 # Start SPDK target + initiator stack via docker compose (dev/test only)
 docker-compose-spdk:
 	@echo "Starting SPDK target + initiator stack (dev/test)..."
@@ -240,6 +265,25 @@ docker-compose-spdk-down:
 	@echo "Stopping SPDK target + initiator stack..."
 	cd curvine-docker/deploy/spdk && docker compose down
 	@echo "✓ SPDK stack stopped."
+
+# Start K8s-style cluster + SPDK target (prerequisite: curvine-spdk-build)
+docker-compose-k8s:
+	@echo "Starting Curvine K8s-style cluster + SPDK target..."
+	@echo ""
+	@echo "Prerequisite: docker-build-spdk-build"
+	@echo "  Run 'make docker-build-spdk-build' first to build the SPDK initiator image."
+	@echo ""
+	@echo "Hugepages recommended (run on host):"
+	@echo "  sudo sysctl -w vm.nr_hugepages=1024"
+	@echo ""
+	cd curvine-docker/deploy && docker compose -f docker-compose-k8s.yml up --build -d
+	@echo "✓ K8s-style cluster started."
+
+# Stop K8s-style cluster + SPDK target
+docker-compose-k8s-down:
+	@echo "Stopping K8s-style cluster + SPDK target..."
+	cd curvine-docker/deploy && docker compose -f docker-compose-k8s.yml down
+	@echo "✓ K8s-style cluster stopped."
 
 # 10. HDFS-specific builds
 .PHONY: build-hdfs build-webhdfs setup-hdfs

@@ -22,6 +22,20 @@ ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
 COPY . /workspace/
 WORKDIR /workspace
 
+# 5.5. Copy SPDK build artifacts for NVMe-oF initiator support
+COPY --from=curvine-spdk-build:latest /opt/spdk /opt/spdk
+ENV SPDK_DIR=/opt/spdk
+ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
+
+# Install SPDK linking dependencies (static .a libs)
+RUN dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y numactl-devel libuuid-devel rdma-core-devel \
+    libibverbs-devel librdmacm-devel && \
+    cp /opt/spdk/isa-l/.libs/*.so* /usr/lib64/ && \
+    cp /opt/spdk/isa-l-crypto/.libs/*.so* /usr/lib64/ && \
+    ldconfig
+
 # 6. Pre-install WebUI dependencies and fix vue-cli-service module resolution
 RUN if [ -d "/workspace/curvine-web/webui" ]; then \
         echo "Pre-installing WebUI dependencies..."; \
@@ -54,8 +68,8 @@ RUN echo "Building Curvine from source..." && \
     # Build with retry mechanism
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'; then \
-            echo "✓ Build succeeded with 'make all --skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'" && \
+        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs --spdk-rdma'; then \
+            echo "✓ Build succeeded with 'make all --skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs --spdk-rdma'" && \
             break; \
         else \
             echo "✗ Build attempt $attempt failed" && \
@@ -93,16 +107,16 @@ RUN mkdir -p /build-output && \
     echo "  conf/: $(ls -1 /build-output/conf 2>/dev/null | wc -l) files"
 
 # Runtime stage
-FROM rockylinux:9
+FROM rockylinux:9 AS runtime
 
-# Use official CDN mirrors instead of unreliable community mirrors
+# [TEST B] Use default mirrorlist instead of CDN
 RUN for repo in /etc/yum.repos.d/*.repo; do \
-        [ -f "$repo" ] || continue; \
-        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
-        sed -i 's/^metalink=/#metalink=/g' "$repo"; \
-        sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
-        sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
-    done
+         [ -f "$repo" ] || continue; \
+         sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
+         sed -i 's/^metalink=/#metalink=/g' "$repo"; \
+         sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
+         sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
+done
 
 RUN dnf install -y --allowerasing \
     fuse3 \
@@ -110,8 +124,20 @@ RUN dnf install -y --allowerasing \
     zlib \
     libstdc++ \
     python3 \
+    libaio \
+    numactl-libs \
+    libuuid \
+    openssl-libs \
+    rdma-core \
+    libibverbs \
+    librdmacm \
+    nvme-cli \
     && dnf clean all \
     && rm -rf /var/cache/dnf/*
+
+# Copy ISA-L shared libs for SPDK initiator (built from source, not in EPEL)
+COPY --from=curvine-spdk-build:latest /usr/lib64/libisal* /usr/lib64/
+RUN ldconfig
 
 # Copy JindoSDK from builder stage for OSS-HDFS support
 COPY --from=builder /opt/jindosdk /opt/jindosdk

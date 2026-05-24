@@ -1,0 +1,89 @@
+# SPDK Initiator Build Image
+#
+# Produces a reusable image with SPDK static libs + headers for building
+# curvine-server with NVMe-oF initiator support, plus runtime system deps.
+#
+# Usage:
+#   docker build -t curvine-spdk-build:latest -f Dockerfile.initiator .
+#
+# Then in Dockerfile_rocky9:
+#   COPY --from=curvine-spdk-build:latest /opt/spdk /opt/spdk
+#   COPY --from=curvine-spdk-build:latest /usr/lib64/libisal* /usr/lib64/
+
+FROM rockylinux:9 AS rocky-base
+
+RUN for repo in /etc/yum.repos.d/*.repo; do \
+        [ -f "$repo" ] || continue; \
+        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
+        sed -i 's/^metalink=/#metalink=/g' "$repo"; \
+        sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
+        sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
+    done
+
+FROM rocky-base AS deps
+
+ARG SPDK_VERSION=v25.09
+ARG NASM_VERSION=2.16.03
+ARG ISAL_VERSION=v2.31.1
+
+RUN dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y git && \
+    dnf clean all
+
+RUN git clone --branch "$SPDK_VERSION" https://github.com/spdk/spdk.git /spdk
+WORKDIR /spdk
+RUN git submodule update --init --depth 1
+
+RUN scripts/pkgdep.sh --rdma && \
+    dnf clean all
+
+RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
+    tar -xz -C /tmp && \
+    cd /tmp/nasm-$NASM_VERSION && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    rm -rf /tmp/nasm-$NASM_VERSION
+
+RUN cd /tmp && \
+    git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src && \
+    cd isa-l-src && \
+    ./autogen.sh && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd / && rm -rf /tmp/isa-l-src
+
+FROM deps AS build
+
+WORKDIR /spdk
+
+RUN ./configure \
+    --disable-tests \
+    --with-rdma \
+    --without-vfio-user \
+    --target-arch=native \
+    --with-shared && \
+    make -j$(nproc) && \
+    mkdir -p /opt/spdk && \
+    cp -r ./* /opt/spdk/ && \
+    ldconfig
+
+FROM rockylinux:9
+
+RUN dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y \
+    libaio numactl-libs libuuid openssl-libs \
+    rdma-core libibverbs librdmacm \
+    fuse3 procps-ng nvme-cli \
+    && dnf clean all
+
+COPY --from=build /opt/spdk /opt/spdk
+RUN cp /opt/spdk/isa-l/.libs/*.so* /usr/lib64/ && \
+    cp /opt/spdk/isa-l-crypto/.libs/*.so* /usr/lib64/ && \
+    ldconfig
+
+ENV SPDK_DIR=/opt/spdk
