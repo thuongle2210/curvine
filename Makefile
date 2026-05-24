@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-build-spdk-initiator docker-build-spdk-build docker-build-k8s docker-compose-spdk build-spdk all dist dist-only
+.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid docker-build-spdk-target docker-build-k8s docker-compose-spdk build-spdk all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -43,8 +43,6 @@ help:
 	@echo "SPDK NVMe-oF (Storage Performance Development Kit):"
 	@echo "  make build-spdk                  - Build SPDK from source (default: v25.09, TCP+RDMA)"
 	@echo "  make docker-build-spdk-target    - Build SPDK NVMe-oF target Docker image"
-	@echo "  make docker-build-spdk-initiator - Build Curvine SPDK initiator Docker image"
-	@echo "  make docker-build-spdk-build    - Build SPDK build image (static libs + headers)"
 	@echo "  make docker-build-k8s           - Build K8s deploy image with SPDK initiator support"
 	@echo "  make docker-compose-spdk         - Start SPDK target + initiator stack (dev/test)"
 	@echo "  make docker-compose-spdk-down    - Stop SPDK target + initiator stack"
@@ -197,7 +195,7 @@ curvine-csi-quick-push: curvine-csi-quick
 	@echo "✓ Quick-built image pushed successfully: curvineio/curvine-csi:latest"
 
 # 9. SPDK NVMe-oF builds
-.PHONY: build-spdk docker-build-spdk-target docker-build-spdk-initiator docker-compose-spdk docker-compose-spdk-down docker-compose-k8s docker-compose-k8s-down
+.PHONY: build-spdk docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down docker-compose-k8s docker-compose-k8s-down
 
 # Build SPDK from source (TCP + RDMA)
 build-spdk:
@@ -215,29 +213,11 @@ docker-build-spdk-target:
 		curvine-docker/deploy/spdk/../../..
 	@echo "✓ SPDK target image built: curvine-spdk-target:latest"
 
-# Build Curvine SPDK initiator Docker image
-docker-build-spdk-initiator:
-	@echo "Building Curvine SPDK initiator Docker image..."
-	docker build \
-		--target initiator-runtime \
-		-f curvine-docker/deploy/spdk/Dockerfile \
-		-t curvine-spdk-initiator:latest \
-		curvine-docker/deploy/spdk/../../..
-	@echo "✓ SPDK initiator image built: curvine-spdk-initiator:latest"
 
-# Build SPDK build image (static libs + headers for Dockerfile_rocky9)
-.PHONY: docker-build-spdk-build
-docker-build-spdk-build:
-	@echo "Building SPDK build image..."
-	docker build \
-		-f curvine-docker/deploy/spdk/Dockerfile.initiator \
-		-t curvine-spdk-build:latest \
-		curvine-docker/deploy/spdk
-	@echo "✓ SPDK build image built: curvine-spdk-build:latest"
 
-# Build K8s deploy image with SPDK initiator support (depends on SPDK build)
+# Build K8s deploy image with SPDK initiator support (self-contained build)
 .PHONY: docker-build-k8s
-docker-build-k8s: docker-build-spdk-build
+docker-build-k8s:
 	@echo "Building K8s deploy image with SPDK initiator support..."
 	docker build \
 		--shm-size=2g \
@@ -270,8 +250,7 @@ docker-compose-spdk-down:
 docker-compose-k8s:
 	@echo "Starting Curvine K8s-style cluster + SPDK target..."
 	@echo ""
-	@echo "Prerequisite: docker-build-spdk-build"
-	@echo "  Run 'make docker-build-spdk-build' first to build the SPDK initiator image."
+	@echo "SPDK build is self-contained in Dockerfile_rocky9 (inline stages)."
 	@echo ""
 	@echo "Hugepages recommended (run on host):"
 	@echo "  sudo sysctl -w vm.nr_hugepages=1024"

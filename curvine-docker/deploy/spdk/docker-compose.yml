@@ -1,6 +1,8 @@
-# Curvine Full Stack (Master + SPDK NVMe-oF Target + Initiator)
+# Curvine Full Stack (Master + Worker + SPDK NVMe-oF Target)
 #
-# All cluster config comes from curvine-cluster.toml.
+# Target uses spdk/Dockerfile. Master and Worker use Dockerfile_rocky9
+# (same image built for K8s deployment, with SPDK initiator support).
+#
 # Set CURVINE_CONF_FILE to your config path, or place it at ./curvine-cluster.toml.
 # Service names resolve via Docker DNS on the "spdk" bridge network.
 #
@@ -8,8 +10,6 @@
 #   sudo sysctl -w vm.nr_hugepages=1024
 #   sudo modprobe uio_pci_generic
 #   sudo modprobe nvme nvme-fabrics nvme-tcp
-#
-# KVM (Intel): intel_iommu=on in kernel cmdline. Cloud VMs usually have this already.
 #
 # Usage:
 #   cd curvine-docker/deploy/spdk
@@ -48,16 +48,15 @@ services:
       TRTYPE: "tcp"
       TARGET_PORT: "4420"
       MEM_SIZE: "1024"
-      NVME_PCI_ADDR: "0000:00:0e.0"
+      NVME_PCI_ADDR: "${NVME_PCI_ADDR?Set NVME_PCI_ADDR to your NVMe device PCI address}"
 
   # ============================================================
-  # Curvine Master (Metadata Server)
+  # Curvine Master (Metadata Server) — from K8s deploy image
   # ============================================================
   master:
     build:
       context: ../../..
-      dockerfile: curvine-docker/deploy/spdk/Dockerfile
-      target: initiator-runtime
+      dockerfile: curvine-docker/deploy/Dockerfile_rocky9
     volumes:
       - ${CURVINE_CONF_FILE:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
     command: ["master", "start"]
@@ -68,13 +67,12 @@ services:
       spdk:
 
   # ============================================================
-  # SPDK NVMe-oF Initiator (Compute Node — Curvine Worker)
+  # Curvine Worker (Compute Node — NVMe-oF Initiator) from K8s deploy image
   # ============================================================
-  initiator:
+  worker:
     build:
       context: ../../..
-      dockerfile: curvine-docker/deploy/spdk/Dockerfile
-      target: initiator-runtime
+      dockerfile: curvine-docker/deploy/Dockerfile_rocky9
     privileged: true
     volumes:
       - /dev/hugepages:/dev/hugepages
