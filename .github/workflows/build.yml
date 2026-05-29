@@ -120,7 +120,21 @@ jobs:
           # Clean all temporary files
           rm -rf target/release/incremental || true
           rm -rf target/release/.fingerprint || true
+          rm -rf target/debug/incremental || true
           find target -name "*.d" -delete || true
+          
+          # Prune stale build artifacts and keep only the most recent build output per crate
+          for prefix in librocksdb-sys aws-lc-sys; do
+            count=$(ls -1dt "target/debug/build/${prefix}"* 2>/dev/null | wc -l)
+            if [ "$count" -gt 1 ]; then
+              ls -1dt "target/debug/build/${prefix}"* 2>/dev/null | tail -n +2 | xargs rm -rf
+            fi
+          done
+          
+          # Remove stale .rlib duplicates
+          for crate in librocksdb_sys lance curvine_server curvine_client; do
+            ls -1t target/debug/deps/lib${crate}-*.rlib 2>/dev/null | tail -n +2 | xargs rm -f
+          done
           
           # Clean cargo cache
           rm -rf ~/.cargo/registry/cache || true
