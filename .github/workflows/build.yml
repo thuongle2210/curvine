@@ -60,7 +60,20 @@ jobs:
           cache-all-crates: false
           # Cache target/ so release build and smoke tests can reuse artifacts (much faster on cache hit)
           cache-targets: true
-      
+
+      - name: Setup zstd and decompress build cache
+        run: |
+          if [ -f target/debug/build.tar.zst ]; then
+            command -v zstd &>/dev/null || dnf install -y -q zstd || true
+            if command -v zstd &>/dev/null; then
+              echo "Decompressing cached build artifacts..."
+              cd target/debug && tar -I zstd -xf build.tar.zst && rm -f build.tar.zst
+              echo "Done"
+            fi
+          fi
+          echo "Disk usage after decompress:"
+          df -h
+
       - name: Run fmt
         run: |
           echo "Running fmt check (fastest, no compilation needed)"
@@ -123,15 +136,14 @@ jobs:
           rm -rf target/debug/incremental || true
           find target -name "*.d" -delete || true
           
-          # Prune stale build artifacts and keep only the most recent build output per crate
-          for prefix in librocksdb-sys aws-lc-sys; do
-            count=$(ls -1dt "target/debug/build/${prefix}"* 2>/dev/null | wc -l)
-            if [ "$count" -gt 1 ]; then
-              ls -1dt "target/debug/build/${prefix}"* 2>/dev/null | tail -n +2 | xargs rm -rf
+          # Compress native build artifacts
+          if [ -d target/debug/build ]; then
+            if command -v zstd &>/dev/null || dnf install -y -q zstd &>/dev/null; then
+              cd target/debug && tar -I 'zstd -3' -cf build.tar.zst build/ && rm -rf build/
             fi
-          done
+          fi
           
-          # Remove stale .rlib duplicates
+          # Remove stale compiled artifacts (keep newest per crate)
           for crate in librocksdb_sys lance curvine_server curvine_client; do
             ls -1t target/debug/deps/lib${crate}-*.rlib 2>/dev/null | tail -n +2 | xargs rm -f
           done
