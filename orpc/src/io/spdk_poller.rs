@@ -299,7 +299,7 @@ impl SpdkPoller {
 
                 // Force-complete stranded I/Os on failed qpairs
                 for key in &failed_qpairs {
-                    Self::force_complete_qpair(*key, &mut dead_qpairs);
+                    Self::force_complete_qpair(*key, &mut dead_qpairs, true);
                 }
                 if !failed_qpairs.is_empty() {
                     error!(
@@ -395,7 +395,7 @@ impl SpdkPoller {
 
                         // Force-complete stranded I/Os on failed qpairs
                         for key in &failed_qpairs {
-                            Self::force_complete_qpair(*key, &mut dead_qpairs);
+                            Self::force_complete_qpair(*key, &mut dead_qpairs, true);
                         }
                         if !failed_qpairs.is_empty() {
                             error!(
@@ -433,7 +433,10 @@ impl SpdkPoller {
         if let IoOp::UnregisterQpair { qpair, ack } = &req.op {
             active_qpairs.retain(|&qp| qp != *qpair);
             let key = *qpair as usize;
-            dead_qpairs.remove(&key);
+            // Reclaim outstanding CallbackCtx before dropping QpairState.
+            // No-op on normal path (pending empty), reclaims on timeout path.
+            Self::force_complete_qpair(key, dead_qpairs, false);
+            // force_complete_qpair does dead_qpairs.remove internally
             let _ = ack.send(());
         }
     }
@@ -552,9 +555,15 @@ impl SpdkPoller {
 
     /// Force-complete all outstanding I/Os on a failed qpair using the
     /// per-qpair pending Vec, then mark the qpair dead so future submissions fail fast.
-    fn force_complete_qpair(key: usize, dead_qpairs: &mut HashMap<usize, Box<QpairState>>) {
+    fn force_complete_qpair(
+        key: usize,
+        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
+        set_dead: bool,
+    ) {
         if let Some(qs) = dead_qpairs.get_mut(&key) {
-            qs.dead.store(true, Ordering::Release);
+            if set_dead {
+                qs.dead.store(true, Ordering::Release);
+            }
             let pending = std::mem::take(&mut qs.pending);
             let count = pending.len();
             for cb_ptr in &pending {

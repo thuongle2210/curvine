@@ -697,6 +697,7 @@ impl Drop for SpdkBdev {
         };
         let deadline = std::time::Instant::now() + max_wait;
         let mut logged = false;
+        let mut timed_out = false;
         loop {
             let count = self.inflight.load(std::sync::atomic::Ordering::Acquire);
             if count == 0 {
@@ -705,15 +706,14 @@ impl Drop for SpdkBdev {
             if std::time::Instant::now() >= deadline {
                 error!(
                     "SpdkBdev '{}': {} in-flight I/O(s) still pending after {}s. \
-                         Leaking DMA buffers to prevent use-after-free.",
+                         Leaking DMA buffers and C qpair to prevent use-after-free.",
                     self.name,
                     count,
                     max_wait.as_secs()
                 );
-                // Poison pointers so DmaBuf::drop is a no-op.
+                timed_out = true;
                 self.read_buf.ptr = std::ptr::null_mut();
                 self.write_buf.ptr = std::ptr::null_mut();
-                // TODO: leak qpair and handle on timeout because reusing a qpair with orphaned callbacks causes use after free.
                 break;
             }
             if !logged {
@@ -726,28 +726,50 @@ impl Drop for SpdkBdev {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        // Return qpair to pool and release handle.
-        if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
-            // Unregister qpair from poller before returning it to pool to avoid use-after-free
-            let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
-            if unregistered {
-                env.release_qpair(self.ctrlr, self.io_channel.qpair);
-            } else {
-                error!(
-                    "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
-                    self.name
-                );
+        if timed_out {
+            // Timeout path: unregister from poller (triggers force_complete_qpair
+            // in handle_unregister, reclaiming all CallbackCtx). Skip release_qpair
+            // to prevent the C qpair from being reused — NVMe commands may still be
+            // in flight on the fabric, and DMA completions into freed CQ memory would
+            // cause C-level corruption. The C qpair object leaks until SPDK controller
+            // detach or process exit.
+            if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
+                if !env.unregister_qpair_from_poller(self.io_channel.qpair) {
+                    error!(
+                        "SpdkBdev '{}': qpair not unregistered after timeout; \
+                         CallbackCtx may leak in addition to C qpair",
+                        self.name
+                    );
+                }
+                env.release_handle();
             }
-            env.release_handle();
+            error!(
+                "SpdkBdev '{}': closed with timeout — leaked C qpair {:p} and DMA buffers",
+                self.name, self.io_channel.qpair
+            );
         } else {
-            unsafe {
-                crate::io::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair);
+            // Normal path — all I/O drained, safe to return qpair to pool.
+            if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
+                let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
+                if unregistered {
+                    env.release_qpair(self.ctrlr, self.io_channel.qpair);
+                } else {
+                    error!(
+                        "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
+                        self.name
+                    );
+                }
+                env.release_handle();
+            } else {
+                unsafe {
+                    crate::io::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair);
+                }
             }
+            debug!(
+                "SpdkBdev '{}' closed (qpair returned to pool, DMA buffers freed)",
+                self.name
+            );
         }
-        debug!(
-            "SpdkBdev '{}' closed (qpair returned to pool, DMA buffers freed)",
-            self.name
-        );
     }
 }
 
