@@ -531,6 +531,8 @@ impl SpdkBdev {
             qpair_dead: self.io_channel.qpair_dead.clone(),
         };
         if self.io_channel.poller_tx.send(req).is_err() {
+            self.inflight
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
             return err_box!("SPDK poller thread is gone");
         }
         if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
@@ -727,24 +729,49 @@ impl Drop for SpdkBdev {
         }
 
         if timed_out {
-            // Timeout path: unregister from poller (triggers force_complete_qpair
-            // in handle_unregister, reclaiming all CallbackCtx). Skip release_qpair
-            // to prevent the C qpair from being reused — NVMe commands may still be
-            // in flight on the fabric, and DMA completions into freed CQ memory would
-            // cause C-level corruption. The C qpair object leaks until SPDK controller
-            // detach or process exit.
+            // Timeout path: keep the qpair on the poller (do NOT unregister) so
+            // outstanding NVMe commands can complete naturally or the qpair fails
+            // via keep-alive poll. The C qpair itself is intentionally leaked since
+            // NVMe commands may still be in flight on the fabric and DMA completions
+            // into freed CQ memory would cause C-level corruption.
+            // DMA buffers are registered as zombie DMA on the poller, which frees
+            // them when all operations complete or the qpair is detected as failed.
             if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
-                if !env.unregister_qpair_from_poller(self.io_channel.qpair) {
+                // Extract DMA buffer pointers and nullify to prevent DmaBuf::drop
+                // from calling spdk_dma_free (poller now owns this responsibility).
+                let read_buf_ptr = self.read_buf.ptr;
+                let write_buf_ptr = self.write_buf.ptr;
+                self.read_buf.ptr = std::ptr::null_mut();
+                self.write_buf.ptr = std::ptr::null_mut();
+
+                // Register zombie DMA — poller takes ownership, frees when safe.
+                use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
+                let req = IoRequest {
+                    op: IoOp::RegisterZombieDma {
+                        qpair: self.io_channel.qpair,
+                        read_buf: read_buf_ptr,
+                        write_buf: write_buf_ptr,
+                    },
+                    completion: IoCompletion::new(),
+                    bdev_inflight: std::sync::Arc::new(
+                        std::sync::atomic::AtomicUsize::new(0),
+                    ),
+                    qpair_dead: std::sync::Arc::new(AtomicBool::new(false)),
+                };
+                if self.io_channel.poller_tx.send(req).is_err() {
                     error!(
-                        "SpdkBdev '{}': qpair not unregistered after timeout; \
-                         CallbackCtx may leak in addition to C qpair",
+                        "SpdkBdev '{}': failed to register zombie DMA on poller, \
+                         DMA buffers may leak",
                         self.name
                     );
+                } else if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
+                    let _ = self.io_channel.eventfd.write(1);
                 }
+
                 env.release_handle();
             }
             error!(
-                "SpdkBdev '{}': closed with timeout — leaked C qpair {:p} and DMA buffers",
+                "SpdkBdev '{}': closed with timeout — leaked C qpair {:p}",
                 self.name, self.io_channel.qpair
             );
         } else {

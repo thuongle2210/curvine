@@ -46,6 +46,13 @@ pub enum IoOp {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
         ack: mpsc::Sender<()>,
     },
+    /// Register zombie DMA buffers for a timed-out qpair.
+    /// The poller takes ownership and frees them when the qpair completes or fails.
+    RegisterZombieDma {
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        read_buf: *mut c_void,
+        write_buf: *mut c_void,
+    },
 }
 
 // SAFETY: exclusive ownership - blocks until completion.
@@ -253,6 +260,8 @@ impl SpdkPoller {
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
+        // Zombie DMA buffers awaiting deferred free (timeout path).
+        let mut zombie_bufs: HashMap<usize, ZombieBufs> = HashMap::new();
 
         // Verify curvine_async_ctx buffer fits the C struct.
         debug_assert!(
@@ -273,7 +282,9 @@ impl SpdkPoller {
             if matches!(state, PollerState::Active) {
                 // Drain pending requests (non-blocking)
                 while let Ok(req) = rx.try_recv() {
-                    if matches!(req.op, IoOp::UnregisterQpair { .. }) {
+                    if matches!(req.op, IoOp::RegisterZombieDma { .. }) {
+                        Self::handle_register_zombie(&req, &mut zombie_bufs);
+                    } else if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                         Self::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs);
                     } else {
                         Self::submit_one(
@@ -307,6 +318,9 @@ impl SpdkPoller {
                         failed_qpairs.len()
                     );
                 }
+
+                // Clean up zombie DMA buffers (pending drained or qpair failed)
+                Self::cleanup_zombies(&mut zombie_bufs, &mut dead_qpairs, &mut active_qpairs);
 
                 // Spin briefly before Idle to avoid eventfd round-trip for back-to-back I/O
                 if rx.is_empty() && active_qpairs.is_empty() {
@@ -365,7 +379,9 @@ impl SpdkPoller {
 
                         // Drain any pending channel data
                         while let Ok(req) = rx.try_recv() {
-                            if matches!(req.op, IoOp::UnregisterQpair { .. }) {
+                            if matches!(req.op, IoOp::RegisterZombieDma { .. }) {
+                                Self::handle_register_zombie(&req, &mut zombie_bufs);
+                            } else if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                                 Self::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs);
                             } else {
                                 Self::submit_one(
@@ -404,6 +420,9 @@ impl SpdkPoller {
                             );
                         }
 
+                        // Clean up zombie DMA buffers
+                        Self::cleanup_zombies(&mut zombie_bufs, &mut dead_qpairs, &mut active_qpairs);
+
                         state = PollerState::Idle;
                     }
                     -1 => {
@@ -438,6 +457,24 @@ impl SpdkPoller {
             Self::force_complete_qpair(key, dead_qpairs, false);
             // force_complete_qpair does dead_qpairs.remove internally
             let _ = ack.send(());
+        }
+    }
+
+    /// Handle register zombie DMA request — takes ownership of DMA buffer pointers.
+    /// The qpair stays on the poller; DMA buffers are freed when all I/O completes
+    /// or the qpair fails (see cleanup_zombies).
+    fn handle_register_zombie(
+        req: &IoRequest,
+        zombie_bufs: &mut HashMap<usize, ZombieBufs>,
+    ) {
+        if let IoOp::RegisterZombieDma { qpair, read_buf, write_buf } = &req.op {
+            zombie_bufs.insert(
+                *qpair as usize,
+                ZombieBufs {
+                    read_buf: *read_buf,
+                    write_buf: *write_buf,
+                },
+            );
         }
     }
 
@@ -532,8 +569,8 @@ impl SpdkPoller {
             IoOp::Flush { ns, qpair } => unsafe {
                 spdk_ffi::curvine_spdk_ns_submit_flush(*ns, *qpair, &mut (*cb_ctx_ptr).async_ctx)
             },
-            IoOp::UnregisterQpair { .. } => {
-                unreachable!("UnregisterQpair handled by handle_unregister")
+            IoOp::UnregisterQpair { .. } | IoOp::RegisterZombieDma { .. } => {
+                unreachable!("UnregisterQpair/RegisterZombieDma handled before submit_one")
             }
         };
 
@@ -551,6 +588,33 @@ impl SpdkPoller {
         if !active_qpairs.contains(&qpair) {
             active_qpairs.push(qpair);
         }
+    }
+
+    /// Clean up zombie DMA buffers whose qpair has completed or failed.
+    /// Called after each poll iteration to check for zombies whose pending Vec
+    /// has drained (all NVMe commands completed) or whose QpairState has been
+    /// removed (force-complete after poll failure). Frees DMA buffers via
+    /// ZombieBufs::drop when removing from the map.
+    fn cleanup_zombies(
+        zombie_bufs: &mut HashMap<usize, ZombieBufs>,
+        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
+        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
+    ) {
+        zombie_bufs.retain(|key, _| {
+            if !dead_qpairs.contains_key(key) {
+                // QpairState was removed by force_complete_qpair (qpair failed)
+                // or never existed. Safe to free DMA buffers.
+                return false;
+            }
+            if dead_qpairs.get(key).map_or(false, |qs| qs.pending.is_empty()) {
+                // All commands completed naturally on this zombie qpair.
+                // Clean up poller state and free DMA buffers.
+                dead_qpairs.remove(key);
+                active_qpairs.retain(|&qp| qp as usize != *key);
+                return false;
+            }
+            true // Keep waiting
+        });
     }
 
     /// Force-complete all outstanding I/Os on a failed qpair using the
@@ -588,6 +652,24 @@ impl SpdkPoller {
 struct QpairState {
     dead: Arc<AtomicBool>,
     pending: Vec<*mut CallbackCtx>,
+}
+
+/// Zombie DMA buffers owned by the poller. Drop calls spdk_dma_free.
+struct ZombieBufs {
+    read_buf: *mut c_void,
+    write_buf: *mut c_void,
+}
+impl Drop for ZombieBufs {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.read_buf.is_null() {
+                spdk_ffi::curvine_spdk_dma_free(self.read_buf);
+            }
+            if !self.write_buf.is_null() {
+                spdk_ffi::curvine_spdk_dma_free(self.write_buf);
+            }
+        }
+    }
 }
 
 /// C callback context. Heap-allocated for SPDK to hold pointer.
@@ -691,7 +773,7 @@ mod test {
         dead_qpairs.insert(LIVE, qs_live);
 
         // Act.
-        SpdkPoller::force_complete_qpair(DEAD, &mut dead_qpairs);
+        SpdkPoller::force_complete_qpair(DEAD, &mut dead_qpairs, true);
 
         // Assert: DEAD entries completed with -EIO.
         assert_eq!(completion_1.wait(0), -libc::EIO);
