@@ -608,6 +608,7 @@ impl SpdkEnv {
             let poller = SpdkPoller::start(PollerConfig {
                 poll_interval_ms: self.conf.poll_interval_ms,
                 spin_iter: self.conf.spin_iter,
+                io_queue_depth: self.conf.io_queue_depth,
             });
             *self.poller.lock().unwrap() = Some(poller);
             info!("SPDK poller thread started");
@@ -684,9 +685,20 @@ impl SpdkEnv {
         if let Some(mut poller) = self.poller.lock().unwrap().take() {
             poller.stop();
             info!("SPDK poller thread stopped");
-        }
 
-        self.qpair_pool.drain_all();
+            // Drain qpair pool AFTER poller stop. This frees cached qpairs,
+            // triggering late SPDK callbacks (abort_reqs) synchronously.
+            // The stale CallbackCtx entries in orphaned list are still valid.
+            self.qpair_pool.drain_all();
+
+            // All late callbacks have now fired. Safe to reclaim orphaned entries.
+            poller.reclaim_stale();
+            info!("SPDK poller: stale callback contexts reclaimed");
+        } else {
+            // If poller was already taken (e.g., timeout path), pool drain
+            // and reclaim happen elsewhere. Drain pool anyway.
+            self.qpair_pool.drain_all();
+        }
         self.detach_controllers(); // stop keep-alive, release controller resources
         self.env_fini(); // release hugepages, cleanup DPDK EAL
 
@@ -805,11 +817,35 @@ impl SpdkEnv {
         self.qpair_pool.acquire(ctrlr)
     }
     /// Return qpair to pool, or free if at capacity.
+    /// If the qpair has orphaned CallbackCtx entries (dead qpair), bypass
+    /// the pool and free immediately, then reclaim orphaned entries.
     pub fn release_qpair(
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
+        // Check if this qpair has orphaned entries (dead/error path).
+        let has_orphaned = self
+            .poller
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|p| p.has_orphaned_for_qpair(qpair))
+            .unwrap_or(false);
+        if has_orphaned {
+            unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+            // Late SPDK callbacks have fired inside free_io_qpair.
+            // Reclaim the orphaned entries.
+            if let Some(poller) = self
+                .poller
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            {
+                poller.reclaim_orphaned_for_qpair(qpair);
+            }
+            return;
+        }
         self.qpair_pool.release(ctrlr, qpair);
     }
 

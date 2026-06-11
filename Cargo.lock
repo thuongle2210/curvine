@@ -2042,7 +2042,6 @@ dependencies = [
  "axum",
  "bindgen",
  "bitflags 2.10.0",
- "bytes",
  "clap",
  "curvine-client",
  "curvine-common",

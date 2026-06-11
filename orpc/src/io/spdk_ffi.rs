@@ -71,6 +71,7 @@ extern "C" {
     // I/O qpair
     pub fn curvine_spdk_alloc_io_qpair(ctrlr: *mut spdk_nvme_ctrlr) -> *mut spdk_nvme_qpair;
     pub fn curvine_spdk_free_io_qpair(qpair: *mut spdk_nvme_qpair);
+    pub fn spdk_nvme_ctrlr_disconnect_io_qpair(qpair: *mut spdk_nvme_qpair);
     // Sync NVMe I/O (unused, to remove)
     pub fn curvine_spdk_ns_read(
         ns: *mut spdk_nvme_ns,

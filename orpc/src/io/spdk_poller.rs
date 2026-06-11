@@ -12,9 +12,11 @@ use crate::io::spdk_ffi;
 /// TODO: SPDK fabric eventfd for immediate detection.
 use log::{error, info};
 use nix::sys::eventfd::{EfdFlags, EventFd};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -72,12 +74,19 @@ impl IoCompletion {
         })
     }
 
-    /// Called by C callback on completion.
-    pub fn complete(&self, status: i32) {
+    /// Called by C callback on completion. Returns true if this call
+    /// won the race and should perform accounting (inflight decrement).
+    /// Returns false if the completion was already signaled (e.g., by
+    /// force_complete_qpair) and accounting was already performed.
+    pub fn complete(&self, status: i32) -> bool {
         let mut inner = self.inner.lock().unwrap();
+        if inner.done {
+            return false;
+        }
         inner.done = true;
         inner.status = status;
         self.cond.notify_one();
+        true
     }
 
     /// Block until complete or timeout. Returns NVMe status.
@@ -111,7 +120,7 @@ pub struct IoRequest {
     pub op: IoOp,
     pub completion: Arc<IoCompletion>,
     /// Per-bdev in-flight counter. Decremented on completion.
-    pub bdev_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub bdev_inflight: Arc<AtomicUsize>,
 }
 
 // SAFETY: exclusive ownership - blocks until completion.
@@ -129,6 +138,34 @@ enum PollerState {
 pub struct PollerConfig {
     pub poll_interval_ms: u64,
     pub spin_iter: u32,
+    /// I/O queue depth (max in-flight per qpair). Used for Vec pre-allocation.
+    pub io_queue_depth: u32,
+}
+
+/// Per-qpair state tracked by the poller thread.
+struct QpairState {
+    /// True if force_complete_qpair was called for this qpair.
+    dead: bool,
+    /// Commands submitted to SPDK, awaiting completion or force-complete.
+    pending: Vec<*mut CallbackCtx>,
+    /// Commands force-completed but kept alive for late SPDK callbacks.
+    stale: Vec<*mut CallbackCtx>,
+}
+
+impl QpairState {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            dead: false,
+            pending: Vec::with_capacity(cap),
+            stale: Vec::new(),
+        }
+    }
+}
+
+/// A qpair tracked by the poller with its state.
+struct ActiveQpair {
+    qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    state: Pin<Box<QpairState>>,
 }
 
 /// Poller thread handle.
@@ -142,6 +179,9 @@ pub struct SpdkPoller {
     /// Whether poller is blocked on eventfd (idle). Bdevs check this to
     /// skip eventfd write syscall when poller is already active.
     is_sleeping: Arc<AtomicBool>,
+    /// Orphaned ActiveQpair entries keyed by qpair address.
+    /// Keeps QpairState alive for late SPDK callbacks during free_io_qpair.
+    orphaned: Arc<Mutex<HashMap<usize, ActiveQpair>>>,
 }
 
 impl SpdkPoller {
@@ -159,10 +199,20 @@ impl SpdkPoller {
         let eventfd_raw = eventfd.as_raw_fd();
         let eventfd_arc = Arc::new(eventfd);
 
+        let orphaned = Arc::new(Mutex::new(HashMap::new()));
+        let orphaned_clone = orphaned.clone();
+
         let handle = std::thread::Builder::new()
             .name("spdk-poller".to_string())
             .spawn(move || {
-                Self::poller_loop(rx, shutdown_clone, is_sleeping_clone, eventfd_raw, config);
+                Self::poller_loop(
+                    rx,
+                    shutdown_clone,
+                    is_sleeping_clone,
+                    eventfd_raw,
+                    config,
+                    orphaned_clone,
+                );
             })
             .expect("Failed to spawn SPDK poller thread");
 
@@ -172,6 +222,7 @@ impl SpdkPoller {
             shutdown,
             handle: Some(handle),
             is_sleeping,
+            orphaned,
         }
     }
 
@@ -203,7 +254,7 @@ impl SpdkPoller {
         let req = IoRequest {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
-            bdev_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
         };
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
@@ -220,6 +271,57 @@ impl SpdkPoller {
         }
     }
 
+    /// True if orphaned map contains entries for this qpair.
+    pub fn has_orphaned_for_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
+        if let Ok(guard) = self.orphaned.lock() {
+            guard.contains_key(&(qpair as usize))
+        } else {
+            false
+        }
+    }
+
+    /// Remove orphaned ActiveQpair for this qpair and free all entries.
+    /// Safe to call only after free_io_qpair has completed for this qpair
+    /// (all late SPDK callbacks have fired).
+    pub fn reclaim_orphaned_for_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
+        if let Ok(mut guard) = self.orphaned.lock() {
+            if let Some(mut aq) = guard.remove(&(qpair as usize)) {
+                for ptr in aq.state.stale.drain(..) {
+                    unsafe {
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+                for ptr in aq.state.pending.drain(..) {
+                    unsafe {
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reclaim all orphaned ActiveQpair entries.
+    /// SAFETY: Call only after all late SPDK callbacks have fired
+    /// (i.e., after qpair_pool::drain_all in SpdkEnv::shutdown).
+    pub fn reclaim_stale(&self) {
+        if let Ok(mut guard) = self.orphaned.lock() {
+            for (_qpair_key, mut aq) in guard.drain() {
+                for ptr in aq.state.stale.drain(..) {
+                    unsafe {
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+                for ptr in aq.state.pending.drain(..) {
+                    unsafe {
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+            }
+        }
+    }
+
     /// Shut down the poller thread.
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -230,6 +332,54 @@ impl SpdkPoller {
         }
     }
 
+    /// Poll all active qpairs, handle errors.
+    /// On error: force_complete + move entire ActiveQpair to orphaned HashMap (keyed by qpair).
+    fn poll_and_sweep(
+        active_qpairs: &mut HashMap<usize, ActiveQpair>,
+        orphaned: &Mutex<HashMap<usize, ActiveQpair>>,
+        context: &str,
+    ) {
+        let err_keys: Vec<usize> = active_qpairs
+            .iter()
+            .filter_map(|(&key, aq)| {
+                let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(aq.qpair, 0) };
+                if rc < 0 {
+                    error!("{}: qpair poll error: {}", context, rc);
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if err_keys.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = orphaned.lock() {
+            for key in err_keys {
+                if let Some(mut aq) = active_qpairs.remove(&key) {
+                    force_complete_qpair(&mut aq);
+                    if let Some(mut prev) = guard.insert(key, aq) {
+                        // Should never reach here — qpair already orphaned.
+                        error!(
+                            "qpair {:p} already orphaned, draining duplicate",
+                            key as *mut c_void
+                        );
+                        for ptr in prev.state.stale.drain(..) {
+                            unsafe {
+                                drop(Box::from_raw(ptr));
+                            }
+                        }
+                        for ptr in prev.state.pending.drain(..) {
+                            unsafe {
+                                drop(Box::from_raw(ptr));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Main poller loop. Runs on dedicated thread.
     fn poller_loop(
         rx: crossbeam::channel::Receiver<IoRequest>,
@@ -237,8 +387,10 @@ impl SpdkPoller {
         is_sleeping: Arc<AtomicBool>,
         eventfd: RawFd,
         config: PollerConfig,
+        orphaned: Arc<Mutex<HashMap<usize, ActiveQpair>>>,
     ) {
-        let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
+        let io_queue_depth = config.io_queue_depth as usize;
+        let mut active_qpairs: HashMap<usize, ActiveQpair> = HashMap::with_capacity(8);
         let mut state = PollerState::Idle;
 
         // Verify curvine_async_ctx buffer fits the C struct.
@@ -261,21 +413,11 @@ impl SpdkPoller {
                 // Drain pending requests (non-blocking)
                 while let Ok(req) = rx.try_recv() {
                     if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                        Self::handle_unregister(&req, &mut active_qpairs);
+                        Self::handle_unregister(&req, &mut active_qpairs, &*orphaned);
                     } else {
-                        Self::submit_one(&req, &mut active_qpairs);
+                        Self::submit_one(&req, &mut active_qpairs, io_queue_depth);
                     }
                 }
-
-                // Poll qpairs for completions
-                active_qpairs.retain(|qpair| {
-                    let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
-                    if rc < 0 {
-                        error!("qpair poll error: {}", rc);
-                        return false;
-                    }
-                    true
-                });
 
                 // Spin briefly before Idle to avoid eventfd round-trip for back-to-back I/O
                 if rx.is_empty() && active_qpairs.is_empty() {
@@ -335,9 +477,9 @@ impl SpdkPoller {
                         // Drain any pending channel data
                         while let Ok(req) = rx.try_recv() {
                             if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                                Self::handle_unregister(&req, &mut active_qpairs);
+                                Self::handle_unregister(&req, &mut active_qpairs, &*orphaned);
                             } else {
-                                Self::submit_one(&req, &mut active_qpairs);
+                                Self::submit_one(&req, &mut active_qpairs, io_queue_depth);
                             }
                         }
 
@@ -346,14 +488,7 @@ impl SpdkPoller {
                     }
                     0 => {
                         // Timeout - poll active qpairs to check connection health
-                        active_qpairs.retain(|qpair| {
-                            let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
-                            if rc < 0 {
-                                error!("Poller: keep-alive poll error: {}, removing qpair", rc);
-                                return false;
-                            }
-                            true
-                        });
+                        Self::poll_and_sweep(&mut active_qpairs, &*orphaned, "Keep-alive poll");
                         state = PollerState::Idle;
                     }
                     -1 => {
@@ -371,19 +506,118 @@ impl SpdkPoller {
             }
         }
 
+        // Thread exiting — drain remaining ActiveQpairs into orphaned HashMap for safe reclamation.
+        if let Ok(mut guard) = orphaned.lock() {
+            for (key, aq) in active_qpairs.drain() {
+                if let Some(mut prev) = guard.insert(key, aq) {
+                    error!(
+                        "qpair {:p} already orphaned on thread exit",
+                        key as *mut c_void
+                    );
+                    for ptr in prev.state.stale.drain(..) {
+                        unsafe {
+                            drop(Box::from_raw(ptr));
+                        }
+                    }
+                    for ptr in prev.state.pending.drain(..) {
+                        unsafe {
+                            drop(Box::from_raw(ptr));
+                        }
+                    }
+                }
+            }
+        }
+
         info!("SPDK poller thread exiting");
     }
 
     /// Handle unregister request, remove qpair from active set and ack.
-    fn handle_unregister(req: &IoRequest, active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>) {
+    ///
+    /// Two paths:
+    /// - Graceful (disconnect+poll succeeds): callbacks fired entries inline,
+    ///   no orphaned accumulation. Defensively drains any remaining entries.
+    /// - Orphaned (dead qpair, or disconnect+poll failed): keep entire ActiveQpair
+    ///   in orphaned HashMap for late callbacks during free_io_qpair.
+    fn handle_unregister(
+        req: &IoRequest,
+        active_qpairs: &mut HashMap<usize, ActiveQpair>,
+        orphaned: &Mutex<HashMap<usize, ActiveQpair>>,
+    ) {
         if let IoOp::UnregisterQpair { qpair, ack } = &req.op {
-            active_qpairs.retain(|&qp| qp != *qpair);
+            if let Some(mut aq) = active_qpairs.remove(&(*qpair as usize)) {
+                let mut graceful_ok = false;
+
+                if !aq.state.dead {
+                    // Graceful path: disconnect + poll. If poll succeeds (>=0),
+                    // all abort callbacks have fired and freed entries inline.
+                    unsafe {
+                        spdk_ffi::spdk_nvme_ctrlr_disconnect_io_qpair(*qpair);
+                        let poll_rc = spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0);
+                        if poll_rc >= 0 {
+                            graceful_ok = true;
+                        }
+                    }
+                }
+
+                if graceful_ok {
+                    // Belt-and-suspenders: drain any entries not cleaned by callbacks.
+                    // In normal operation all entries were removed+freed by callbacks.
+                    for ptr in aq.state.pending.drain(..) {
+                        unsafe {
+                            if (*ptr).completion.complete(-libc::ESHUTDOWN) {
+                                (*ptr).bdev_inflight.fetch_sub(1, Ordering::Release);
+                            }
+                            drop(Box::from_raw(ptr));
+                        }
+                    }
+                    for ptr in aq.state.stale.drain(..) {
+                        unsafe {
+                            drop(Box::from_raw(ptr));
+                        }
+                    }
+                } else {
+                    // Orphaned path: transport broken or disconnect failed.
+                    // Signal pending entries to unstick waiters, then keep
+                    // entire ActiveQpair in orphaned for late SPDK callbacks.
+                    for &ptr in &aq.state.pending {
+                        unsafe {
+                            if (*ptr).completion.complete(-libc::ESHUTDOWN) {
+                                (*ptr).bdev_inflight.fetch_sub(1, Ordering::Release);
+                            }
+                        }
+                    }
+                    aq.state.stale.append(&mut aq.state.pending);
+                    let qpair_key = *qpair as usize;
+                    if let Ok(mut guard) = orphaned.lock() {
+                        if let Some(mut prev) = guard.insert(qpair_key, aq) {
+                            error!(
+                                "qpair {:p} already orphaned during unregister",
+                                qpair_key as *mut c_void
+                            );
+                            for ptr in prev.state.stale.drain(..) {
+                                unsafe {
+                                    drop(Box::from_raw(ptr));
+                                }
+                            }
+                            for ptr in prev.state.pending.drain(..) {
+                                unsafe {
+                                    drop(Box::from_raw(ptr));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let _ = ack.send(());
         }
     }
 
     /// Submit a single I/O request on the poller thread.
-    fn submit_one(req: &IoRequest, active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>) {
+    fn submit_one(
+        req: &IoRequest,
+        active_qpairs: &mut HashMap<usize, ActiveQpair>,
+        io_queue_depth: usize,
+    ) {
         let qpair = match &req.op {
             IoOp::Read { qpair, .. } => *qpair,
             IoOp::Write { qpair, .. } => *qpair,
@@ -393,11 +627,25 @@ impl SpdkPoller {
             }
         };
 
-        // Box::into_raw ensures CallbackCtx survives until poller_callback reclaims it
+        let state = &mut active_qpairs
+            .entry(qpair as usize)
+            .or_insert_with(|| ActiveQpair {
+                qpair,
+                state: Pin::new(Box::new(QpairState::with_capacity(io_queue_depth))),
+            })
+            .state;
+
+        let pending_idx = state.pending.len();
+        // Must be computed BEFORE push to pending.
+        // Cast to raw pointer AFTER mutable deref to ensure we get the heap address, not a reborrowed stack address.
+        let owner_ptr = &mut **state as *mut QpairState;
+
         let cb_ctx = Box::new(CallbackCtx {
             completion: req.completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: req.bdev_inflight.clone(),
+            pending_idx,
+            owner: owner_ptr,
         });
         let cb_ctx_ptr = Box::into_raw(cb_ctx);
 
@@ -409,6 +657,12 @@ impl SpdkPoller {
                 cb_ctx_ptr as *mut c_void,
             );
         }
+
+        // Push to pending BEFORE SPDK submit to handle synchronous completions.
+        // If SPDK calls poller_callback during submit (some transports/backends),
+        // the callback finds this entry in pending, removes+frees it inline.
+        // If not, the entry stays and the callback removes it on the next poll.
+        state.pending.push(cb_ctx_ptr);
 
         let rc = match &req.op {
             IoOp::Read {
@@ -452,17 +706,30 @@ impl SpdkPoller {
         };
 
         if rc != 0 {
-            // Submission failed - reclaim allocation and complete with error
-            unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
-            req.bdev_inflight.fetch_sub(1, Ordering::Release);
-            req.completion.complete(rc);
+            // Submission failed — reclaim allocation and complete with error.
+            // If the callback fired synchronously (saw entry in pending, removed+freed it),
+            // we skip the remove/free because the callback already handled it.
+            // Use position() scan instead of cached pending_idx: other callbacks
+            // during submit may have moved our entry via swap_remove, making the
+            // local variable stale. Comparing raw pointer values is safe even if
+            // the target was freed — position() returns None when not in pending.
+            if let Some(actual_idx) = state.pending.iter().position(|&p| p == cb_ctx_ptr) {
+                let last = state.pending.len() - 1;
+                if actual_idx != last {
+                    state.pending[actual_idx] = state.pending[last];
+                    (*state.pending[actual_idx]).pending_idx = actual_idx;
+                }
+                state.pending.pop();
+                drop(Box::from_raw(cb_ctx_ptr));
+            }
+            if req.completion.complete(rc) {
+                req.bdev_inflight.fetch_sub(1, Ordering::Release);
+            }
             return;
         }
-
-        // Track active qpair
-        if !active_qpairs.contains(&qpair) {
-            active_qpairs.push(qpair);
-        }
+        // rc == 0: submission accepted. Entry is in pending, awaiting completion
+        // callback. If the callback fired synchronously during submit, it already
+        // removed the entry from pending — no further work needed.
     }
 }
 
@@ -470,18 +737,64 @@ impl SpdkPoller {
 struct CallbackCtx {
     completion: Arc<IoCompletion>,
     async_ctx: spdk_ffi::curvine_async_ctx,
-    bdev_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    bdev_inflight: Arc<AtomicUsize>,
+    /// Index in QpairState::pending. Updated by swap_remove when other entries complete.
+    pending_idx: usize,
+    /// Pointer to owning QpairState (Pin<Box<QpairState>> — stable heap address).
+    owner: *mut QpairState,
 }
 
 /// C callback invoked by SPDK when NVMe command completes.
+/// Hot path: removes self from pending + Box::from_raw(self).
+/// Late callback (during free_io_qpair on orphaned qpair): entry is in stale,
+/// not in pending. The pending_idx check fails so we skip remove/free and just signal.
 unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
-    let ctx = Box::from_raw(cb_arg as *mut CallbackCtx);
-    ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
-    ctx.completion.complete(status);
+    let ctx = cb_arg as *mut CallbackCtx;
+    if (*ctx).completion.complete(status) {
+        (*ctx).bdev_inflight.fetch_sub(1, Ordering::Release);
+    }
+
+    let qs = &mut *(*ctx).owner;
+    let idx = (*ctx).pending_idx;
+    // Only remove from pending if the entry is still there (hot path).
+    // If not (late callback on orphaned entry), skip remove/free.
+    if idx < qs.pending.len() && qs.pending[idx] == ctx {
+        let last_idx = qs.pending.len() - 1;
+        if idx != last_idx {
+            qs.pending[idx] = qs.pending[last_idx];
+            (*qs.pending[idx]).pending_idx = idx;
+        }
+        qs.pending.pop();
+        drop(Box::from_raw(ctx));
+    }
+}
+
+/// Force-complete all pending I/Os for a qpair that has failed.
+/// Signals waiters, decrements inflight, moves pending to stale.
+/// CallbackCtx entries are kept alive for late SPDK callbacks
+/// (QpairState stays alive via orphaned ActiveQpair).
+fn force_complete_qpair(aq: &mut ActiveQpair) {
+    aq.state.dead = true;
+    for &cb_ctx_ptr in &aq.state.pending {
+        unsafe {
+            // No reclaimed check needed — entries where callback fired were
+            // removed from pending inline by the callback itself.
+            if (*cb_ctx_ptr).completion.complete(-libc::EIO) {
+                (*cb_ctx_ptr).bdev_inflight.fetch_sub(1, Ordering::Release);
+            }
+        }
+    }
+    // Move pending to stale — keep allocations alive for late callbacks
+    aq.state.stale.append(&mut aq.state.pending);
 }
 
 impl Drop for SpdkPoller {
     fn drop(&mut self) {
         self.stop();
+        // Note: We do NOT call reclaim_stale() here because late SPDK callbacks
+        // may still fire (e.g., in the timeout path where pool wasn't drained).
+        // The caller (SpdkEnv::shutdown) is responsible for calling reclaim_stale()
+        // after pool drain when late callbacks are guaranteed finished.
+        // Any remaining orphaned entries leak in the timeout path — bounded leak.
     }
 }

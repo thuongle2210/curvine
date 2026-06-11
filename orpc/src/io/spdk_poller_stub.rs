@@ -12,6 +12,13 @@ impl SpdkPoller {
     pub fn sender(&self) -> crossbeam::channel::Sender<IoRequest> {
         crossbeam::channel::unbounded().0
     }
+    pub fn reclaim_stale(&self) {}
+    pub fn has_orphaned_for_qpair(&self, _qpair: *mut std::ffi::c_void) -> bool {
+        false
+    }
+    pub fn reclaim_orphaned_for_qpair(&self, _qpair: *mut std::ffi::c_void) -> bool {
+        false
+    }
     pub fn stop(&mut self) {}
 }
 impl Drop for SpdkPoller {
@@ -53,7 +60,9 @@ impl IoCompletion {
     pub fn new() -> Arc<Self> {
         Arc::new(Self(std::sync::Mutex::new(())))
     }
-    pub fn complete(&self, _: i32) {}
+    pub fn complete(&self, _: i32) -> bool {
+        true
+    }
     pub fn wait(&self, _: u64) -> i32 {
         0
     }
