@@ -293,10 +293,7 @@ impl SpdkPoller {
     pub fn unregister_ctrlr(&self, ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr) -> bool {
         let (ack_tx, ack_rx) = mpsc::channel::<()>();
         let req = IoRequest {
-            op: IoOp::UnregisterCtrlr {
-                ctrlr,
-                ack: ack_tx,
-            },
+            op: IoOp::UnregisterCtrlr { ctrlr, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
         };
@@ -402,23 +399,15 @@ impl SpdkPoller {
             for key in err_keys {
                 if let Some(mut aq) = active_qpairs.remove(&key) {
                     force_complete_qpair(&mut aq);
-                    if let Some(mut prev) = guard.insert(key, aq) {
-                        // Should never reach here — qpair already orphaned.
-                        error!(
-                            "qpair {:p} already orphaned, draining duplicate",
+                    if let Some(mut prev) = guard.remove(&key) {
+                        warn!(
+                            "qpair {:p} already orphaned, merging old entries",
                             key as *mut c_void
                         );
-                        for ptr in prev.state.stale.drain(..) {
-                            unsafe {
-                                drop(Box::from_raw(ptr));
-                            }
-                        }
-                        for ptr in prev.state.pending.drain(..) {
-                            unsafe {
-                                drop(Box::from_raw(ptr));
-                            }
-                        }
+                        aq.state.stale.extend(prev.state.stale.drain(..));
+                        aq.state.stale.extend(prev.state.pending.drain(..));
                     }
+                    guard.insert(key, aq);
                 }
             }
         }
@@ -536,11 +525,7 @@ impl SpdkPoller {
                     }
                     0 => {
                         // Timeout - poll active qpairs to check connection health
-                        Self::poll_and_sweep(
-                            &mut active_qpairs,
-                            &*orphaned,
-                            "keep-alive",
-                        );
+                        Self::poll_and_sweep(&mut active_qpairs, &*orphaned, "keep-alive");
                         // Process admin completions (keep-alive)
                         Self::process_admin_completions(&active_ctrlrs);
                         state = PollerState::Idle;
@@ -580,11 +565,9 @@ impl SpdkPoller {
 
     /// Handle unregister request, remove qpair from active set and ack.
     ///
-    /// Two paths:
-    /// - Graceful (disconnect+poll succeeds): callbacks fired entries inline,
-    ///   no orphaned accumulation. Defensively drains any remaining entries.
-    /// - Orphaned (dead qpair, or disconnect+poll failed): keep entire ActiveQpair
-    ///   in orphaned HashMap for late callbacks during free_io_qpair.
+    /// Always orphans — disconnect+poll does not guarantee all late callbacks
+    /// have fired, so we must keep the ActiveQpair alive in orphaned for
+    /// late callbacks during free_io_qpair. See Issue B for details.
     fn handle_unregister(
         req: &IoRequest,
         active_qpairs: &mut HashMap<usize, ActiveQpair>,
@@ -592,60 +575,37 @@ impl SpdkPoller {
     ) {
         if let IoOp::UnregisterQpair { qpair, ack } = &req.op {
             if let Some(mut aq) = active_qpairs.remove(&(*qpair as usize)) {
-                let mut graceful_ok = false;
-
                 if !aq.state.dead {
-                    // Graceful path: disconnect + poll. If poll succeeds (>=0),
-                    // all abort callbacks have fired and freed entries inline.
+                    // Disconnect + poll — may process some abort completions
+                    // synchronously, but does NOT guarantee all late callbacks
+                    // have fired. free_io_qpair can still fire callbacks.
                     unsafe {
                         spdk_ffi::spdk_nvme_ctrlr_disconnect_io_qpair(*qpair);
-                        let poll_rc = spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0);
-                        if poll_rc >= 0 {
-                            graceful_ok = true;
-                        }
+                        spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0);
                     }
                 }
 
-                if graceful_ok {
-                    // Belt-and-suspenders: drain any entries not cleaned by callbacks.
-                    // In normal operation all entries were removed+freed by callbacks.
-                    for ptr in aq.state.pending.drain(..) {
-                        unsafe {
-                            if (*ptr).completion.complete(-libc::ESHUTDOWN) {
-                                (*ptr).bdev_inflight.fetch_sub(1, Ordering::Release);
-                            }
-                            drop(Box::from_raw(ptr));
+                // Always orphan — keep ActiveQpair alive for late callbacks
+                // during free_io_qpair (graceful path removed — see Issue B).
+                for &ptr in &aq.state.pending {
+                    unsafe {
+                        if (*ptr).completion.complete(-libc::ESHUTDOWN) {
+                            (*ptr).bdev_inflight.fetch_sub(1, Ordering::Release);
                         }
                     }
-                    for ptr in aq.state.stale.drain(..) {
-                        unsafe {
-                            drop(Box::from_raw(ptr));
-                        }
+                }
+                aq.state.stale.append(&mut aq.state.pending);
+                let qpair_key = *qpair as usize;
+                if let Ok(mut guard) = orphaned.lock() {
+                    if let Some(mut prev) = guard.remove(&qpair_key) {
+                        warn!(
+                            "qpair {:p} already orphaned during unregister, merging old entries",
+                            qpair_key as *mut c_void
+                        );
+                        aq.state.stale.extend(prev.state.stale.drain(..));
+                        aq.state.stale.extend(prev.state.pending.drain(..));
                     }
-                } else {
-                    // Orphaned path: transport broken or disconnect failed.
-                    // Signal pending entries to unstick waiters, then keep
-                    // entire ActiveQpair in orphaned for late SPDK callbacks.
-                    for &ptr in &aq.state.pending {
-                        unsafe {
-                            if (*ptr).completion.complete(-libc::ESHUTDOWN) {
-                                (*ptr).bdev_inflight.fetch_sub(1, Ordering::Release);
-                            }
-                        }
-                    }
-                    aq.state.stale.append(&mut aq.state.pending);
-                    let qpair_key = *qpair as usize;
-                    if let Ok(mut guard) = orphaned.lock() {
-                        if let Some(mut prev) = guard.remove(&qpair_key) {
-                            warn!(
-                                "qpair {:p} already orphaned during unregister, merging old entries",
-                                qpair_key as *mut c_void
-                            );
-                            aq.state.stale.extend(prev.state.stale.drain(..));
-                            aq.state.stale.extend(prev.state.pending.drain(..));
-                        }
-                        guard.insert(qpair_key, aq);
-                    }
+                    guard.insert(qpair_key, aq);
                 }
             }
             let _ = ack.send(());
@@ -865,5 +825,3 @@ impl Drop for SpdkPoller {
         // Any remaining orphaned entries leak in the timeout path — bounded leak.
     }
 }
-
-

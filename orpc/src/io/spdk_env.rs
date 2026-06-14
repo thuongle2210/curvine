@@ -881,10 +881,7 @@ impl SpdkEnv {
 
     /// Unregister controller from poller, blocking until removed to prevent UAF
     /// on process_admin_completions. Returns false if poller didn't ack.
-    pub fn unregister_ctrlr_from_poller(
-        &self,
-        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
-    ) -> bool {
+    pub fn unregister_ctrlr_from_poller(&self, ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr) -> bool {
         let poller = self.poller.lock().unwrap();
         if let Some(poller) = poller.as_ref() {
             poller.unregister_ctrlr(ctrlr)
