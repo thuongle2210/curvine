@@ -177,8 +177,6 @@ impl QpairState {
 struct ActiveQpair {
     qpair: *mut spdk_ffi::spdk_nvme_qpair,
     state: Pin<Box<QpairState>>,
-    pub io_queue_depth: usize,
-    pub ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr>,
 }
 
 // SAFETY: ActiveQpair is only accessed from the poller thread
