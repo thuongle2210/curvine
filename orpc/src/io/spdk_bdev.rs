@@ -282,6 +282,9 @@ impl SpdkBdev {
         if rc >= 0 {
             return "success".to_string();
         }
+        if rc == -libc::ETIMEDOUT {
+            return "timeout".to_string();
+        }
         let code = (-rc) as u32;
         let sct = code / 256;
         let sc = code % 256;
