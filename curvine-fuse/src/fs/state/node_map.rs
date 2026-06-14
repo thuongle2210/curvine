@@ -35,7 +35,6 @@ pub struct NodeMap {
     pending_deletes: FastHashSet<u64>,
     id_creator: AtomicCounter,
     cache_ttl: u64,
-    last_clean: u64,
     conf: FuseConf,
 }
 
@@ -50,7 +49,6 @@ impl NodeMap {
             pending_deletes: FastHashSet::default(),
             id_creator: AtomicCounter::new(FUSE_ROOT_ID),
             cache_ttl: conf.node_cache_ttl.as_millis() as u64,
-            last_clean: LocalTime::mills(),
             conf: conf.clone(),
         }
     }
@@ -141,6 +139,17 @@ impl NodeMap {
             ino
         };
 
+        if self.is_pending_delete(attr.ino) {
+            if let Some(inode) = self.get_mut(attr.ino) {
+                inode.sub_lookup(1);
+            }
+            return err_fuse!(
+                libc::ENOENT,
+                "inode {} marked for deletion, suppress lookup revive",
+                attr.ino
+            );
+        }
+
         Ok(attr)
     }
 
@@ -151,8 +160,6 @@ impl NodeMap {
         parent: u64,
         name: Option<T>,
     ) -> FuseResult<&mut NodeAttr> {
-        self.clean_cache();
-
         let ino = match self.lookup_node(parent, name.as_ref()) {
             Some(v) => v.id,
 
@@ -420,10 +427,6 @@ impl NodeMap {
 
     pub fn clean_cache(&mut self) {
         let now = LocalTime::mills();
-        if self.last_clean + self.cache_ttl > now {
-            return;
-        }
-
         let expired_nodes: Vec<_> = self
             .nodes
             .iter()
@@ -439,7 +442,6 @@ impl NodeMap {
             }
         }
 
-        self.last_clean = now;
         info!(
             "Clean node cache, total nodes {}, delete nodes {}, cost {} ms",
             self.nodes.len(),

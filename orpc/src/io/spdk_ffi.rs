@@ -29,8 +29,6 @@ extern "C" {
     pub fn curvine_spdk_env_opts_init(opts: *mut spdk_env_opts);
     pub fn curvine_spdk_env_opts_set_name(opts: *mut spdk_env_opts, name: *const c_char);
     pub fn curvine_spdk_env_opts_set_core_mask(opts: *mut spdk_env_opts, mask: *const c_char);
-    pub fn curvine_spdk_env_opts_set_shm_id(opts: *mut spdk_env_opts, shm_id: c_int);
-    pub fn curvine_spdk_env_opts_set_mem_channel(opts: *mut spdk_env_opts, mem_channel: c_int);
     pub fn curvine_spdk_env_opts_set_mem_size(opts: *mut spdk_env_opts, mem_size: c_int);
     pub fn curvine_spdk_env_init(opts: *mut spdk_env_opts) -> c_int;
     pub fn spdk_env_fini();
@@ -59,6 +57,7 @@ extern "C" {
         opts: *mut spdk_nvme_ctrlr_opts,
     ) -> *mut spdk_nvme_ctrlr;
     pub fn spdk_nvme_detach(ctrlr: *mut spdk_nvme_ctrlr) -> c_int;
+    pub fn spdk_nvme_ctrlr_process_admin_completions(ctrlr: *mut spdk_nvme_ctrlr) -> c_int;
     pub fn spdk_nvme_ctrlr_get_num_ns(ctrlr: *mut spdk_nvme_ctrlr) -> u32;
     pub fn spdk_nvme_ctrlr_get_ns(ctrlr: *mut spdk_nvme_ctrlr, ns_id: u32) -> *mut spdk_nvme_ns;
     pub fn spdk_nvme_ns_is_active(ns: *mut spdk_nvme_ns) -> bool;

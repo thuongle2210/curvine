@@ -10,13 +10,13 @@ use crate::io::spdk_ffi;
 /// ## Disconnect Detection
 /// Detected via periodic keep-alive poll every 1s while idle (~1s latency).
 /// TODO: SPDK fabric eventfd for immediate detection.
-use log::{error, info};
+use log::{error, info, warn};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -78,7 +78,8 @@ impl IoCompletion {
     /// won the race and should perform accounting (inflight decrement).
     /// Returns false if the completion was already signaled (e.g., by
     /// force_complete_qpair) and accounting was already performed.
-    pub fn complete(&self, status: i32) -> bool {
+    /// Returns true if this call actually completed the I/O (first call wins).
+    pub fn complete(&self, status: i32) -> bool -> bool {
         let mut inner = self.inner.lock().unwrap();
         if inner.done {
             return false;
@@ -166,6 +167,8 @@ impl QpairState {
 struct ActiveQpair {
     qpair: *mut spdk_ffi::spdk_nvme_qpair,
     state: Pin<Box<QpairState>>,
+    pub io_queue_depth: usize,
+    pub ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr>,
 }
 
 /// Poller thread handle.
@@ -254,7 +257,7 @@ impl SpdkPoller {
         let req = IoRequest {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
-            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+            bdev_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
@@ -391,7 +394,10 @@ impl SpdkPoller {
     ) {
         let io_queue_depth = config.io_queue_depth as usize;
         let mut active_qpairs: HashMap<usize, ActiveQpair> = HashMap::with_capacity(8);
+        let active_ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = config.ctrlrs;
         let mut state = PollerState::Idle;
+        // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
+        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
 
         // Verify curvine_async_ctx buffer fits the C struct.
         debug_assert!(
@@ -477,9 +483,9 @@ impl SpdkPoller {
                         // Drain any pending channel data
                         while let Ok(req) = rx.try_recv() {
                             if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                                Self::handle_unregister(&req, &mut active_qpairs, &*orphaned);
+                                Self::handle_unregister(&req, &mut active_qpairs);
                             } else {
-                                Self::submit_one(&req, &mut active_qpairs, io_queue_depth);
+                                Self::submit_one(&req, &mut active_qpairs);
                             }
                         }
 
@@ -488,7 +494,16 @@ impl SpdkPoller {
                     }
                     0 => {
                         // Timeout - poll active qpairs to check connection health
-                        Self::poll_and_sweep(&mut active_qpairs, &*orphaned, "Keep-alive poll");
+                        active_qpairs.retain(|qpair| {
+                            let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
+                            if rc < 0 {
+                                error!("Poller: keep-alive poll error: {}, removing qpair", rc);
+                                return false;
+                            }
+                            true
+                        });
+                        // Process admin completions (keep-alive)
+                        Self::process_admin_completions(&active_ctrlrs);
                         state = PollerState::Idle;
                     }
                     -1 => {
@@ -627,6 +642,26 @@ impl SpdkPoller {
             }
         };
 
+        let key = qpair as usize;
+
+        // Register/retrieve QpairState on first sight of this qpair.
+        let qs = dead_qpairs.entry(key).or_insert_with(|| {
+            Box::new(QpairState {
+                dead: req.qpair_dead.clone(),
+                pending: Vec::with_capacity(io_queue_depth),
+            })
+        });
+
+        // Fast-fail if this qpair is already known dead.
+        if req.qpair_dead.load(Ordering::Acquire) {
+            req.bdev_inflight.fetch_sub(1, Ordering::Release);
+            req.completion.complete(-libc::ENXIO);
+            return;
+        }
+
+        let pending_idx = qs.pending.len();
+        let qs_ptr = &mut **qs as *mut QpairState;
+
         let state = &mut active_qpairs
             .entry(qpair as usize)
             .or_insert_with(|| ActiveQpair {
@@ -731,6 +766,46 @@ impl SpdkPoller {
         // callback. If the callback fired synchronously during submit, it already
         // removed the entry from pending — no further work needed.
     }
+
+    /// Force-complete all outstanding I/Os on a failed qpair using the
+    /// per-qpair pending Vec, then mark the qpair dead so future submissions fail fast.
+    fn force_complete_qpair(key: usize, dead_qpairs: &mut HashMap<usize, Box<QpairState>>) {
+        if let Some(qs) = dead_qpairs.get_mut(&key) {
+            qs.dead.store(true, Ordering::Release);
+            let pending = std::mem::take(&mut qs.pending);
+            let count = pending.len();
+            for cb_ptr in &pending {
+                let ctx = unsafe { Box::from_raw(*cb_ptr as *mut CallbackCtx) };
+                if ctx.completion.complete(-libc::EIO) {
+                    ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
+                }
+            }
+            if count > 0 {
+                error!(
+                    "Force-completed {} outstanding I/O(s) on failed qpair 0x{:x} with EIO",
+                    count, key
+                );
+            }
+        }
+        dead_qpairs.remove(&key);
+    }
+
+    /// Process admin completions on all controllers to service keep-alive.
+    fn process_admin_completions(ctrlrs: &[*mut spdk_ffi::spdk_nvme_ctrlr]) {
+        for &ctrlr in ctrlrs {
+            let rc = unsafe { spdk_ffi::spdk_nvme_ctrlr_process_admin_completions(ctrlr) };
+            if rc < 0 {
+                warn!("ctrlr {:p} admin completion error: rc={}", ctrlr, rc);
+            }
+        }
+    }
+}
+
+/// Per-qpair state tracked on the poller thread. Holds the dead flag and
+/// a Vec of all in-flight CallbackCtx pointers for force-completion.
+struct QpairState {
+    dead: Arc<AtomicBool>,
+    pending: Vec<*mut CallbackCtx>,
 }
 
 /// C callback context. Heap-allocated for SPDK to hold pointer.
@@ -796,5 +871,201 @@ impl Drop for SpdkPoller {
         // The caller (SpdkEnv::shutdown) is responsible for calling reclaim_stale()
         // after pool drain when late callbacks are guaranteed finished.
         // Any remaining orphaned entries leak in the timeout path — bounded leak.
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const DEAD: usize = 0xDEAD;
+    const LIVE: usize = 0xCAFE;
+
+    #[test]
+    fn force_complete_reclaims_callback_ctx() {
+        // Allocate CallbackCtx as submit_one does, one per simulated I/O.
+        let completion_1 = IoCompletion::new();
+        let inflight_1 = Arc::new(AtomicUsize::new(1));
+        let completion_2 = IoCompletion::new();
+        let inflight_2 = Arc::new(AtomicUsize::new(1));
+        let completion_3 = IoCompletion::new();
+        let inflight_3 = Arc::new(AtomicUsize::new(1));
+
+        // Create QpairState for DEAD qpair.
+        let dead_flag = Arc::new(AtomicBool::new(false));
+        let mut qs_dead = Box::new(QpairState {
+            dead: dead_flag.clone(),
+            pending: Vec::new(),
+        });
+
+        // Allocate and push 2 CallbackCtx entries into DEAD's pending Vec.
+        let ctx_1 = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion_1.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight_1.clone(),
+            qpair_state: &mut *qs_dead as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs_dead.pending.push(ctx_1);
+
+        let ctx_2 = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion_2.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight_2.clone(),
+            qpair_state: &mut *qs_dead as *mut QpairState,
+            pending_idx: 1,
+        }));
+        qs_dead.pending.push(ctx_2);
+
+        // Create QpairState for LIVE qpair (control — should be untouched).
+        let live_flag = Arc::new(AtomicBool::new(false));
+        let mut qs_live = Box::new(QpairState {
+            dead: live_flag,
+            pending: Vec::new(),
+        });
+
+        let ctx_3 = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion_3.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight_3.clone(),
+            qpair_state: &mut *qs_live as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs_live.pending.push(ctx_3);
+
+        // Build dead_qpairs map.
+        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
+        dead_qpairs.insert(DEAD, qs_dead);
+        dead_qpairs.insert(LIVE, qs_live);
+
+        // Act.
+        SpdkPoller::force_complete_qpair(DEAD, &mut dead_qpairs);
+
+        // Assert: DEAD entries completed with -EIO.
+        assert_eq!(completion_1.wait(0), -libc::EIO);
+        assert_eq!(completion_2.wait(0), -libc::EIO);
+
+        // Assert: LIVE entry NOT completed (timeout with 1ms).
+        assert_eq!(completion_3.wait(1000), -libc::ETIMEDOUT);
+
+        // Assert: DEAD entries' bdev_inflight decremented.
+        assert_eq!(inflight_1.load(Ordering::Acquire), 0);
+        assert_eq!(inflight_2.load(Ordering::Acquire), 0);
+
+        // Assert: LIVE entry's bdev_inflight unchanged.
+        assert_eq!(inflight_3.load(Ordering::Acquire), 1);
+
+        // Assert: dead flag set.
+        assert!(dead_flag.load(Ordering::Acquire));
+
+        // Assert: DEAD removed from dead_qpairs, LIVE still present.
+        assert!(!dead_qpairs.contains_key(&DEAD));
+        assert!(dead_qpairs.contains_key(&LIVE));
+
+        // Clean up LIVE entry (force_complete did not touch it).
+        // The raw pointer in qs_live.pending must be reclaimed.
+        if let Some(qs) = dead_qpairs.get_mut(&LIVE) {
+            for cb_ptr in qs.pending.drain(..) {
+                unsafe { drop(Box::from_raw(cb_ptr as *mut CallbackCtx)) };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const DEAD: usize = 0xDEAD;
+    const LIVE: usize = 0xCAFE;
+
+    #[test]
+    fn force_complete_reclaims_callback_ctx() {
+        // Allocate CallbackCtx as submit_one does, one per simulated I/O.
+        let completion_1 = IoCompletion::new();
+        let inflight_1 = Arc::new(AtomicUsize::new(1));
+        let completion_2 = IoCompletion::new();
+        let inflight_2 = Arc::new(AtomicUsize::new(1));
+        let completion_3 = IoCompletion::new();
+        let inflight_3 = Arc::new(AtomicUsize::new(1));
+
+        // Create QpairState for DEAD qpair.
+        let dead_flag = Arc::new(AtomicBool::new(false));
+        let mut qs_dead = Box::new(QpairState {
+            dead: dead_flag.clone(),
+            pending: Vec::new(),
+        });
+
+        // Allocate and push 2 CallbackCtx entries into DEAD's pending Vec.
+        let ctx_1 = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion_1.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight_1.clone(),
+            qpair_state: &mut *qs_dead as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs_dead.pending.push(ctx_1);
+
+        let ctx_2 = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion_2.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight_2.clone(),
+            qpair_state: &mut *qs_dead as *mut QpairState,
+            pending_idx: 1,
+        }));
+        qs_dead.pending.push(ctx_2);
+
+        // Create QpairState for LIVE qpair (control — should be untouched).
+        let live_flag = Arc::new(AtomicBool::new(false));
+        let mut qs_live = Box::new(QpairState {
+            dead: live_flag,
+            pending: Vec::new(),
+        });
+
+        let ctx_3 = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion_3.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight_3.clone(),
+            qpair_state: &mut *qs_live as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs_live.pending.push(ctx_3);
+
+        // Build dead_qpairs map.
+        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
+        dead_qpairs.insert(DEAD, qs_dead);
+        dead_qpairs.insert(LIVE, qs_live);
+
+        // Act.
+        SpdkPoller::force_complete_qpair(DEAD, &mut dead_qpairs);
+
+        // Assert: DEAD entries completed with -EIO.
+        assert_eq!(completion_1.wait(0), -libc::EIO);
+        assert_eq!(completion_2.wait(0), -libc::EIO);
+
+        // Assert: LIVE entry NOT completed (timeout with 1ms).
+        assert_eq!(completion_3.wait(1000), -libc::ETIMEDOUT);
+
+        // Assert: DEAD entries' bdev_inflight decremented.
+        assert_eq!(inflight_1.load(Ordering::Acquire), 0);
+        assert_eq!(inflight_2.load(Ordering::Acquire), 0);
+
+        // Assert: LIVE entry's bdev_inflight unchanged.
+        assert_eq!(inflight_3.load(Ordering::Acquire), 1);
+
+        // Assert: dead flag set.
+        assert!(dead_flag.load(Ordering::Acquire));
+
+        // Assert: DEAD removed from dead_qpairs, LIVE still present.
+        assert!(!dead_qpairs.contains_key(&DEAD));
+        assert!(dead_qpairs.contains_key(&LIVE));
+
+        // Clean up LIVE entry (force_complete did not touch it).
+        // The raw pointer in qs_live.pending must be reclaimed.
+        if let Some(qs) = dead_qpairs.get_mut(&LIVE) {
+            for cb_ptr in qs.pending.drain(..) {
+                unsafe { drop(Box::from_raw(cb_ptr as *mut CallbackCtx)) };
+            }
+        }
     }
 }

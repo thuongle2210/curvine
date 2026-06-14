@@ -31,6 +31,8 @@ pub struct SpdkIoChannel {
     pub eventfd: std::sync::Arc<nix::sys::eventfd::EventFd>,
     /// Flag: poller is idle and blocked on eventfd; only write eventfd when true
     pub poller_is_sleeping: std::sync::Arc<AtomicBool>,
+    /// Flag: the poller detected this qpair died — future I/Os fail immediately.
+    pub qpair_dead: std::sync::Arc<AtomicBool>,
 }
 unsafe impl Send for SpdkIoChannel {}
 unsafe impl Sync for SpdkIoChannel {}
@@ -141,8 +143,8 @@ pub struct SpdkBdev {
     io_channel: SpdkIoChannel,
     /// Raw controller pointer (for qpair pool on drop).
     ctrlr: *mut crate::io::spdk_ffi::spdk_nvme_ctrlr,
-    /// I/O timeout in microseconds. 0 = no timeout.
-    io_timeout_us: u64,
+    /// I/O timeout in milliseconds. 0 = no timeout.
+    io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -227,13 +229,15 @@ impl SpdkBdev {
             let poller_tx = env.poller_sender(); // Get sender from SpdkEnv
             let eventfd = env.poller_eventfd(); // Get eventfd for wake signaling
             let poller_is_sleeping = env.poller_is_sleeping(); // Skip eventfd if active
+            let qpair_dead = std::sync::Arc::new(AtomicBool::new(false));
             let io_channel = SpdkIoChannel {
                 qpair,
                 poller_tx,
                 eventfd,
                 poller_is_sleeping,
+                qpair_dead: qpair_dead.clone(),
             };
-            let io_timeout_us = env.conf().io_timeout_us;
+            let io_timeout_ms = info.io_timeout_ms;
             Ok(Self {
                 name: name.to_string(),
                 size,
@@ -245,7 +249,7 @@ impl SpdkBdev {
                 write_buf,
                 ns,
                 ctrlr,
-                io_timeout_us,
+                io_timeout_ms,
                 inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
         }
@@ -311,6 +315,10 @@ impl SpdkBdev {
 
     /// Submit read to SPDK, wait for completion. Uses DMA buffer (large reads chunked).
     fn spdk_read(&mut self, offset: i64, len: usize) -> IOResult<BytesMut> {
+        if self.io_channel.qpair_dead.load(Ordering::Acquire) {
+            return err_box!("SPDK qpair is dead, device unreachable");
+        }
+
         let buf_cap = self.read_buf.capacity();
         let dma_buf = self.read_buf.as_ptr();
 
@@ -342,6 +350,7 @@ impl SpdkBdev {
                 },
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
+                qpair_dead: self.io_channel.qpair_dead.clone(),
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
@@ -357,7 +366,7 @@ impl SpdkBdev {
                     );
                 }
             }
-            let rc = completion.wait(self.io_timeout_us);
+            let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
                 return err_box!(
                     "NVMe read failed on '{}' at offset={}: {}",
@@ -379,6 +388,10 @@ impl SpdkBdev {
 
     /// Submit write to SPDK, wait for completion. Uses DMA buffer (large writes chunked).
     fn spdk_write(&mut self, offset: i64, data: &[u8]) -> IOResult<()> {
+        if self.io_channel.qpair_dead.load(Ordering::Acquire) {
+            return err_box!("SPDK qpair is dead, device unreachable");
+        }
+
         use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
 
         if !self.writable {
@@ -417,6 +430,7 @@ impl SpdkBdev {
                     },
                     completion: completion.clone(),
                     bdev_inflight: self.inflight.clone(),
+                    qpair_dead: self.io_channel.qpair_dead.clone(),
                 };
                 if self.io_channel.poller_tx.send(req).is_err() {
                     self.inflight
@@ -432,7 +446,7 @@ impl SpdkBdev {
                         );
                     }
                 }
-                let rc = completion.wait(self.io_timeout_us);
+                let rc = completion.wait(self.io_timeout_ms * 1000);
 
                 if rc != 0 {
                     return err_box!(
@@ -465,6 +479,7 @@ impl SpdkBdev {
                 },
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
+                qpair_dead: self.io_channel.qpair_dead.clone(),
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
@@ -480,7 +495,7 @@ impl SpdkBdev {
                     );
                 }
             }
-            let rc = completion.wait(self.io_timeout_us);
+            let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
                 return err_box!(
                     "NVMe write failed on '{}' at offset={}, len={}: {}",
@@ -498,6 +513,10 @@ impl SpdkBdev {
     }
 
     fn spdk_flush(&self) -> IOResult<()> {
+        if self.io_channel.qpair_dead.load(Ordering::Acquire) {
+            return err_box!("SPDK qpair is dead, device unreachable");
+        }
+
         use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
         let completion = IoCompletion::new();
         self.inflight
@@ -509,6 +528,7 @@ impl SpdkBdev {
             },
             completion: completion.clone(),
             bdev_inflight: self.inflight.clone(),
+            qpair_dead: self.io_channel.qpair_dead.clone(),
         };
         if self.io_channel.poller_tx.send(req).is_err() {
             return err_box!("SPDK poller thread is gone");
@@ -522,7 +542,7 @@ impl SpdkBdev {
                 );
             }
         }
-        let rc = completion.wait(self.io_timeout_us);
+        let rc = completion.wait(self.io_timeout_ms * 1000);
         if rc != 0 {
             return err_box!(
                 "NVMe flush failed on '{}': {}",
@@ -670,8 +690,8 @@ impl Display for SpdkBdev {
 impl Drop for SpdkBdev {
     fn drop(&mut self) {
         // Wait for in-flight I/O.
-        let max_wait = if self.io_timeout_us > 0 {
-            std::time::Duration::from_micros(self.io_timeout_us * 2)
+        let max_wait = if self.io_timeout_ms > 0 {
+            std::time::Duration::from_millis(self.io_timeout_ms * 2)
         } else {
             std::time::Duration::from_secs(60)
         };

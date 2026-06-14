@@ -20,13 +20,12 @@ use curvine_common::state::FileBlocks;
 use curvine_common::FsResult;
 use log::error;
 use orpc::err_box;
-use orpc::runtime::RpcRuntime;
+use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
 use orpc::sync::ErrorMonitor;
 use orpc::sys::DataSlice;
 use std::sync::Arc;
 use tokio::sync::mpsc::Permit;
-use tokio::task::yield_now;
 
 // Control task type
 enum ReadTask {
@@ -40,10 +39,18 @@ enum SelectTask<'a> {
     Permit(Permit<'a, FileChunk>),
 }
 
+struct PrefetchArgs {
+    rt: Arc<Runtime>,
+    reader: FsReaderParallel,
+    chunk_sender: AsyncSender<FileChunk>,
+    task_receiver: AsyncReceiver<ReadTask>,
+}
+
 // A parallel task description structure
 // chunk_receiver: accept data
 // task_sender: Send control command
 struct BufferChannel {
+    prefetch: Option<PrefetchArgs>,
     chunk_receiver: AsyncReceiver<FileChunk>,
     task_sender: AsyncSender<ReadTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
@@ -54,7 +61,31 @@ impl BufferChannel {
         self.err_monitor.take_error().unwrap_or(e.into())
     }
 
+    fn start_prefetch(&mut self) {
+        let Some(args) = self.prefetch.take() else {
+            return;
+        };
+
+        let monitor = self.err_monitor.clone();
+        let parallel_id = args.reader.parallel_id();
+
+        args.rt.spawn(async move {
+            let res =
+                FsReaderBuffer::read_future(args.chunk_sender, args.task_receiver, args.reader)
+                    .await;
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("buffer read(parallel id {}) error: {:?}", parallel_id, e);
+                    monitor.set_error(e);
+                }
+            }
+        });
+    }
+
     async fn read(&mut self) -> FsResult<FileChunk> {
+        self.start_prefetch();
+
         self.chunk_receiver
             .recv_check()
             .await
@@ -62,6 +93,8 @@ impl BufferChannel {
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        self.start_prefetch();
+
         let fun = async {
             // Notify seek and seek will pause data reading.
             let (tx, rx) = CallChannel::channel();
@@ -79,6 +112,11 @@ impl BufferChannel {
     }
 
     async fn complete(&mut self) -> FsResult<()> {
+        if self.prefetch.is_some() {
+            // Prefetch task was never started, nothing to stop.
+            return Ok(());
+        }
+
         let fun = async {
             // Send a stop command and wait for the command to complete
             let (tx, rx) = CallChannel::channel();
@@ -90,6 +128,9 @@ impl BufferChannel {
     }
 
     async fn pause(&self, pos: i64, pause: bool) -> FsResult<()> {
+        if self.prefetch.is_some() {
+            return Ok(());
+        }
         let fun = async { self.task_sender.send(ReadTask::Pause((pos, pause))).await };
         fun.await.map_err(|e| self.check_error(e))
     }
@@ -134,6 +175,7 @@ impl ReaderAdapter {
 // Reader with buffer.
 pub struct FsReaderBuffer {
     readers: Vec<ReaderAdapter>,
+    base_reader_index: usize,
     path: Path,
     pos: i64,
     len: i64,
@@ -185,20 +227,13 @@ impl FsReaderBuffer {
             } else {
                 let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
                 let (task_sender, task_receiver) = AsyncChannel::new(2).split();
-                let monitor = err_monitor.clone();
-                let parallel_id = reader.parallel_id();
-
-                rt.spawn(async move {
-                    let res = Self::read_future(chunk_sender, task_receiver, reader).await;
-                    match res {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("buffer read(parallel id {})error: {:?}", parallel_id, e);
-                            monitor.set_error(e);
-                        }
-                    }
-                });
                 let channel = BufferChannel {
+                    prefetch: Some(PrefetchArgs {
+                        rt: rt.clone(),
+                        reader,
+                        chunk_sender,
+                        task_receiver,
+                    }),
                     chunk_receiver,
                     task_sender,
                     err_monitor: err_monitor.clone(),
@@ -208,10 +243,12 @@ impl FsReaderBuffer {
             readers.push(reader);
         }
 
+        let base_reader_index = readers.len();
         readers.push(ReaderAdapter::Base(base));
 
         let reader = Self {
             readers,
+            base_reader_index,
             path,
             pos,
             len,
@@ -245,14 +282,42 @@ impl FsReaderBuffer {
         &self.path
     }
 
+    fn select_reader_index(
+        is_random: bool,
+        pos: i64,
+        slice_size: i64,
+        read_parallel: i64,
+        base_reader_index: usize,
+    ) -> Option<usize> {
+        if is_random {
+            return Some(base_reader_index);
+        }
+
+        if slice_size <= 0 || read_parallel <= 0 {
+            return None;
+        }
+
+        Some((pos / slice_size % read_parallel) as usize)
+    }
+
     fn get_reader(&mut self) -> FsResult<&mut ReaderAdapter> {
-        let id = if self.read_detector.is_random() {
-            self.read_detector.read_parallel()
-        } else {
-            self.pos / self.slice_size % self.read_detector.read_parallel()
+        let Some(id) = Self::select_reader_index(
+            self.read_detector.is_random(),
+            self.pos,
+            self.slice_size,
+            self.read_detector.read_parallel(),
+            self.base_reader_index,
+        ) else {
+            return err_box!(
+                "reader is not initialized: pos={}, slice_size={}, read_parallel={}, base_reader_index={}",
+                self.pos,
+                self.slice_size,
+                self.read_detector.read_parallel(),
+                self.base_reader_index
+            );
         };
 
-        match self.readers.get_mut(id as usize) {
+        match self.readers.get_mut(id) {
             Some(v) => Ok(v),
             None => err_box!("reader {} is not initialized", id),
         }
@@ -289,11 +354,10 @@ impl FsReaderBuffer {
         let is_changed = self
             .read_detector
             .record_read(start_pos, self.pos, &self.path);
-        if is_changed {
+
+        if is_changed && self.read_detector.is_sequential() {
             for reader in &mut self.readers {
-                if self.read_detector.is_sequential() {
-                    reader.pause(self.pos, false).await?;
-                }
+                reader.pause(self.pos, false).await?;
             }
         }
 
@@ -334,74 +398,109 @@ impl FsReaderBuffer {
         mut task_receiver: AsyncReceiver<ReadTask>,
         mut reader: FsReaderParallel,
     ) -> FsResult<()> {
-        // Mark whether the current task needs to be paused
         let mut paused = false;
         loop {
-            // The queue can be written and controlled to complete any future.
-            let select_task = tokio::select! {
-                biased;
-
-                task_opt = task_receiver.recv() => {
-                    match task_opt {
-                        Some(task) => SelectTask::Control(task),
-                        None => return Ok(()), // control channel closed: normal shutdown
-                    }
+            let select_task = if paused {
+                match task_receiver.recv().await {
+                    Some(task) => SelectTask::Control(task),
+                    None => return Ok(()), // control channel closed while paused
                 }
+            } else {
+                tokio::select! {
+                    biased;
 
-                permit_res = chunk_sender.reserve() => {
-                    if !paused {
+                    task_opt = task_receiver.recv() => {
+                        match task_opt {
+                            Some(task) => SelectTask::Control(task),
+                            None => return Ok(()), // control channel closed: normal shutdown
+                        }
+                    }
+
+                    permit_res = chunk_sender.reserve() => {
                         match permit_res {
                             Ok(permit) => SelectTask::Permit(permit),
                             Err(_e) => return Ok(()), // data channel closed: normal shutdown
-                        }
-                    } else {
-                        // Wait for the next command to prevent the CPU from idling.
-                        match task_receiver.recv().await {
-                            Some(task) => SelectTask::Control(task),
-                            None => return Ok(()), // control channel closed while paused
                         }
                     }
                 }
             };
 
             match select_task {
-                SelectTask::Control(task) => {
-                    match task {
-                        ReadTask::Seek(pos, tx) => {
-                            // 1. reader executes seek
-                            // 2. Set paused = true
-                            // 3. The notification pause was successful
-                            paused = true;
-                            reader.seek(pos).await?;
-                            tx.send(1)?;
-                        }
-
-                        ReadTask::Pause((pos, v)) => {
-                            paused = v;
-                            reader.seek(pos).await?;
-                        }
-
-                        ReadTask::Stop(tx) => {
-                            reader.complete().await?;
-                            tx.send(1)?;
-                            return Ok(());
-                        }
+                SelectTask::Control(task) => match task {
+                    ReadTask::Seek(pos, tx) => {
+                        // 1. reader executes seek
+                        // 2. Set paused = true
+                        // 3. The notification pause was successful
+                        paused = true;
+                        reader.seek(pos).await?;
+                        tx.send(1)?;
                     }
-                }
+
+                    ReadTask::Pause((pos, v)) => {
+                        paused = v;
+                        reader.seek(pos).await?;
+                    }
+
+                    ReadTask::Stop(tx) => {
+                        reader.complete().await?;
+                        tx.send(1)?;
+                        return Ok(());
+                    }
+                },
 
                 SelectTask::Permit(permit) => {
-                    if !paused {
-                        let chunk = reader.read().await?;
-                        if chunk.is_empty() {
-                            paused = true;
-                        }
-                        // Send an empty chunk to prevent read from blocking.
-                        permit.send(chunk);
-                    } else {
-                        yield_now().await;
+                    // paused is guaranteed false here (paused branch never yields a Permit).
+                    let chunk = reader.read().await?;
+                    if chunk.is_empty() {
+                        paused = true;
                     }
+                    // Send the chunk (possibly empty) so the reader side does not block.
+                    permit.send(chunk);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_common::conf::ClusterConf;
+    use curvine_common::state::FileStatus;
+
+    fn sparse_file_blocks(len: i64) -> FileBlocks {
+        FileBlocks::new(
+            FileStatus {
+                id: 1,
+                len,
+                is_complete: true,
+                ..Default::default()
+            },
+            vec![],
+        )
+    }
+
+    #[test]
+    fn test_random_read_uses_base_reader_for_sparse_parallel_slices() {
+        let mut conf = ClusterConf::default();
+        conf.client.read_parallel = 4;
+        conf.client.read_chunk_num = 1;
+        conf.client.read_slice_size_str = "16MB".to_string();
+        conf.client.large_file_size_str = "1GB".to_string();
+        conf.client.init().unwrap();
+
+        let file_len = conf.client.read_slice_size / 2;
+        let file_blocks = sparse_file_blocks(file_len);
+        let path = Path::from_str("/small-file").unwrap();
+        let read_detector = ReadDetector::with_conf(&conf.client, file_len);
+        let fs_context = Arc::new(FsContext::new(conf).unwrap());
+        let rt = fs_context.clone_runtime();
+        let mut reader = FsReaderBuffer::new(path, fs_context, file_blocks, read_detector).unwrap();
+
+        assert_eq!(reader.base_reader_index, 1);
+
+        rt.block_on(reader.seek(file_len)).unwrap();
+        assert!(reader.read_detector.is_random());
+        assert!(reader.get_reader().is_ok());
     }
 }

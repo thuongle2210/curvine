@@ -105,6 +105,11 @@ impl NodeState {
         is_changed
     }
 
+    pub fn clear(&self) -> FuseResult<()> {
+        self.node_write().clean_cache();
+        Ok(())
+    }
+
     pub fn should_keep_cache(&self, id: u64, status: &FileStatus) -> bool {
         let is_changed = self.update_cache_state(id, status);
         !is_changed
@@ -298,6 +303,13 @@ impl NodeState {
         Ok(reader)
     }
 
+    pub async fn complete_writer(&self, ino: u64) -> FuseResult<()> {
+        if let Some(existing_writer) = self.find_writer(&ino) {
+            existing_writer.lock().await.complete(None).await?;
+        }
+        Ok(())
+    }
+
     pub async fn new_handle(
         &self,
         ino: u64,
@@ -306,14 +318,6 @@ impl NodeState {
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
-
-        // Before creating reader, flush any active writer to ensure reader gets correct file length
-        // This is critical for applications like git clone that read files while they're being written
-        if flags.read() {
-            if let Some(existing_writer) = self.find_writer(&ino) {
-                existing_writer.lock().await.flush(None).await?;
-            }
-        }
 
         let (reader, writer) = match flags.access_mode() {
             mode if mode == OpenFlags::RDONLY => {

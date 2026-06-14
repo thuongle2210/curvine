@@ -17,6 +17,7 @@
 use crate::raw::fuse_abi::{fuse_in_header, fuse_out_header};
 use once_cell::sync::Lazy;
 
+pub mod cli;
 pub mod fs;
 pub mod macros;
 pub mod raw;
@@ -93,6 +94,10 @@ pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 pub const FUSE_POSIX_ACL: u32 = 1 << 20;
 
 pub const FUSE_DO_RENAME2: u32 = 1 << 11;
+
+/// Kernel automatically invalidates the page cache on open when mtime or size
+/// has changed (CAP_AUTO_INVAL_DATA, available since Linux 2.6.35).
+pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
 
 pub const FUSE_MAX_NAME_LENGTH: usize = 255;
 

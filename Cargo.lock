@@ -1966,7 +1966,6 @@ dependencies = [
  "async-stream",
  "bytes",
  "curvine-common",
- "curvine-tracing-appender",
  "curvine-ufs",
  "dashmap 5.5.3",
  "futures",
@@ -1984,6 +1983,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 
@@ -2001,6 +2001,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "crossbeam",
+ "curvine-common-macros",
  "dashmap 5.5.3",
  "flate2",
  "futures",
@@ -2036,6 +2037,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-common-macros"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "orpc",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "curvine-fuse"
 version = "0.2.0"
 dependencies = [
@@ -2045,7 +2058,6 @@ dependencies = [
  "clap",
  "curvine-client",
  "curvine-common",
- "curvine-tracing-appender",
  "dashmap 5.5.3",
  "futures",
  "fxhash",
@@ -2060,11 +2072,13 @@ dependencies = [
  "pin-project-lite",
  "pkg-config",
  "serde",
+ "serde_json",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "trait-variant",
 ]
@@ -2108,7 +2122,6 @@ dependencies = [
  "cc",
  "curvine-client",
  "curvine-common",
- "curvine-tracing-appender",
  "dashmap 5.5.3",
  "futures",
  "jni",
@@ -2124,6 +2137,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 
@@ -2183,7 +2197,6 @@ dependencies = [
  "curvine-fuse",
  "curvine-lancedb",
  "curvine-server",
- "curvine-tracing-appender",
  "curvine-ufs",
  "futures",
  "lance-io",
@@ -2194,20 +2207,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "url",
-]
-
-[[package]]
-name = "curvine-tracing-appender"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d785fa01e9a1b7fd1aa71967e79bda314827c03997591d2d260b3f9bef226df"
-dependencies = [
- "crossbeam-channel",
- "thiserror 2.0.16",
- "time",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5804,11 +5806,10 @@ dependencies = [
 
 [[package]]
 name = "num-bigint-dig"
-version = "0.8.4"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc84195820f291c7697304f3cbdadd1cb7199c0efc917ff5eafd71225c136151"
+checksum = "e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7"
 dependencies = [
- "byteorder",
  "lazy_static",
  "libm",
  "num-integer",
@@ -6080,7 +6081,6 @@ dependencies = [
  "chrono",
  "crc32fast",
  "crossbeam",
- "curvine-tracing-appender",
  "dashmap 5.5.3",
  "fs2",
  "futures",
@@ -6101,6 +6101,7 @@ dependencies = [
  "prost 0.11.9",
  "prost-build 0.11.9",
  "rand 0.8.5",
+ "rolling-file",
  "serde",
  "socket2 0.5.10",
  "sysinfo",
@@ -6109,6 +6110,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
  "uuid",
@@ -7730,6 +7732,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rolling-file"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8395b4f860856b740f20a296ea2cd4d823e81a2658cf05ef61be22916026a906"
+dependencies = [
+ "chrono",
+]
+
+[[package]]
 name = "roxmltree"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8589,6 +8600,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9290,6 +9307,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror 2.0.16",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

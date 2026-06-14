@@ -128,16 +128,15 @@ pub struct FuseConf {
     // File and directory related options
     pub direct_io: bool,
 
+    // When the file is opened and the local metadata (mtime/len) differs from the server,
+    // fall back to direct I/O for that open instead of letting the kernel serve stale
+    // page-cache data.  This gives stronger per-open consistency at the cost of bypassing
+    // the page cache entirely for the affected file descriptor.  Default: false.
+    pub open_direct_on_stale: bool,
+
     pub write_back_cache: bool,
 
     pub cache_readdir: bool,
-
-    /// When metadata indicates a cache miss on open, use direct I/O instead of
-    /// dropping the kernel page cache. Default false preserves mmap/read coherence
-    /// (#850); set true to restore the pre-fix behavior for strict remote-read
-    /// freshness (log tailers, multi-writer pipelines). May break MAP_SHARED ↔
-    /// pread coherence when enabled.
-    pub direct_io_on_cache_miss: bool,
 
     pub non_seekable: bool,
 
@@ -311,12 +310,12 @@ impl Default for FuseConf {
             meta_cache_ttl: "120s".to_string(),
 
             node_cache_size: 200000,
-            node_cache_timeout: "24h".to_string(),
+            node_cache_timeout: "1h".to_string(),
 
             direct_io: false,
+            open_direct_on_stale: false,
             write_back_cache: false,
             cache_readdir: false,
-            direct_io_on_cache_miss: false,
             non_seekable: false,
             check_permission: true,
 
