@@ -879,6 +879,88 @@ impl SpdkEnv {
         }
     }
 
+    /// Unregister controller from poller, blocking until removed to prevent UAF
+    /// on process_admin_completions. Returns false if poller didn't ack.
+    pub fn unregister_ctrlr_from_poller(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+    ) -> bool {
+        let poller = self.poller.lock().unwrap();
+        if let Some(poller) = poller.as_ref() {
+            poller.unregister_ctrlr(ctrlr)
+        } else {
+            false
+        }
+    }
+
+    /// Detach a single NVMe-oF target at runtime.
+    ///
+    /// 1. Unregisters the controller from poller (stops admin completion polling)
+    /// 2. Detaches the SPDK controller
+    ///
+    /// Does NOT remove the target from `conf.targets` or `bdevs` — those are
+    /// immutable after init. Call `shutdown()` when all targets should be removed.
+    pub fn detach_target(&self, target_idx: usize) -> CommonResult<()> {
+        let current = self.state();
+        if current != SpdkEnvState::Initialized {
+            return err_box!(
+                "SpdkEnv: cannot detach target in state {} (expected Initialized)",
+                current
+            );
+        }
+
+        if target_idx >= self.conf.targets.len() {
+            return err_box!(
+                "SpdkEnv: target index {} out of range ({} targets)",
+                target_idx,
+                self.conf.targets.len()
+            );
+        }
+
+        let target = &self.conf.targets[target_idx];
+        info!("Detaching target[{}]: {}", target_idx, target.endpoint());
+
+        // Find controller pointer for this target via bdev metadata
+        let ctrlr: Option<*mut spdk_ffi::spdk_nvme_ctrlr> = self
+            .bdevs
+            .iter()
+            .find(|b| b.target_endpoint == target.endpoint())
+            .map(|b| b.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr);
+
+        if let Some(ctrlr) = ctrlr {
+            // Step 1: Unregister from poller so process_admin_completions stops.
+            let unreg_ok = self.unregister_ctrlr_from_poller(ctrlr);
+            if !unreg_ok {
+                warn!(
+                    "detach_target[{}]: poller unregister timed out, proceeding with detach",
+                    target_idx
+                );
+            }
+
+            // Step 2: Detach SPDK controller.
+            let rc = unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
+            if rc != 0 {
+                return err_box!(
+                    "SpdkEnv: spdk_nvme_detach failed for target[{}]: rc={}",
+                    target_idx,
+                    rc
+                );
+            }
+            info!(
+                "detach_target[{}]: controller {:p} detached",
+                target_idx, ctrlr
+            );
+        } else {
+            warn!(
+                "detach_target[{}]: no controller found for target '{}', already detached?",
+                target_idx,
+                target.endpoint()
+            );
+        }
+
+        Ok(())
+    }
+
     // SPDK FFI — feature-gated
 
     fn env_init(&self) -> CommonResult<()> {
