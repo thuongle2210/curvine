@@ -229,6 +229,9 @@ impl SpdkBdev {
             let poller_tx = env.poller_sender(); // Get sender from SpdkEnv
             let eventfd = env.poller_eventfd(); // Get eventfd for wake signaling
             let poller_is_sleeping = env.poller_is_sleeping(); // Skip eventfd if active
+            // TODO(#1): qpair_dead is per-bdev but should be shared across all
+            // bdevs using the same qpair (qpair_pool level). One bdev timeout
+            // poisons the qpair but sibling bdevs don't see the dead flag.
             let qpair_dead = std::sync::Arc::new(AtomicBool::new(false));
             let io_channel = SpdkIoChannel {
                 qpair,
