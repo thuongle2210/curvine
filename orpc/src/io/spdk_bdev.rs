@@ -700,42 +700,6 @@ impl Display for SpdkBdev {
 
 impl Drop for SpdkBdev {
     fn drop(&mut self) {
-        // Wait for in-flight I/O.
-        let max_wait = if self.io_timeout_ms > 0 {
-            std::time::Duration::from_millis(self.io_timeout_ms * 2)
-        } else {
-            std::time::Duration::from_secs(60)
-        };
-        let deadline = std::time::Instant::now() + max_wait;
-        let mut logged = false;
-        loop {
-            let count = self.inflight.load(std::sync::atomic::Ordering::Acquire);
-            if count == 0 {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                error!(
-                    "SpdkBdev '{}': {} in-flight I/O(s) still pending after {}s. \
-                         Leaking DMA buffers to prevent use-after-free.",
-                    self.name,
-                    count,
-                    max_wait.as_secs()
-                );
-                // Poison pointers so DmaBuf::drop is a no-op.
-                self.read_buf.ptr = std::ptr::null_mut();
-                self.write_buf.ptr = std::ptr::null_mut();
-                break;
-            }
-            if !logged {
-                warn!(
-                    "SpdkBdev '{}': waiting for {} in-flight I/O(s) to complete before drop",
-                    self.name, count
-                );
-                logged = true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-
         // Return qpair to pool and release handle.
         if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
             // Unregister qpair from poller before returning it to pool to avoid use-after-free

@@ -686,6 +686,9 @@ impl SpdkEnv {
                 // but do NOT detach controllers or call env_fini.
                 if let Some(mut poller) = self.poller.lock().unwrap().take() {
                     poller.stop();
+                    // Safe to reclaim stale entries: no free_io_qpair was
+                    // called in this path, so no late SPDK callbacks can fire.
+                    poller.reclaim_stale();
                     info!("SPDK poller thread stopped (timeout path)");
                 }
                 return;
