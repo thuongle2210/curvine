@@ -461,6 +461,11 @@ pub struct SpdkEnv {
     open_handles: AtomicUsize,
     qpair_pool: QpairPool,
     poller: Mutex<Option<SpdkPoller>>,
+    /// Qpairs whose `unregister_qpair` timed out (poller unresponsive).
+    /// Resolved periodically by checking if the poller has orphaned them.
+    /// Freed via `resolve_deferred_qpairs` during subsequent `release_qpair`
+    /// or during `shutdown()`.
+    deferred_qpairs: Mutex<Vec<*mut spdk_ffi::spdk_nvme_qpair>>,
 }
 
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
@@ -482,6 +487,7 @@ impl SpdkEnv {
             open_handles: AtomicUsize::new(0),
             qpair_pool: QpairPool::new(),
             poller: Mutex::new(None),
+            deferred_qpairs: Mutex::new(Vec::new()),
         })
     }
 
@@ -686,8 +692,11 @@ impl SpdkEnv {
                 // but do NOT detach controllers or call env_fini.
                 if let Some(mut poller) = self.poller.lock().unwrap().take() {
                     poller.stop();
-                    // Safe to reclaim stale entries: no free_io_qpair was
-                    // called in this path, so no late SPDK callbacks can fire.
+                    // Resolve deferred qpairs first (free_io_qpair fires late
+                    // callbacks against orphaned entries that are still alive).
+                    self.resolve_deferred_qpairs_with(&poller);
+                    // Safe to reclaim stale entries: no further free_io_qpair
+                    // was called in this path, so no late SPDK callbacks remain.
                     poller.reclaim_stale();
                     info!("SPDK poller thread stopped (timeout path)");
                 }
@@ -713,7 +722,13 @@ impl SpdkEnv {
             // The stale CallbackCtx entries in orphaned list are still valid.
             self.qpair_pool.drain_all();
 
-            // All late callbacks have now fired. Safe to reclaim orphaned entries.
+            // Resolve deferred qpairs BEFORE reclaim_stale. This calls
+            // free_io_qpair which fires late SPDK callbacks against orphaned
+            // CallbackCtx entries that are still alive.
+            self.resolve_deferred_qpairs_with(&poller);
+
+            // All late callbacks (including from deferred) have now fired.
+            // Safe to reclaim remaining orphaned entries.
             poller.reclaim_stale();
             info!("SPDK poller: stale callback contexts reclaimed");
         } else {
@@ -838,6 +853,48 @@ impl SpdkEnv {
     ) -> CommonResult<*mut spdk_ffi::spdk_nvme_qpair> {
         self.qpair_pool.acquire(ctrlr)
     }
+    /// Try to resolve deferred qpairs (those whose unregister timed out).
+    /// For each qpair the poller has orphaned, free it and reclaim its
+    /// CallbackCtx entries. Safe to call opportunistically on every
+    /// bdev close — the normal fast path has an empty deferred list.
+    pub fn resolve_deferred_qpairs(&self) {
+        let mut deferred = self.deferred_qpairs.lock().unwrap_or_else(|p| p.into_inner());
+        deferred.retain(|&qpair| {
+            let poller_guard = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+            let poller = match poller_guard.as_ref() {
+                Some(p) => p,
+                // Poller is gone — can't check orphaned state.
+                // Leave in deferred for shutdown's explicit pass.
+                None => return true,
+            };
+            if poller.has_orphaned_for_qpair(qpair) {
+                unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                poller.reclaim_orphaned_for_qpair(qpair);
+                false // resolved, remove from deferred
+            } else {
+                true // not yet orphaned, keep for next attempt
+            }
+        });
+    }
+
+    /// Resolve deferred qpairs using an explicit poller reference.
+    /// Used during shutdown where the poller is already locked.
+    /// Must be called BEFORE `reclaim_stale` to ensure late
+    /// SPDK callbacks from `free_io_qpair` fire while the orphaned
+    /// CallbackCtx entries are still alive.
+    pub fn resolve_deferred_qpairs_with(&self, poller: &SpdkPoller) {
+        let mut deferred = self.deferred_qpairs.lock().unwrap_or_else(|p| p.into_inner());
+        deferred.retain(|&qpair| {
+            if poller.has_orphaned_for_qpair(qpair) {
+                unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                poller.reclaim_orphaned_for_qpair(qpair);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// Return qpair to pool, or free if at capacity.
     /// If the qpair has orphaned CallbackCtx entries (dead qpair), bypass
     /// the pool and free immediately, then reclaim orphaned entries.
@@ -846,6 +903,9 @@ impl SpdkEnv {
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
+        // Opportunistically resolve any deferred qpairs.
+        self.resolve_deferred_qpairs();
+
         // Check if this qpair has orphaned entries (dead/error path).
         let has_orphaned = self
             .poller
@@ -873,10 +933,19 @@ impl SpdkEnv {
 
     /// Unregister qpair from poller, blocking until removed to prevent UAF.
     /// Returns false if poller didn't ack within timeout (likely stuck/dead).
+    /// On timeout, the qpair is added to `deferred_qpairs` for later cleanup.
     pub fn unregister_qpair_from_poller(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
         let poller = self.poller.lock().unwrap();
         if let Some(poller) = poller.as_ref() {
-            poller.unregister_qpair(qpair)
+            let ok = poller.unregister_qpair(qpair);
+            if !ok {
+                // Push to deferred for later cleanup.
+                self.deferred_qpairs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(qpair);
+            }
+            ok
         } else {
             false
         }

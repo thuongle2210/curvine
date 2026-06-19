@@ -345,7 +345,7 @@ impl SpdkBdev {
             use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
             let completion = IoCompletion::new();
             self.inflight
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+                .fetch_add(1, Ordering::Release);
             let req = IoRequest {
                 op: IoOp::Read {
                     ns: self.ns,
@@ -359,7 +359,7 @@ impl SpdkBdev {
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    .fetch_sub(1, Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
             if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
@@ -427,7 +427,7 @@ impl SpdkBdev {
             if head_skip > 0 || (chunk_data + head_skip) < aligned_len {
                 let completion = IoCompletion::new();
                 self.inflight
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    .fetch_add(1, Ordering::Release);
                 let req = IoRequest {
                     op: IoOp::Read {
                         ns: self.ns,
@@ -441,7 +441,7 @@ impl SpdkBdev {
                 };
                 if self.io_channel.poller_tx.send(req).is_err() {
                     self.inflight
-                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                        .fetch_sub(1, Ordering::Release);
                     return err_box!("SPDK poller thread is gone");
                 }
                 if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
@@ -478,7 +478,7 @@ impl SpdkBdev {
             // Submit synchronous NVMe write
             let completion = IoCompletion::new();
             self.inflight
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
+                .fetch_add(1, Ordering::Release);
             let req = IoRequest {
                 op: IoOp::Write {
                     ns: self.ns,
@@ -492,7 +492,7 @@ impl SpdkBdev {
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    .fetch_sub(1, Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
             if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
@@ -532,7 +532,7 @@ impl SpdkBdev {
         use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
         let completion = IoCompletion::new();
         self.inflight
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+            .fetch_add(1, Ordering::Release);
         let req = IoRequest {
             op: IoOp::Flush {
                 ns: self.ns,

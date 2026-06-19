@@ -565,7 +565,7 @@ impl SpdkPoller {
     ///
     /// Always orphans — disconnect+poll does not guarantee all late callbacks
     /// have fired, so we must keep the ActiveQpair alive in orphaned for
-    /// late callbacks during free_io_qpair. See Issue B for details.
+    /// late callbacks during free_io_qpair.
     fn handle_unregister(
         req: &IoRequest,
         active_qpairs: &mut HashMap<usize, ActiveQpair>,
@@ -584,7 +584,7 @@ impl SpdkPoller {
                 }
 
                 // Always orphan — keep ActiveQpair alive for late callbacks
-                // during free_io_qpair (graceful path removed — see Issue B).
+                // during free_io_qpair (graceful path removed).
                 for &ptr in &aq.state.pending {
                     unsafe {
                         if (*ptr).completion.complete(-libc::ESHUTDOWN) {
