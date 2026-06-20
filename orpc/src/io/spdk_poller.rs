@@ -183,6 +183,27 @@ struct ActiveQpair {
 // (mutex-locked for cross-thread orphaned access).
 unsafe impl Send for ActiveQpair {}
 
+/// Remove entry at `idx` from `pending`, swapping with last to avoid O(n) shift.
+/// Updates the moved entry's heap-stored `pending_idx`.
+/// # Panics
+/// Panics if `idx >= pending.len()` (same as `Vec::swap_remove`).
+fn swap_remove_entry(pending: &mut Vec<*mut CallbackCtx>, idx: usize) {
+    assert!(
+        idx < pending.len(),
+        "swap_remove_entry: idx={} >= len={}",
+        idx,
+        pending.len()
+    );
+    let last_idx = pending.len() - 1;
+    if idx != last_idx {
+        pending[idx] = pending[last_idx];
+        unsafe {
+            (*pending[idx]).pending_idx = idx;
+        }
+    }
+    pending.pop();
+}
+
 /// Poller thread handle.
 pub struct SpdkPoller {
     /// Channel sender for I/O submissions
@@ -545,7 +566,7 @@ impl SpdkPoller {
 
         // Thread exiting — drain remaining ActiveQpairs into orphaned HashMap for safe reclamation.
         if let Ok(mut guard) = orphaned.lock() {
-            for (key, aq) in active_qpairs.drain() {
+            for (key, mut aq) in active_qpairs.drain() {
                 if let Some(mut prev) = guard.remove(&key) {
                     warn!(
                         "qpair {:p} already orphaned on thread exit, merging old entries",
@@ -592,7 +613,8 @@ impl SpdkPoller {
                         }
                     }
                 }
-                aq.state.stale.append(&mut aq.state.pending);
+                let pending = std::mem::take(&mut aq.state.pending);
+                aq.state.stale.extend(pending);
                 let qpair_key = *qpair as usize;
                 if let Ok(mut guard) = orphaned.lock() {
                     if let Some(mut prev) = guard.remove(&qpair_key) {
@@ -646,6 +668,13 @@ impl SpdkPoller {
                 state: Pin::new(Box::new(QpairState::with_capacity(io_queue_depth))),
             })
             .state;
+
+        if state.dead {
+            if req.completion.complete(-libc::ENXIO) {
+                req.bdev_inflight.fetch_sub(1, Ordering::Release);
+            }
+            return;
+        }
 
         let pending_idx = state.pending.len();
         // Must be computed BEFORE push to pending.
@@ -729,13 +758,8 @@ impl SpdkPoller {
             // local variable stale. Comparing raw pointer values is safe even if
             // the target was freed — position() returns None when not in pending.
             if let Some(actual_idx) = state.pending.iter().position(|&p| p == cb_ctx_ptr) {
-                let last = state.pending.len() - 1;
-                if actual_idx != last {
-                    state.pending[actual_idx] = state.pending[last];
-                    (*state.pending[actual_idx]).pending_idx = actual_idx;
-                }
-                state.pending.pop();
-                drop(Box::from_raw(cb_ctx_ptr));
+                swap_remove_entry(&mut state.pending, actual_idx);
+                drop(unsafe { Box::from_raw(cb_ctx_ptr) });
             }
             if req.completion.complete(rc) {
                 req.bdev_inflight.fetch_sub(1, Ordering::Release);
@@ -784,12 +808,7 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     // Only remove from pending if the entry is still there (hot path).
     // If not (late callback on orphaned entry), skip remove/free.
     if idx < qs.pending.len() && qs.pending[idx] == ctx {
-        let last_idx = qs.pending.len() - 1;
-        if idx != last_idx {
-            qs.pending[idx] = qs.pending[last_idx];
-            (*qs.pending[idx]).pending_idx = idx;
-        }
-        qs.pending.pop();
+        swap_remove_entry(&mut qs.pending, idx);
         drop(Box::from_raw(ctx));
     }
 }
@@ -810,7 +829,8 @@ fn force_complete_qpair(aq: &mut ActiveQpair) {
         }
     }
     // Move pending to stale — keep allocations alive for late callbacks
-    aq.state.stale.append(&mut aq.state.pending);
+    let pending = std::mem::take(&mut aq.state.pending);
+    aq.state.stale.extend(pending);
 }
 
 impl Drop for SpdkPoller {
@@ -821,5 +841,242 @@ impl Drop for SpdkPoller {
         // The caller (SpdkEnv::shutdown) is responsible for calling reclaim_stale()
         // after pool drain when late callbacks are guaranteed finished.
         // Any remaining orphaned entries leak in the timeout path — bounded leak.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    // ── Helpers ──
+
+    fn make_callback_ctx(owner: *mut QpairState, pending_idx: usize) -> *mut CallbackCtx {
+        Box::into_raw(Box::new(CallbackCtx {
+            completion: IoCompletion::new(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: Arc::new(AtomicUsize::new(1)),
+            pending_idx,
+            owner,
+        }))
+    }
+
+    // ── A1: swap_remove maintains pending_idx invariant ──
+
+    #[test]
+    fn swap_remove_maintains_pending_idx_invariant() {
+        let mut qs = Box::pin(QpairState::with_capacity(10));
+        let owner = &mut *qs as *mut QpairState;
+        let n = 5;
+
+        let mut ptrs = Vec::with_capacity(n);
+        for i in 0..n {
+            let ptr = make_callback_ctx(owner, i);
+            ptrs.push(ptr);
+            qs.pending.push(ptr);
+        }
+
+        // Remove each entry one by one, finding its position by pointer identity.
+        // Covers all three swap_remove paths:
+        //   remove-first (swap+reindex), remove-middle (swap+reindex), remove-last (just pop).
+        for expected_removed in 0..n {
+            let pos = qs
+                .pending
+                .iter()
+                .position(|&p| p == ptrs[expected_removed])
+                .expect("entry must be in pending");
+            assert_eq!(
+                unsafe { (*ptrs[expected_removed]).pending_idx },
+                pos,
+                "entry {} has wrong pending_idx before swap_remove",
+                expected_removed
+            );
+
+            swap_remove_entry(&mut qs.pending, pos);
+
+            // Verify every remaining entry has correct pending_idx
+            for j in 0..qs.pending.len() {
+                let p = qs.pending[j];
+                assert_eq!(
+                    unsafe { (*p).pending_idx },
+                    j,
+                    "after removing entry {}, remaining entry at {} has wrong pending_idx",
+                    expected_removed,
+                    j
+                );
+            }
+        }
+        assert!(qs.pending.is_empty(), "all entries should be removed");
+    }
+
+    // ── A2: swap_remove empty vec panics ──
+
+    #[test]
+    #[should_panic]
+    fn swap_remove_empty_panics() {
+        let mut pending: Vec<*mut CallbackCtx> = Vec::new();
+        swap_remove_entry(&mut pending, 0);
+    }
+
+    // ── A3: submit_one on dead qpair returns ENXIO ──
+
+    #[test]
+    fn submit_one_dead_qpair_returns_enxio() {
+        let qpair = 0x1 as *mut _;
+        let mut active_qpairs = HashMap::new();
+
+        active_qpairs.insert(
+            qpair as usize,
+            ActiveQpair {
+                qpair,
+                state: Pin::new(Box::new(QpairState {
+                    dead: true,
+                    pending: Vec::new(),
+                    stale: Vec::new(),
+                })),
+            },
+        );
+
+        let completion = IoCompletion::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+
+        let req = IoRequest {
+            op: IoOp::Read {
+                ns: std::ptr::null_mut(),
+                qpair,
+                buf: std::ptr::null_mut(),
+                offset: 0,
+                num_bytes: 4096,
+            },
+            completion: completion.clone(),
+            bdev_inflight: inflight.clone(),
+        };
+
+        SpdkPoller::submit_one(&req, &mut active_qpairs, 10);
+
+        // pending unchanged (no submit)
+        let aq = active_qpairs.get(&(qpair as usize)).unwrap();
+        assert!(
+            aq.state.pending.is_empty(),
+            "dead qpair must not push to pending"
+        );
+        assert!(
+            aq.state.stale.is_empty(),
+            "dead qpair must not push to stale"
+        );
+
+        // inflight decremented
+        assert_eq!(
+            inflight.load(Ordering::Acquire),
+            0,
+            "dead qpair must decrement inflight"
+        );
+
+        // completion signaled with -ENXIO
+        let status = completion.wait(0);
+        assert_eq!(
+            status,
+            -libc::ENXIO,
+            "dead qpair must complete with ENXIO, got {}",
+            status
+        );
+    }
+
+    // ── A4: handle_unregister orphans pending entries ──
+
+    #[test]
+    fn handle_unregister_orphans_pending_entries() {
+        let qpair = 0x1 as *mut _;
+        let mut active_qpairs = HashMap::new();
+        let orphaned = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut qs = Box::pin(QpairState::with_capacity(5));
+        qs.dead = true;
+        let owner = &mut *qs as *mut QpairState;
+        let ctx_a = make_callback_ctx(owner, 0);
+        let ctx_b = make_callback_ctx(owner, 1);
+        qs.pending.push(ctx_a);
+        qs.pending.push(ctx_b);
+
+        active_qpairs.insert(qpair as usize, ActiveQpair { qpair, state: qs });
+
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_unregister(&req, &mut active_qpairs, &orphaned);
+
+        // 1: removed from active_qpairs
+        assert!(
+            active_qpairs.is_empty(),
+            "unregistered qpair must be removed from active"
+        );
+
+        // 2: orphaned has the entry, dead, pending→stale
+        let guard = orphaned.lock().unwrap();
+        let aq = guard
+            .get(&(qpair as usize))
+            .expect("qpair must be orphaned");
+        assert!(aq.state.dead, "orphaned qpair must be marked dead");
+        assert!(
+            aq.state.pending.is_empty(),
+            "pending must be moved to stale"
+        );
+        assert_eq!(
+            aq.state.stale.len(),
+            2,
+            "orphaned stale must preserve both entries"
+        );
+        assert!(aq.state.stale.contains(&ctx_a), "stale must contain ctx_a");
+        assert!(aq.state.stale.contains(&ctx_b), "stale must contain ctx_b");
+
+        // 3: ack was sent
+        assert_eq!(ack_rx.try_recv(), Ok(()), "handle_unregister must send ack");
+    }
+
+    // ── A11: poller_callback hot path removes + frees ──
+
+    #[test]
+    fn poller_callback_hot_path_removes_and_frees() {
+        let mut qs = Box::pin(QpairState::with_capacity(5));
+        let owner = &mut *qs as *mut QpairState;
+        let ctx = make_callback_ctx(owner, 0);
+        qs.pending.push(ctx);
+
+        unsafe {
+            poller_callback(ctx as *mut c_void, 0);
+        }
+
+        assert!(
+            qs.pending.is_empty(),
+            "hot path must remove entry from pending"
+        );
+        assert!(qs.stale.is_empty(), "hot path must not move entry to stale");
+    }
+
+    // ── A12: poller_callback late path skips free ──
+
+    #[test]
+    fn poller_callback_late_path_skips_free() {
+        let mut qs = Box::pin(QpairState::with_capacity(5));
+        let owner = &mut *qs as *mut QpairState;
+        let ctx = make_callback_ctx(owner, 0);
+        // Entry is in stale only (simulates force_complete_qpair)
+        qs.stale.push(ctx);
+
+        unsafe {
+            poller_callback(ctx as *mut c_void, -libc::EIO);
+        }
+
+        // Entry NOT freed — still in stale
+        assert_eq!(qs.stale.len(), 1, "late path must NOT free the entry");
+        assert_eq!(
+            qs.stale[0], ctx,
+            "late path must preserve the entry pointer"
+        );
+        assert!(qs.pending.is_empty(), "late path must not affect pending");
     }
 }

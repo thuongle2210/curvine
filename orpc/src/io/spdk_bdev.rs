@@ -229,9 +229,9 @@ impl SpdkBdev {
             let poller_tx = env.poller_sender(); // Get sender from SpdkEnv
             let eventfd = env.poller_eventfd(); // Get eventfd for wake signaling
             let poller_is_sleeping = env.poller_is_sleeping(); // Skip eventfd if active
-            // TODO(#1): qpair_dead is per-bdev but should be shared across all
-            // bdevs using the same qpair (qpair_pool level). One bdev timeout
-            // poisons the qpair but sibling bdevs don't see the dead flag.
+                                                               // TODO(#1): qpair_dead is per-bdev but should be shared across all
+                                                               // bdevs using the same qpair (qpair_pool level). One bdev timeout
+                                                               // poisons the qpair but sibling bdevs don't see the dead flag.
             let qpair_dead = std::sync::Arc::new(AtomicBool::new(false));
             let io_channel = SpdkIoChannel {
                 qpair,
@@ -344,8 +344,7 @@ impl SpdkBdev {
             // Submit NVMe read
             use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
             let completion = IoCompletion::new();
-            self.inflight
-                .fetch_add(1, Ordering::Release);
+            self.inflight.fetch_add(1, Ordering::Release);
             let req = IoRequest {
                 op: IoOp::Read {
                     ns: self.ns,
@@ -358,8 +357,7 @@ impl SpdkBdev {
                 bdev_inflight: self.inflight.clone(),
             };
             if self.io_channel.poller_tx.send(req).is_err() {
-                self.inflight
-                    .fetch_sub(1, Ordering::Release);
+                self.inflight.fetch_sub(1, Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
             if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
@@ -426,8 +424,7 @@ impl SpdkBdev {
             // Read-modify-write if the chunk doesn't cover full aligned blocks
             if head_skip > 0 || (chunk_data + head_skip) < aligned_len {
                 let completion = IoCompletion::new();
-                self.inflight
-                    .fetch_add(1, Ordering::Release);
+                self.inflight.fetch_add(1, Ordering::Release);
                 let req = IoRequest {
                     op: IoOp::Read {
                         ns: self.ns,
@@ -440,8 +437,7 @@ impl SpdkBdev {
                     bdev_inflight: self.inflight.clone(),
                 };
                 if self.io_channel.poller_tx.send(req).is_err() {
-                    self.inflight
-                        .fetch_sub(1, Ordering::Release);
+                    self.inflight.fetch_sub(1, Ordering::Release);
                     return err_box!("SPDK poller thread is gone");
                 }
                 if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
@@ -477,8 +473,7 @@ impl SpdkBdev {
             }
             // Submit synchronous NVMe write
             let completion = IoCompletion::new();
-            self.inflight
-                .fetch_add(1, Ordering::Release);
+            self.inflight.fetch_add(1, Ordering::Release);
             let req = IoRequest {
                 op: IoOp::Write {
                     ns: self.ns,
@@ -491,8 +486,7 @@ impl SpdkBdev {
                 bdev_inflight: self.inflight.clone(),
             };
             if self.io_channel.poller_tx.send(req).is_err() {
-                self.inflight
-                    .fetch_sub(1, Ordering::Release);
+                self.inflight.fetch_sub(1, Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
             if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
@@ -531,8 +525,7 @@ impl SpdkBdev {
 
         use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
         let completion = IoCompletion::new();
-        self.inflight
-            .fetch_add(1, Ordering::Release);
+        self.inflight.fetch_add(1, Ordering::Release);
         let req = IoRequest {
             op: IoOp::Flush {
                 ns: self.ns,

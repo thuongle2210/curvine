@@ -858,7 +858,10 @@ impl SpdkEnv {
     /// CallbackCtx entries. Safe to call opportunistically on every
     /// bdev close — the normal fast path has an empty deferred list.
     pub fn resolve_deferred_qpairs(&self) {
-        let mut deferred = self.deferred_qpairs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut deferred = self
+            .deferred_qpairs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         deferred.retain(|&qpair| {
             let poller_guard = self.poller.lock().unwrap_or_else(|p| p.into_inner());
             let poller = match poller_guard.as_ref() {
@@ -883,7 +886,10 @@ impl SpdkEnv {
     /// SPDK callbacks from `free_io_qpair` fire while the orphaned
     /// CallbackCtx entries are still alive.
     pub fn resolve_deferred_qpairs_with(&self, poller: &SpdkPoller) {
-        let mut deferred = self.deferred_qpairs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut deferred = self
+            .deferred_qpairs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         deferred.retain(|&qpair| {
             if poller.has_orphaned_for_qpair(qpair) {
                 unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
