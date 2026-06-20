@@ -1079,4 +1079,210 @@ mod tests {
         );
         assert!(qs.pending.is_empty(), "late path must not affect pending");
     }
+
+    // ── B1: force_complete_qpair marks dead, moves pending to stale, signals -EIO ──
+
+    #[test]
+    fn force_complete_qpair_marks_dead_and_moves_pending_to_stale() {
+        let mut qs = Box::pin(QpairState::with_capacity(10));
+        let owner = &mut *qs as *mut QpairState;
+
+        let ctx0 = make_callback_ctx(owner, 0);
+        let ctx1 = make_callback_ctx(owner, 1);
+        let ctx2 = make_callback_ctx(owner, 2);
+
+        qs.pending.push(ctx0);
+        qs.pending.push(ctx1);
+        qs.pending.push(ctx2);
+
+        let mut aq = ActiveQpair {
+            qpair: std::ptr::null_mut(),
+            state: qs,
+        };
+
+        force_complete_qpair(&mut aq);
+
+        assert!(aq.state.dead, "force_complete must mark qpair dead");
+        assert!(aq.state.pending.is_empty(), "pending must be drained");
+        assert_eq!(
+            aq.state.stale.len(),
+            3,
+            "all 3 entries must be moved to stale"
+        );
+        assert!(aq.state.stale.contains(&ctx0), "stale must contain ctx0");
+        assert!(aq.state.stale.contains(&ctx1), "stale must contain ctx1");
+        assert!(aq.state.stale.contains(&ctx2), "stale must contain ctx2");
+
+        // All entries completed with -EIO
+        assert_eq!(
+            unsafe { (*ctx0).completion.wait(0) },
+            -libc::EIO,
+            "ctx0 must complete with -EIO"
+        );
+        assert_eq!(
+            unsafe { (*ctx1).completion.wait(0) },
+            -libc::EIO,
+            "ctx1 must complete with -EIO"
+        );
+        assert_eq!(
+            unsafe { (*ctx2).completion.wait(0) },
+            -libc::EIO,
+            "ctx2 must complete with -EIO"
+        );
+    }
+
+    // ── B2: IoCompletion::complete returns false on second call ──
+
+    #[test]
+    fn io_completion_double_complete_returns_false() {
+        let comp = IoCompletion::new();
+
+        let first = comp.complete(-libc::EIO);
+        assert!(first, "first complete must return true");
+
+        let second = comp.complete(-libc::ENXIO);
+        assert!(!second, "second complete must return false");
+
+        // Status is preserved from first completion
+        assert_eq!(
+            comp.wait(0),
+            -libc::EIO,
+            "status must preserve first completion value"
+        );
+    }
+
+    // ── B3: handle_unregister_ctrlr removes controller from active set ──
+
+    #[test]
+    fn handle_unregister_ctrlr_removes_controller() {
+        let ctrlr_a = 0x100 as *mut _;
+        let ctrlr_b = 0x200 as *mut _;
+        let ctrlr_c = 0x300 as *mut _;
+        let mut active_ctrlrs = vec![ctrlr_a, ctrlr_b, ctrlr_c];
+
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::UnregisterCtrlr {
+                ctrlr: ctrlr_b,
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
+
+        assert_eq!(active_ctrlrs.len(), 2, "ctrlr_b must be removed, leaving 2");
+        assert!(active_ctrlrs.contains(&ctrlr_a), "ctrlr_a must remain");
+        assert!(!active_ctrlrs.contains(&ctrlr_b), "ctrlr_b must be removed");
+        assert!(active_ctrlrs.contains(&ctrlr_c), "ctrlr_c must remain");
+
+        assert_eq!(ack_rx.try_recv(), Ok(()), "ack must be sent");
+    }
+
+    // ── B4: handle_unregister merges with existing orphaned entry ──
+
+    #[test]
+    fn handle_unregister_orphan_collision_merges_entries() {
+        let qpair = 0x1 as *mut _;
+        let mut active_qpairs = HashMap::new();
+        let orphaned = Arc::new(Mutex::new(HashMap::new()));
+
+        // Pre-populate orphaned with a stale entry for this qpair
+        let old_stale = make_callback_ctx(std::ptr::null_mut(), 0);
+        let orphaned_state = QpairState {
+            dead: true,
+            pending: Vec::new(),
+            stale: vec![old_stale],
+        };
+        orphaned.lock().unwrap().insert(
+            qpair as usize,
+            ActiveQpair {
+                qpair,
+                state: Pin::new(Box::new(orphaned_state)),
+            },
+        );
+
+        // Create new ActiveQpair with 1 pending entry
+        let mut qs = Box::pin(QpairState::with_capacity(5));
+        qs.dead = true;
+        let owner = &mut *qs as *mut QpairState;
+        let new_ctx = make_callback_ctx(owner, 0);
+        qs.pending.push(new_ctx);
+
+        active_qpairs.insert(qpair as usize, ActiveQpair { qpair, state: qs });
+
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let req = IoRequest {
+            op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_unregister(&req, &mut active_qpairs, &orphaned);
+
+        // active is empty
+        assert!(
+            active_qpairs.is_empty(),
+            "active_qpairs must be empty after unregister"
+        );
+
+        // orphaned has the entry with BOTH old and new stale entries
+        let guard = orphaned.lock().unwrap();
+        let aq = guard
+            .get(&(qpair as usize))
+            .expect("qpair must be in orphaned");
+        assert_eq!(
+            aq.state.stale.len(),
+            2,
+            "orphaned stale must contain both old and new entries"
+        );
+        assert!(
+            aq.state.stale.contains(&old_stale),
+            "orphaned stale must contain old stale entry"
+        );
+        assert!(
+            aq.state.stale.contains(&new_ctx),
+            "orphaned stale must contain new entry"
+        );
+
+        assert_eq!(ack_rx.try_recv(), Ok(()), "ack must be sent");
+    }
+
+    // ── B5: force_complete_qpair preserves existing stale entries ──
+
+    #[test]
+    fn force_complete_qpair_with_existing_stale() {
+        let mut qs = Box::pin(QpairState::with_capacity(5));
+        let owner = &mut *qs as *mut QpairState;
+
+        let stale_ctx = make_callback_ctx(owner, 0);
+        let pending_ctx = make_callback_ctx(owner, 1);
+
+        qs.stale.push(stale_ctx);
+        qs.pending.push(pending_ctx);
+
+        let mut aq = ActiveQpair {
+            qpair: std::ptr::null_mut(),
+            state: qs,
+        };
+
+        force_complete_qpair(&mut aq);
+
+        assert!(aq.state.dead, "force_complete must mark qpair dead");
+        assert!(aq.state.pending.is_empty(), "pending must be drained");
+        assert_eq!(
+            aq.state.stale.len(),
+            2,
+            "stale must contain original stale + moved pending"
+        );
+        assert!(
+            aq.state.stale.contains(&stale_ctx),
+            "original stale entry must survive"
+        );
+        assert!(
+            aq.state.stale.contains(&pending_ctx),
+            "pending entry must move to stale"
+        );
+    }
 }
