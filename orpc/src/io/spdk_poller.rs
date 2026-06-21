@@ -577,9 +577,11 @@ impl SpdkPoller {
             let pending = std::mem::take(&mut qs.pending);
             let count = pending.len();
             for cb_ptr in &pending {
-                let ctx = unsafe { Box::from_raw(*cb_ptr as *mut CallbackCtx) };
-                if ctx.completion.complete(-libc::EIO) {
-                    ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
+                let ctx = *cb_ptr as *mut CallbackCtx;
+                unsafe {
+                    if (*ctx).completion.complete(-libc::EIO) {
+                        (*ctx).bdev_inflight.fetch_sub(1, Ordering::Release);
+                    }
                 }
             }
             if count > 0 {
@@ -621,29 +623,30 @@ struct CallbackCtx {
     pending_idx: usize,
 }
 
-/// C callback invoked by SPDK when NVMe command completes.
+/// SPDK NVMe completion callback.
+///
+/// **Hot path** — first completion, qpair_state alive. Remove from pending, decrement inflight.
+/// **Late path** — completion already signaled by force_complete, qpair_state may be freed.
+///   Only free the CallbackCtx via drop.
 unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     let ctx = Box::from_raw(cb_arg as *mut CallbackCtx);
 
-    let qs = &mut *(ctx.qpair_state as *mut QpairState);
-
-    // Defensive guard against UB underflow on empty pending.
-    if qs.pending.is_empty() {
-        return;
-    }
-
-    let idx = ctx.pending_idx;
-    let last = qs.pending.len() - 1;
-    if idx != last {
-        let last_ptr = qs.pending[last];
-        qs.pending.swap_remove(idx);
-        (*last_ptr).pending_idx = idx;
-    } else {
-        qs.pending.pop();
-    }
-
-    // Guard against double-decrement on repeated complete().
     if ctx.completion.complete(status) {
+        let qs = &mut *(ctx.qpair_state as *mut QpairState);
+
+        // Defensive: skip swap_remove if pending is empty (underflow guard).
+        if !qs.pending.is_empty() {
+            let idx = ctx.pending_idx;
+            let last = qs.pending.len() - 1;
+            if idx != last {
+                let last_ptr = qs.pending[last];
+                qs.pending.swap_remove(idx);
+                (*last_ptr).pending_idx = idx;
+            } else {
+                qs.pending.pop();
+            }
+        }
+
         ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
     }
 }
@@ -742,6 +745,10 @@ mod test {
         assert!(!dead_qpairs.contains_key(&DEAD));
         assert!(dead_qpairs.contains_key(&LIVE));
 
+        // Clean up force-completed entries (kept alive for late callbacks).
+        unsafe { drop(Box::from_raw(ctx_1)) };
+        unsafe { drop(Box::from_raw(ctx_2)) };
+
         // Clean up LIVE entry (force_complete did not touch it).
         // The raw pointer in qs_live.pending must be reclaimed.
         if let Some(qs) = dead_qpairs.get_mut(&LIVE) {
@@ -752,7 +759,7 @@ mod test {
     }
 
     #[test]
-    fn poller_callback_empty_pending_returns_early() {
+    fn poller_callback_empty_pending_signals_completion() {
         let inflight = Arc::new(AtomicUsize::new(1));
         let completion = IoCompletion::new();
         let qs = Box::new(QpairState {
@@ -767,11 +774,11 @@ mod test {
             pending_idx: 0,
         }));
 
-        unsafe { poller_callback(ctx as *mut c_void, 0) };
+        unsafe { poller_callback(ctx as *mut c_void, 42) };
 
-        assert!(qs.pending.is_empty());
-        assert_eq!(inflight.load(Ordering::Acquire), 1);
-        assert_eq!(completion.wait(1), -libc::ETIMEDOUT);
+        // Hot path always signals completion and decrements inflight.
+        assert_eq!(completion.wait(0), 42);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -903,5 +910,34 @@ mod test {
 
         // Clean up ctx_1.
         unsafe { drop(Box::from_raw(ctx_1)) };
+    }
+
+    #[test]
+    fn poller_callback_late_path_does_not_double_signal() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let completion = IoCompletion::new();
+        let qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+        });
+
+        // Simulate force_complete signaling first.
+        assert!(completion.complete(-libc::EIO));
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+
+        // Now simulate the late SPDK callback.
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: &*qs as *const QpairState as *mut QpairState,
+            pending_idx: 0,
+        }));
+        unsafe { poller_callback(ctx as *mut c_void, 0) };
+
+        // Completion unchanged (still -EIO from force_complete).
+        assert_eq!(completion.wait(0), -libc::EIO);
+        // Inflight unchanged (force_complete already decremented).
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 }
