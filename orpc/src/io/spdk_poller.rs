@@ -504,6 +504,9 @@ impl SpdkPoller {
             );
         }
 
+        // Pre-push: poller_callback needs the entry in pending if SPDK completes synchronously during the submit call.
+        qs.pending.push(cb_ctx_ptr);
+
         let rc = match &req.op {
             IoOp::Read {
                 ns,
@@ -546,14 +549,19 @@ impl SpdkPoller {
         };
 
         if rc != 0 {
-            // Submission failed - reclaim allocation and complete with error
-            unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
-            req.bdev_inflight.fetch_sub(1, Ordering::Release);
-            req.completion.complete(rc);
+            // If callback fired during submit and removed this entry from
+            // pending via swap_remove, position() returns None - skip.
+            if let Some(pos) = qs.pending.iter().position(|&p| p == cb_ctx_ptr) {
+                qs.pending.swap_remove(pos);
+                if pos < qs.pending.len() {
+                    unsafe { (*qs.pending[pos]).pending_idx = pos };
+                }
+                unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
+                req.bdev_inflight.fetch_sub(1, Ordering::Release);
+                req.completion.complete(rc);
+            }
             return;
         }
-
-        qs.pending.push(cb_ctx_ptr);
 
         // Track active qpair
         if !active_qpairs.contains(&qpair) {
@@ -774,5 +782,126 @@ mod test {
 
         assert!(!completion.complete(99));
         assert_eq!(completion.wait(0), 42);
+    }
+
+    #[test]
+    fn submit_one_rc_error_cleans_up_pending_entry() {
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+        });
+
+        let cb_ctx = Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        });
+        let cb_ctx_ptr = Box::into_raw(cb_ctx);
+        qs.pending.push(cb_ctx_ptr);
+
+        // Simulate rc != 0 path: entry still in pending -> position() finds it.
+        if let Some(pos) = qs.pending.iter().position(|&p| p == cb_ctx_ptr) {
+            qs.pending.swap_remove(pos);
+            if pos < qs.pending.len() {
+                unsafe { (*qs.pending[pos]).pending_idx = pos };
+            }
+            unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
+            inflight.fetch_sub(1, Ordering::Release);
+            completion.complete(-libc::ENOMEM);
+        }
+
+        assert!(qs.pending.is_empty());
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(completion.wait(0), -libc::ENOMEM);
+    }
+
+    #[test]
+    fn submit_one_rc_error_callback_already_removed_entry() {
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+        });
+
+        let cb_ctx = Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        });
+        let cb_ctx_ptr = Box::into_raw(cb_ctx);
+        qs.pending.push(cb_ctx_ptr);
+
+        // Simulate callback firing during submit via the real callback.
+        unsafe { poller_callback(cb_ctx_ptr as *mut c_void, 0) };
+        assert!(qs.pending.is_empty());
+
+        // Simulate rc != 0 path: position() returns None -> skip.
+        let found = qs.pending.iter().position(|&p| p == cb_ctx_ptr);
+        assert!(found.is_none());
+
+        // Completion and inflight unchanged from callback.
+        assert_eq!(completion.wait(0), 0);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn submit_one_rc_error_reindexes_on_swap_remove() {
+        let inflight_0 = Arc::new(AtomicUsize::new(1));
+        let completion_0 = IoCompletion::new();
+        let inflight_1 = Arc::new(AtomicUsize::new(1));
+        let completion_1 = IoCompletion::new();
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+        });
+
+        let ctx_0 = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion_0.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight_0.clone(),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs.pending.push(ctx_0);
+
+        let ctx_1 = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion_1.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight_1.clone(),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 1,
+        }));
+        qs.pending.push(ctx_1);
+
+        // Simulate rc != 0 for ctx_0 (position 0 → swap with last = ctx_1).
+        if let Some(pos) = qs.pending.iter().position(|&p| p == ctx_0) {
+            qs.pending.swap_remove(pos);
+            if pos < qs.pending.len() {
+                unsafe { (*qs.pending[pos]).pending_idx = pos };
+            }
+            unsafe { drop(Box::from_raw(ctx_0)) };
+            inflight_0.fetch_sub(1, Ordering::Release);
+            completion_0.complete(-libc::EIO);
+        }
+
+        // ctx_0 freed and cleaned up.
+        assert_eq!(qs.pending.len(), 1);
+        assert_eq!(completion_0.wait(0), -libc::EIO);
+        assert_eq!(inflight_0.load(Ordering::Acquire), 0);
+
+        // ctx_1 still alive, reindexed to 0.
+        assert_eq!(unsafe { (*qs.pending[0]).pending_idx }, 0);
+        assert_eq!(completion_1.wait(1), -libc::ETIMEDOUT);
+        assert_eq!(inflight_1.load(Ordering::Acquire), 1);
+
+        // Clean up ctx_1.
+        unsafe { drop(Box::from_raw(ctx_1)) };
     }
 }
