@@ -118,9 +118,6 @@ pub struct IoRequest {
     pub completion: Arc<IoCompletion>,
     /// Per-bdev in-flight counter. Decremented on completion.
     pub bdev_inflight: Arc<AtomicUsize>,
-    /// Per-qpair dead flag. Set by the poller when qpair poll fails;
-    /// checked by the bdev to fail subsequent I/Os fast.
-    pub qpair_dead: Arc<AtomicBool>,
 }
 
 // SAFETY: exclusive ownership - blocks until completion.
@@ -232,7 +229,6 @@ impl SpdkPoller {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
-            qpair_dead: Arc::new(AtomicBool::new(false)),
         };
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
@@ -496,18 +492,11 @@ impl SpdkPoller {
         // Register/retrieve QpairState on first sight of this qpair.
         let qs = dead_qpairs.entry(key).or_insert_with(|| {
             Box::new(QpairState {
-                dead: req.qpair_dead.clone(),
+                dead: Arc::new(AtomicBool::new(false)),
                 pending: Vec::with_capacity(io_queue_depth),
                 stale: Vec::new(),
             })
         });
-
-        // Fast-fail if this qpair is already known dead.
-        if req.qpair_dead.load(Ordering::Acquire) {
-            req.bdev_inflight.fetch_sub(1, Ordering::Release);
-            req.completion.complete(-libc::ENXIO);
-            return;
-        }
 
         let pending_idx = qs.pending.len();
         let qs_ptr = &mut **qs as *mut QpairState;
@@ -1178,7 +1167,6 @@ mod test {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
-            qpair_dead: Arc::new(AtomicBool::new(false)),
         };
 
         SpdkPoller::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs, &orphaned);
@@ -1275,7 +1263,6 @@ mod test {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
-            qpair_dead: Arc::new(AtomicBool::new(false)),
         };
 
         SpdkPoller::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs, &orphaned);
