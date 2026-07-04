@@ -712,7 +712,7 @@ impl SpdkEnv {
             // Resolve deferred before drain_all — free_io_qpair fires late callbacks.
             self.resolve_deferred_qpairs_with(&poller);
             info!("SPDK poller thread stopped");
-            pointer.reclaim_stale();
+            poller.reclaim_stale();
         }
 
         self.qpair_pool.drain_all();
