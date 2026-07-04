@@ -655,48 +655,6 @@ impl SpdkPoller {
             }
         }
     }
-
-    /// Poll all active qpairs, handle errors.
-    /// On error: force_complete + move QpairState from dead_qpairs to orphaned HashMap.
-    fn poll_and_sweep(
-        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
-        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
-        orphaned: &Mutex<HashMap<usize, Box<QpairState>>>,
-        context: &str,
-    ) {
-        let err_keys: Vec<usize> = active_qpairs
-            .iter()
-            .filter_map(|&qpair| {
-                let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
-                if rc < 0 {
-                    error!("{}: qpair poll error: rc={}", context, rc);
-                    Some(qpair as usize)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if err_keys.is_empty() {
-            return;
-        }
-        active_qpairs.retain(|&qp| !err_keys.contains(&(qp as usize)));
-        if let Ok(mut guard) = orphaned.lock() {
-            for &key in &err_keys {
-                Self::force_complete_qpair(key, dead_qpairs);
-                if let Some(mut qs) = dead_qpairs.remove(&key) {
-                    if let Some(mut prev) = guard.remove(&key) {
-                        qs.stale.extend(prev.stale.drain(..));
-                        qs.stale.extend(prev.pending.drain(..));
-                    }
-                    guard.insert(key, qs);
-                }
-            }
-        }
-        error!(
-            "{} qpair(s) failed, removed from active set",
-            err_keys.len()
-        );
-    }
 }
 
 impl SpdkPoller {
@@ -791,59 +749,6 @@ impl SpdkPoller {
             "{} qpair(s) failed, removed from active set",
             err_keys.len()
         );
-    }
-}
-
-impl SpdkPoller {
-    /// True if orphaned map contains entries for this qpair.
-    pub fn has_orphaned_for_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
-        if let Ok(guard) = self.orphaned.lock() {
-            guard.contains_key(&(qpair as usize))
-        } else {
-            false
-        }
-    }
-
-    /// Remove orphaned QpairState for this qpair and free all entries.
-    /// Safe to call only after free_io_qpair has completed for this qpair
-    /// (all late SPDK callbacks have fired).
-    pub fn reclaim_orphaned_for_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
-        if let Ok(mut guard) = self.orphaned.lock() {
-            if let Some(mut qs) = guard.remove(&(qpair as usize)) {
-                for ptr in qs.stale.drain(..) {
-                    unsafe {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-                for ptr in qs.pending.drain(..) {
-                    unsafe {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Reclaim all orphaned QpairState entries.
-    /// SAFETY: Call only after all late SPDK callbacks have fired
-    /// (i.e., after qpair_pool::drain_all in SpdkEnv::shutdown).
-    pub fn reclaim_stale(&self) {
-        if let Ok(mut guard) = self.orphaned.lock() {
-            for (_key, mut qs) in guard.drain() {
-                for ptr in qs.stale.drain(..) {
-                    unsafe {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-                for ptr in qs.pending.drain(..) {
-                    unsafe {
-                        drop(Box::from_raw(ptr));
-                    }
-                }
-            }
-        }
     }
 }
 
