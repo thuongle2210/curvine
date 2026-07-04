@@ -712,6 +712,7 @@ impl SpdkEnv {
             // Resolve deferred before drain_all — free_io_qpair fires late callbacks.
             self.resolve_deferred_qpairs_with(&poller);
             info!("SPDK poller thread stopped");
+            pointer.reclaim_stale();
         }
 
         self.qpair_pool.drain_all();
@@ -910,6 +911,75 @@ impl SpdkEnv {
                 .push(qpair);
         }
         ok
+    }
+
+    /// Unregister controller from poller, blocking until removed to prevent UAF
+    /// on process_admin_completions. Returns false if poller didn't ack.
+    pub fn unregister_ctrlr_from_poller(&self, ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr) -> bool {
+        let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+        match poller.as_ref() {
+            Some(poller) => poller.unregister_ctrlr(ctrlr),
+            None => false,
+        }
+    }
+
+    /// Unregister controller from poller + detach from SPDK at runtime.
+    pub fn detach_target(&self, target_idx: usize) -> CommonResult<()> {
+        let current = self.state();
+        if current != SpdkEnvState::Initialized {
+            return err_box!(
+                "SpdkEnv: cannot detach target in state {} (expected Initialized)",
+                current
+            );
+        }
+
+        if target_idx >= self.conf.targets.len() {
+            return err_box!(
+                "SpdkEnv: target index {} out of range ({} targets)",
+                target_idx,
+                self.conf.targets.len()
+            );
+        }
+
+        let target = &self.conf.targets[target_idx];
+        info!("Detaching target[{}]: {}", target_idx, target.endpoint());
+
+        let ctrlr: Option<*mut spdk_ffi::spdk_nvme_ctrlr> = self
+            .bdevs
+            .iter()
+            .find(|b| b.target_endpoint == target.endpoint())
+            .map(|b| b.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr);
+
+        if let Some(ctrlr) = ctrlr {
+            let unreg_ok = self.unregister_ctrlr_from_poller(ctrlr);
+            if !unreg_ok {
+                warn!(
+                    "detach_target[{}]: poller unregister timed out, proceeding with detach",
+                    target_idx
+                );
+            }
+
+            let rc = unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
+            if rc != 0 {
+                return err_box!(
+                    "SpdkEnv: spdk_nvme_detach failed for target[{}]: rc={}",
+                    target_idx,
+                    rc
+                );
+            }
+            info!(
+                "detach_target[{}]: controller {:p} detached",
+                target_idx, ctrlr
+            );
+        } else {
+            warn!(
+                "detach_target[{}]: no controller found for target '{}', already detached?",
+                target_idx,
+                target.endpoint()
+            );
+        }
+
+        Ok(())
     }
 
     // SPDK FFI — feature-gated

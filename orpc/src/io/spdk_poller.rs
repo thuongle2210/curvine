@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 const EVENTSZ: usize = std::mem::size_of::<u64>();
 /// I/O operation submitted to the poller thread.
@@ -44,6 +45,11 @@ pub enum IoOp {
     /// Unregister a qpair from the poller before it is freed.
     UnregisterQpair {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        ack: mpsc::Sender<()>,
+    },
+    /// Unregister a controller from the poller (stop admin completion polling).
+    UnregisterCtrlr {
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         ack: mpsc::Sender<()>,
     },
 }
@@ -94,7 +100,7 @@ impl IoCompletion {
                 inner = self.cond.wait(inner).unwrap();
             }
         } else {
-            let timeout = std::time::Duration::from_micros(timeout_us);
+            let timeout = Duration::from_micros(timeout_us);
             let deadline = std::time::Instant::now() + timeout;
             while !inner.done {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -233,7 +239,7 @@ impl SpdkPoller {
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
             let _ = self.eventfd.write(1);
-            match ack_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            match ack_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => true,
                 Err(_) => {
                     error!("Unregister timeout: poller may be stuck, qpair not removed");
@@ -242,6 +248,30 @@ impl SpdkPoller {
             }
         } else {
             false // Poller stopped
+        }
+    }
+
+    /// Unregister controller from the poller, blocking until removed to prevent UAF
+    /// on process_admin_completions. Returns false if poller didn't ack within timeout.
+    pub fn unregister_ctrlr(&self, ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr) -> bool {
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let req = IoRequest {
+            op: IoOp::UnregisterCtrlr { ctrlr, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(req);
+            let _ = self.eventfd.write(1);
+            match ack_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) => true,
+                Err(_) => {
+                    error!("Unregister ctrlr timeout: poller may be stuck, ctrlr not removed");
+                    false
+                }
+            }
+        } else {
+            false
         }
     }
 
@@ -271,7 +301,7 @@ impl SpdkPoller {
         config: PollerConfig,
         orphaned: Arc<Mutex<HashMap<usize, Box<QpairState>>>>,
     ) {
-        let active_ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = config.ctrlrs;
+        let mut active_ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = config.ctrlrs;
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
@@ -298,7 +328,9 @@ impl SpdkPoller {
             if matches!(state, PollerState::Active) {
                 // Drain pending requests (non-blocking)
                 while let Ok(req) = rx.try_recv() {
-                    if matches!(req.op, IoOp::UnregisterQpair { .. }) {
+                    if matches!(req.op, IoOp::UnregisterCtrlr { .. }) {
+                        Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
+                    } else if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                         Self::handle_unregister(&req, &mut dead_qpairs, &*orphaned);
                     } else {
                         Self::submit_one(&req, &mut dead_qpairs, config.io_queue_depth);
@@ -368,7 +400,9 @@ impl SpdkPoller {
 
                         // Drain any pending channel data
                         while let Ok(req) = rx.try_recv() {
-                            if matches!(req.op, IoOp::UnregisterQpair { .. }) {
+                            if matches!(req.op, IoOp::UnregisterCtrlr { .. }) {
+                                Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
+                            } else if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                                 Self::handle_unregister(&req, &mut dead_qpairs, &*orphaned);
                             } else {
                                 Self::submit_one(&req, &mut dead_qpairs, config.io_queue_depth);
@@ -455,6 +489,17 @@ impl SpdkPoller {
         }
     }
 
+    /// Handle unregister controller request, remove from active set and ack.
+    fn handle_unregister_ctrlr(
+        req: &IoRequest,
+        active_ctrlrs: &mut Vec<*mut spdk_ffi::spdk_nvme_ctrlr>,
+    ) {
+        if let IoOp::UnregisterCtrlr { ctrlr, ack } = &req.op {
+            active_ctrlrs.retain(|c| *c != *ctrlr);
+            let _ = ack.send(());
+        }
+    }
+
     /// Submit a single I/O request on the poller thread.
     fn submit_one(
         req: &IoRequest,
@@ -467,6 +512,9 @@ impl SpdkPoller {
             IoOp::Flush { qpair, .. } => *qpair,
             IoOp::UnregisterQpair { .. } => {
                 unreachable!("UnregisterQpair handled by handle_unregister")
+            }
+            IoOp::UnregisterCtrlr { .. } => {
+                unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
             }
         };
 
@@ -546,6 +594,9 @@ impl SpdkPoller {
             },
             IoOp::UnregisterQpair { .. } => {
                 unreachable!("UnregisterQpair handled by handle_unregister")
+            }
+            IoOp::UnregisterCtrlr { .. } => {
+                unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
             }
         };
 
