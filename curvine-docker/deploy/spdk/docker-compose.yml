@@ -74,4 +74,3 @@ services:
         condition: service_healthy
     command: ["worker", "start"]
     restart: unless-stopped
-
