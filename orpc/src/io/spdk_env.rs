@@ -832,6 +832,8 @@ impl SpdkEnv {
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
     ) -> CommonResult<*mut spdk_ffi::spdk_nvme_qpair> {
+        // Opportunistically resolve deferred qpairs before returning a qpair.
+        self.resolve_deferred_qpairs();
         self.qpair_pool.acquire(ctrlr)
     }
     /// Opportunistically resolve deferred qpairs (those whose unregister timed out).
@@ -891,6 +893,17 @@ impl SpdkEnv {
             }
             return;
         }
+
+        // Don't release to pool if qpair is in deferred_qpairs (unregister timed out).
+        // resolve_deferred_qpairs will free it when the poller orphans the qpair.
+        if self
+            .deferred_qpairs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&qpair)
+        {
+            return;
+        }
         self.qpair_pool.release(ctrlr, qpair);
     }
 
@@ -898,14 +911,18 @@ impl SpdkEnv {
     /// Returns false if poller didn't ack within timeout (likely stuck/dead).
     /// On timeout, the qpair is added to `deferred_qpairs` for later cleanup.
     pub fn unregister_qpair_from_poller(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
+        let had_poller;
         let ok = {
             let poller = self.poller.lock().unwrap();
+            had_poller = poller.is_some();
             match poller.as_ref() {
                 Some(poller) => poller.unregister_qpair(qpair),
                 None => false,
             }
         };
-        if !ok {
+        // Only defer if poller existed (message was actually sent).
+        // If no poller, there's nothing to defer to.
+        if !ok && had_poller {
             self.deferred_qpairs
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
