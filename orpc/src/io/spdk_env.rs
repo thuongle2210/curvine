@@ -3,7 +3,7 @@
 use crate::common::DurationUnit;
 use crate::err_msg;
 use crate::io::spdk_ffi;
-use crate::io::spdk_poller::PollerConfig;
+use crate::io::spdk_poller::{CtrlHandle, PollerConfig};
 use crate::io::spdk_poller::{IoRequest, SpdkPoller};
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
@@ -362,13 +362,15 @@ impl SpdkConf {
             } else {
                 self.keep_alive_timeout_ms
             };
-            if resolved_ka_ms < self.poll_interval_ms {
+            let min_ka_ms = self.poll_interval_ms * 3;
+            if resolved_ka_ms < min_ka_ms {
                 return err_box!(
-                    "SpdkConf: targets[{}]: resolved keep_alive_timeout_ms ({}) \
-                     must be >= poll_interval_ms ({})",
+                    "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be \
+                     >= 3 * poll_interval_ms ({}) as the worst-case idle->active gap spans \
+                     ~2 poll intervals, requiring 1 interval margin for safety",
                     i,
                     resolved_ka_ms,
-                    self.poll_interval_ms
+                    min_ka_ms
                 );
             }
         }
@@ -617,10 +619,10 @@ impl SpdkEnv {
 
         // Collect unique controllers for admin completion polling (keep-alive)
         let mut seen = HashSet::new();
-        let mut ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = Vec::with_capacity(self.bdevs.len());
+        let mut ctrlrs: Vec<CtrlHandle> = Vec::with_capacity(self.bdevs.len());
         for bdev in &self.bdevs {
             if bdev.ctrlr != 0 && seen.insert(bdev.ctrlr) {
-                ctrlrs.push(bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr);
+                ctrlrs.push(CtrlHandle(bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr));
             }
         }
 
@@ -831,6 +833,8 @@ impl SpdkEnv {
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
     ) -> CommonResult<*mut spdk_ffi::spdk_nvme_qpair> {
+        // Opportunistically resolve deferred qpairs before returning a qpair.
+        self.resolve_deferred_qpairs();
         self.qpair_pool.acquire(ctrlr)
     }
     /// Opportunistically resolve deferred qpairs (those whose unregister timed out).
@@ -890,6 +894,17 @@ impl SpdkEnv {
             }
             return;
         }
+
+        // Don't release to pool if qpair is in deferred_qpairs (unregister timed out).
+        // resolve_deferred_qpairs will free it when the poller orphans the qpair.
+        if self
+            .deferred_qpairs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&qpair)
+        {
+            return;
+        }
         self.qpair_pool.release(ctrlr, qpair);
     }
 
@@ -897,14 +912,18 @@ impl SpdkEnv {
     /// Returns false if poller didn't ack within timeout (likely stuck/dead).
     /// On timeout, the qpair is added to `deferred_qpairs` for later cleanup.
     pub fn unregister_qpair_from_poller(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
+        let had_poller;
         let ok = {
             let poller = self.poller.lock().unwrap();
+            had_poller = poller.is_some();
             match poller.as_ref() {
                 Some(poller) => poller.unregister_qpair(qpair),
                 None => false,
             }
         };
-        if !ok {
+        // Only defer if poller existed (message was actually sent).
+        // If no poller, there's nothing to defer to.
+        if !ok && had_poller {
             self.deferred_qpairs
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1352,7 +1371,7 @@ mod test {
                     traddr: "10.0.0.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
-                    keep_alive_timeout_ms: 200, // above poll_interval_ms
+                    keep_alive_timeout_ms: 300, // >= 3 * poll_interval_ms
                     ..Default::default()
                 }],
                 ..Default::default()
