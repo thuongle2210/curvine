@@ -310,11 +310,7 @@ impl SpdkPoller {
                     if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                         Self::handle_unregister(&req, &mut dead_qpairs, &*orphaned);
                     } else {
-                        Self::submit_one(
-                            &req,
-                            &mut dead_qpairs,
-                            config.io_queue_depth,
-                        );
+                        Self::submit_one(&req, &mut dead_qpairs, config.io_queue_depth);
                     }
                     drain_count += 1;
                     if drain_count & 0x7F == 0 && Instant::now() >= deadline {
@@ -392,11 +388,7 @@ impl SpdkPoller {
                             if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                                 Self::handle_unregister(&req, &mut dead_qpairs, &*orphaned);
                             } else {
-                                Self::submit_one(
-                                    &req,
-                                    &mut dead_qpairs,
-                                    config.io_queue_depth,
-                                );
+                                Self::submit_one(&req, &mut dead_qpairs, config.io_queue_depth);
                             }
                             drain_count += 1;
                             if drain_count & 0x7F == 0 && Instant::now() >= deadline {
