@@ -46,6 +46,10 @@ pub enum IoOp {
         ns: *mut std::ffi::c_void,
         qpair: *mut std::ffi::c_void,
     },
+    UnregisterCtrlr {
+        ctrlr: *mut std::ffi::c_void,
+        ack: std::sync::mpsc::Sender<()>,
+    },
 }
 #[allow(dead_code)]
 pub struct IoCompletion(std::sync::Mutex<()>);

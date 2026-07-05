@@ -47,6 +47,11 @@ pub enum IoOp {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
         ack: mpsc::Sender<()>,
     },
+    /// Unregister a controller from the poller (stop admin completion polling).
+    UnregisterCtrlr {
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        ack: mpsc::Sender<()>,
+    },
 }
 
 // SAFETY: exclusive ownership - blocks until completion.
@@ -250,6 +255,30 @@ impl SpdkPoller {
         }
     }
 
+    /// Unregister controller from the poller, blocking until removed to prevent UAF
+    /// on process_admin_completions. Returns false if poller didn't ack within timeout.
+    pub fn unregister_ctrlr(&self, ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr) -> bool {
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let req = IoRequest {
+            op: IoOp::UnregisterCtrlr { ctrlr, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(req);
+            let _ = self.eventfd.write(1);
+            match ack_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) => true,
+                Err(_) => {
+                    error!("Unregister ctrlr timeout: poller may be stuck, ctrlr not removed");
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
     /// Shut down the poller thread.
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -276,7 +305,7 @@ impl SpdkPoller {
         mut config: PollerConfig,
         orphaned: Arc<Mutex<HashMap<usize, Box<QpairState>>>>,
     ) {
-        let active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
+        let mut active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
@@ -307,7 +336,9 @@ impl SpdkPoller {
                 let mut deadline = Instant::now() + delta;
                 let mut drain_count: u64 = 0;
                 while let Ok(req) = rx.try_recv() {
-                    if matches!(req.op, IoOp::UnregisterQpair { .. }) {
+                    if matches!(req.op, IoOp::UnregisterCtrlr { .. }) {
+                        Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
+                    } else if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                         Self::handle_unregister(&req, &mut dead_qpairs, &*orphaned);
                     } else {
                         Self::submit_one(&req, &mut dead_qpairs, config.io_queue_depth);
@@ -385,7 +416,9 @@ impl SpdkPoller {
                         let mut deadline = Instant::now() + delta;
                         let mut drain_count: u64 = 0;
                         while let Ok(req) = rx.try_recv() {
-                            if matches!(req.op, IoOp::UnregisterQpair { .. }) {
+                            if matches!(req.op, IoOp::UnregisterCtrlr { .. }) {
+                                Self::handle_unregister_ctrlr(&req, &mut active_ctrlrs);
+                            } else if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                                 Self::handle_unregister(&req, &mut dead_qpairs, &*orphaned);
                             } else {
                                 Self::submit_one(&req, &mut dead_qpairs, config.io_queue_depth);
@@ -476,6 +509,17 @@ impl SpdkPoller {
         }
     }
 
+    /// Handle unregister controller request, remove from active set and ack.
+    fn handle_unregister_ctrlr(
+        req: &IoRequest,
+        active_ctrlrs: &mut Vec<*mut spdk_ffi::spdk_nvme_ctrlr>,
+    ) {
+        if let IoOp::UnregisterCtrlr { ctrlr, ack } = &req.op {
+            active_ctrlrs.retain(|c| *c != *ctrlr);
+            let _ = ack.send(());
+        }
+    }
+
     /// Submit a single I/O request on the poller thread.
     fn submit_one(
         req: &IoRequest,
@@ -488,6 +532,9 @@ impl SpdkPoller {
             IoOp::Flush { qpair, .. } => *qpair,
             IoOp::UnregisterQpair { .. } => {
                 unreachable!("UnregisterQpair handled by handle_unregister")
+            }
+            IoOp::UnregisterCtrlr { .. } => {
+                unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
             }
         };
 
@@ -565,6 +612,9 @@ impl SpdkPoller {
             },
             IoOp::UnregisterQpair { .. } => {
                 unreachable!("UnregisterQpair handled by handle_unregister")
+            }
+            IoOp::UnregisterCtrlr { .. } => {
+                unreachable!("UnregisterCtrlr handled by handle_unregister_ctrlr")
             }
         };
 
