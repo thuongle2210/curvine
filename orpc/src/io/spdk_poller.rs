@@ -512,10 +512,10 @@ impl SpdkPoller {
     /// Handle unregister controller request, remove from active set and ack.
     fn handle_unregister_ctrlr(
         req: &IoRequest,
-        active_ctrlrs: &mut Vec<*mut spdk_ffi::spdk_nvme_ctrlr>,
+        active_ctrlrs: &mut Vec<CtrlHandle>,
     ) {
         if let IoOp::UnregisterCtrlr { ctrlr, ack } = &req.op {
-            active_ctrlrs.retain(|c| *c != *ctrlr);
+            active_ctrlrs.retain(|c| c.0 != *ctrlr);
             let _ = ack.send(());
         }
     }
