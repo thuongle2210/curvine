@@ -276,7 +276,6 @@ impl SpdkPoller {
         mut config: PollerConfig,
         orphaned: Arc<Mutex<HashMap<usize, Box<QpairState>>>>,
     ) {
-        let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
         let active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
@@ -313,7 +312,6 @@ impl SpdkPoller {
                     } else {
                         Self::submit_one(
                             &req,
-                            &mut active_qpairs,
                             &mut dead_qpairs,
                             config.io_queue_depth,
                         );
@@ -396,7 +394,6 @@ impl SpdkPoller {
                             } else {
                                 Self::submit_one(
                                     &req,
-                                    &mut active_qpairs,
                                     &mut dead_qpairs,
                                     config.io_queue_depth,
                                 );
@@ -689,18 +686,21 @@ impl SpdkPoller {
     /// Poll all active qpairs, handle errors.
     /// On error: force_complete + move QpairState from dead_qpairs to orphaned HashMap.
     fn poll_and_sweep(
-        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
         dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
         orphaned: &Mutex<HashMap<usize, Box<QpairState>>>,
         context: &str,
     ) {
-        let err_keys: Vec<usize> = active_qpairs
+        let err_keys: Vec<usize> = dead_qpairs
             .iter()
-            .filter_map(|&qpair| {
+            .filter_map(|(&key, qs)| {
+                if qs.dead.load(Ordering::Acquire) {
+                    return None;
+                }
+                let qpair = key as *mut spdk_ffi::spdk_nvme_qpair;
                 let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
                 if rc < 0 {
                     error!("{}: qpair poll error: rc={}", context, rc);
-                    Some(qpair as usize)
+                    Some(key)
                 } else {
                     None
                 }
@@ -709,7 +709,6 @@ impl SpdkPoller {
         if err_keys.is_empty() {
             return;
         }
-        active_qpairs.retain(|&qp| !err_keys.contains(&(qp as usize)));
         if let Ok(mut guard) = orphaned.lock() {
             for &key in &err_keys {
                 Self::force_complete_qpair(key, dead_qpairs);
