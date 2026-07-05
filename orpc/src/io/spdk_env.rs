@@ -963,7 +963,7 @@ impl SpdkEnv {
         let target = &self.conf.targets[target_idx];
         info!("Detaching target[{}]: {}", target_idx, target.endpoint());
 
-        let ctrlr: Option<*mut spdk_ffi::spdk_nvme_ctrlr> = self
+        let ctrlr = self
             .bdevs
             .iter()
             .find(|b| b.target_endpoint == target.endpoint())
