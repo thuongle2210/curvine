@@ -264,7 +264,7 @@ impl SpdkPoller {
     fn has_active_qpairs(dead_qpairs: &HashMap<usize, Box<QpairState>>) -> bool {
         dead_qpairs
             .values()
-            .any(|qs| qs.active && !qs.dead.load(Ordering::Acquire))
+            .any(|qs| !qs.pending.is_empty() && !qs.dead.load(Ordering::Acquire))
     }
 
     /// Main poller loop. Runs on dedicated thread.
@@ -465,7 +465,6 @@ impl SpdkPoller {
             // Signal pending entries with -ESHUTDOWN, move to stale, then orphan
             if let Some(mut qs) = dead_qpairs.remove(&key) {
                 qs.dead.store(true, Ordering::Release);
-                qs.active = false;
                 for &ptr in &qs.pending {
                     unsafe {
                         if (*ptr).completion.complete(-libc::ESHUTDOWN) {
@@ -509,12 +508,10 @@ impl SpdkPoller {
         let qs = dead_qpairs.entry(key).or_insert_with(|| {
             Box::new(QpairState {
                 dead: Arc::new(AtomicBool::new(false)),
-                active: false,
                 pending: Vec::with_capacity(io_queue_depth),
                 stale: Vec::new(),
             })
         });
-        qs.active = true;
 
         let pending_idx = qs.pending.len();
         let qs_ptr = &mut **qs as *mut QpairState;
@@ -603,7 +600,6 @@ impl SpdkPoller {
     fn force_complete_qpair(key: usize, dead_qpairs: &mut HashMap<usize, Box<QpairState>>) {
         if let Some(qs) = dead_qpairs.get_mut(&key) {
             qs.dead.store(true, Ordering::Release);
-            qs.active = false;
             let pending = std::mem::take(&mut qs.pending);
             let count = pending.len();
             for cb_ptr in &pending {
@@ -738,7 +734,6 @@ impl SpdkPoller {
 /// late SPDK callbacks (stale).
 struct QpairState {
     dead: Arc<AtomicBool>,
-    active: bool,
     pending: Vec<*mut CallbackCtx>,
     /// Force-completed entries kept alive for late callbacks. Freed by reclaim_stale().
     stale: Vec<*mut CallbackCtx>,
@@ -826,7 +821,6 @@ mod test {
         let dead_flag = Arc::new(AtomicBool::new(false));
         let mut qs_dead = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -854,7 +848,6 @@ mod test {
         let live_flag = Arc::new(AtomicBool::new(false));
         let mut qs_live = Box::new(QpairState {
             dead: live_flag,
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -920,7 +913,6 @@ mod test {
         let completion = IoCompletion::new();
         let qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -955,7 +947,6 @@ mod test {
         let completion = IoCompletion::new();
         let mut qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -992,7 +983,6 @@ mod test {
         let completion = IoCompletion::new();
         let mut qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1028,7 +1018,6 @@ mod test {
         let completion_1 = IoCompletion::new();
         let mut qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1082,7 +1071,6 @@ mod test {
         let completion = IoCompletion::new();
         let qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1117,7 +1105,6 @@ mod test {
         let dead_flag = Arc::new(AtomicBool::new(false));
         let mut qs = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1160,7 +1147,6 @@ mod test {
         let dead_flag = Arc::new(AtomicBool::new(false));
         let mut qs = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1255,7 +1241,6 @@ mod test {
         }));
         let orphaned_qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(true)),
-            active: false,
             pending: Vec::new(),
             stale: vec![old_stale],
         });
@@ -1265,7 +1250,6 @@ mod test {
         let dead_flag = Arc::new(AtomicBool::new(false));
         let mut qs = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1333,7 +1317,6 @@ mod test {
 
         let mut qs = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
