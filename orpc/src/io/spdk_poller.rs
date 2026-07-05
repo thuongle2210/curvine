@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 const EVENTSZ: usize = std::mem::size_of::<u64>();
 /// I/O operation submitted to the poller thread.
@@ -94,10 +95,10 @@ impl IoCompletion {
                 inner = self.cond.wait(inner).unwrap();
             }
         } else {
-            let timeout = std::time::Duration::from_micros(timeout_us);
-            let deadline = std::time::Instant::now() + timeout;
+            let timeout = Duration::from_micros(timeout_us);
+            let deadline = Instant::now() + timeout;
             while !inner.done {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return -libc::ETIMEDOUT;
                 }
@@ -131,16 +132,20 @@ enum PollerState {
     Idle,
 }
 
+/// SPDK NVMe controller handle — thread-safe.
+#[repr(transparent)]
+pub struct CtrlHandle(pub *mut spdk_ffi::spdk_nvme_ctrlr);
+
+// SAFETY: opaque SPDK handle; admin completion is thread-safe.
+unsafe impl Send for CtrlHandle {}
+
 /// Configuration for the poller thread.
 pub struct PollerConfig {
     pub poll_interval_ms: u64,
     pub spin_iter: u32,
     pub io_queue_depth: usize,
-    pub ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr>,
+    pub ctrlrs: Vec<CtrlHandle>,
 }
-
-// SAFETY: only used for admin completion polling, which is thread-safe.
-unsafe impl Send for PollerConfig {}
 
 /// Poller thread handle.
 pub struct SpdkPoller {
@@ -233,7 +238,7 @@ impl SpdkPoller {
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
             let _ = self.eventfd.write(1);
-            match ack_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            match ack_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => true,
                 Err(_) => {
                     error!("Unregister timeout: poller may be stuck, qpair not removed");
@@ -259,7 +264,7 @@ impl SpdkPoller {
     fn has_active_qpairs(dead_qpairs: &HashMap<usize, Box<QpairState>>) -> bool {
         dead_qpairs
             .values()
-            .any(|qs| qs.active && !qs.dead.load(Ordering::Acquire))
+            .any(|qs| !qs.pending.is_empty() && !qs.dead.load(Ordering::Acquire))
     }
 
     /// Main poller loop. Runs on dedicated thread.
@@ -268,10 +273,10 @@ impl SpdkPoller {
         shutdown: Arc<AtomicBool>,
         is_sleeping: Arc<AtomicBool>,
         eventfd: RawFd,
-        config: PollerConfig,
+        mut config: PollerConfig,
         orphaned: Arc<Mutex<HashMap<usize, Box<QpairState>>>>,
     ) {
-        let active_ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = config.ctrlrs;
+        let active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
@@ -296,12 +301,21 @@ impl SpdkPoller {
 
             // Active state: drain all pending I/Os and poll completions
             if matches!(state, PollerState::Active) {
-                // Drain pending requests (non-blocking)
+                // Drain pending requests (non-blocking) - yield to admin completions every ~128 ops
+                // to prevent keep-alive timeout during heavy I/O bursts.
+                let delta = Duration::from_millis(config.poll_interval_ms);
+                let mut deadline = Instant::now() + delta;
+                let mut drain_count: u64 = 0;
                 while let Ok(req) = rx.try_recv() {
                     if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                         Self::handle_unregister(&req, &mut dead_qpairs, &*orphaned);
                     } else {
                         Self::submit_one(&req, &mut dead_qpairs, config.io_queue_depth);
+                    }
+                    drain_count += 1;
+                    if drain_count & 0x7F == 0 && Instant::now() >= deadline {
+                        Self::process_admin_completions(&active_ctrlrs);
+                        deadline = Instant::now() + delta;
                     }
                 }
 
@@ -366,12 +380,20 @@ impl SpdkPoller {
                             libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENTSZ)
                         };
 
-                        // Drain any pending channel data
+                        // Drain any pending channel data — yield to admin completions every ~128 ops.
+                        let delta = Duration::from_millis(config.poll_interval_ms);
+                        let mut deadline = Instant::now() + delta;
+                        let mut drain_count: u64 = 0;
                         while let Ok(req) = rx.try_recv() {
                             if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                                 Self::handle_unregister(&req, &mut dead_qpairs, &*orphaned);
                             } else {
                                 Self::submit_one(&req, &mut dead_qpairs, config.io_queue_depth);
+                            }
+                            drain_count += 1;
+                            if drain_count & 0x7F == 0 && Instant::now() >= deadline {
+                                Self::process_admin_completions(&active_ctrlrs);
+                                deadline = Instant::now() + delta;
                             }
                         }
 
@@ -432,7 +454,6 @@ impl SpdkPoller {
             // Signal pending entries with -ESHUTDOWN, move to stale, then orphan
             if let Some(mut qs) = dead_qpairs.remove(&key) {
                 qs.dead.store(true, Ordering::Release);
-                qs.active = false;
                 for &ptr in &qs.pending {
                     unsafe {
                         if (*ptr).completion.complete(-libc::ESHUTDOWN) {
@@ -476,12 +497,10 @@ impl SpdkPoller {
         let qs = dead_qpairs.entry(key).or_insert_with(|| {
             Box::new(QpairState {
                 dead: Arc::new(AtomicBool::new(false)),
-                active: false,
                 pending: Vec::with_capacity(io_queue_depth),
                 stale: Vec::new(),
             })
         });
-        qs.active = true;
 
         let pending_idx = qs.pending.len();
         let qs_ptr = &mut **qs as *mut QpairState;
@@ -570,7 +589,6 @@ impl SpdkPoller {
     fn force_complete_qpair(key: usize, dead_qpairs: &mut HashMap<usize, Box<QpairState>>) {
         if let Some(qs) = dead_qpairs.get_mut(&key) {
             qs.dead.store(true, Ordering::Release);
-            qs.active = false;
             let pending = std::mem::take(&mut qs.pending);
             let count = pending.len();
             for cb_ptr in &pending {
@@ -595,55 +613,13 @@ impl SpdkPoller {
     }
 
     /// Process admin completions on all controllers to service keep-alive.
-    fn process_admin_completions(ctrlrs: &[*mut spdk_ffi::spdk_nvme_ctrlr]) {
-        for &ctrlr in ctrlrs {
-            let rc = unsafe { spdk_ffi::spdk_nvme_ctrlr_process_admin_completions(ctrlr) };
+    fn process_admin_completions(ctrlrs: &[CtrlHandle]) {
+        for handle in ctrlrs {
+            let rc = unsafe { spdk_ffi::spdk_nvme_ctrlr_process_admin_completions(handle.0) };
             if rc < 0 {
-                warn!("ctrlr {:p} admin completion error: rc={}", ctrlr, rc);
+                warn!("ctrlr {:p} admin completion error: rc={}", handle.0, rc);
             }
         }
-    }
-
-    /// Poll all active qpairs, handle errors.
-    /// On error: force_complete + move QpairState from dead_qpairs to orphaned HashMap.
-    fn poll_and_sweep(
-        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
-        orphaned: &Mutex<HashMap<usize, Box<QpairState>>>,
-        context: &str,
-    ) {
-        let err_keys: Vec<usize> = dead_qpairs
-            .iter()
-            .filter(|(_, qs)| qs.active && !qs.dead.load(Ordering::Acquire))
-            .filter_map(|(&key, _)| {
-                let qpair = key as *mut spdk_ffi::spdk_nvme_qpair;
-                let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
-                if rc < 0 {
-                    error!("{}: qpair poll error: rc={}", context, rc);
-                    Some(key)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if err_keys.is_empty() {
-            return;
-        }
-        if let Ok(mut guard) = orphaned.lock() {
-            for &key in &err_keys {
-                Self::force_complete_qpair(key, dead_qpairs);
-                if let Some(mut qs) = dead_qpairs.remove(&key) {
-                    if let Some(mut prev) = guard.remove(&key) {
-                        qs.stale.extend(prev.stale.drain(..));
-                        qs.stale.extend(prev.pending.drain(..));
-                    }
-                    guard.insert(key, qs);
-                }
-            }
-        }
-        error!(
-            "{} qpair(s) failed, removed from active set",
-            err_keys.len()
-        );
     }
 }
 
@@ -698,6 +674,50 @@ impl SpdkPoller {
             }
         }
     }
+
+    /// Poll all active qpairs, handle errors.
+    /// On error: force_complete + move QpairState from dead_qpairs to orphaned HashMap.
+    fn poll_and_sweep(
+        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
+        orphaned: &Mutex<HashMap<usize, Box<QpairState>>>,
+        context: &str,
+    ) {
+        let err_keys: Vec<usize> = dead_qpairs
+            .iter()
+            .filter_map(|(&key, qs)| {
+                if qs.dead.load(Ordering::Acquire) {
+                    return None;
+                }
+                let qpair = key as *mut spdk_ffi::spdk_nvme_qpair;
+                let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
+                if rc < 0 {
+                    error!("{}: qpair poll error: rc={}", context, rc);
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if err_keys.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = orphaned.lock() {
+            for &key in &err_keys {
+                Self::force_complete_qpair(key, dead_qpairs);
+                if let Some(mut qs) = dead_qpairs.remove(&key) {
+                    if let Some(mut prev) = guard.remove(&key) {
+                        qs.stale.extend(prev.stale.drain(..));
+                        qs.stale.extend(prev.pending.drain(..));
+                    }
+                    guard.insert(key, qs);
+                }
+            }
+        }
+        error!(
+            "{} qpair(s) failed, removed from active set",
+            err_keys.len()
+        );
+    }
 }
 
 /// Per-qpair state tracked on the poller thread. Holds the dead flag,
@@ -705,7 +725,6 @@ impl SpdkPoller {
 /// late SPDK callbacks (stale).
 struct QpairState {
     dead: Arc<AtomicBool>,
-    active: bool,
     pending: Vec<*mut CallbackCtx>,
     /// Force-completed entries kept alive for late callbacks. Freed by reclaim_stale().
     stale: Vec<*mut CallbackCtx>,
@@ -793,7 +812,6 @@ mod test {
         let dead_flag = Arc::new(AtomicBool::new(false));
         let mut qs_dead = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -821,7 +839,6 @@ mod test {
         let live_flag = Arc::new(AtomicBool::new(false));
         let mut qs_live = Box::new(QpairState {
             dead: live_flag,
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -887,7 +904,6 @@ mod test {
         let completion = IoCompletion::new();
         let qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -922,7 +938,6 @@ mod test {
         let completion = IoCompletion::new();
         let mut qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -959,7 +974,6 @@ mod test {
         let completion = IoCompletion::new();
         let mut qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -995,7 +1009,6 @@ mod test {
         let completion_1 = IoCompletion::new();
         let mut qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1049,7 +1062,6 @@ mod test {
         let completion = IoCompletion::new();
         let qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(false)),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1084,7 +1096,6 @@ mod test {
         let dead_flag = Arc::new(AtomicBool::new(false));
         let mut qs = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1127,7 +1138,6 @@ mod test {
         let dead_flag = Arc::new(AtomicBool::new(false));
         let mut qs = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1222,7 +1232,6 @@ mod test {
         }));
         let orphaned_qs = Box::new(QpairState {
             dead: Arc::new(AtomicBool::new(true)),
-            active: false,
             pending: Vec::new(),
             stale: vec![old_stale],
         });
@@ -1232,7 +1241,6 @@ mod test {
         let dead_flag = Arc::new(AtomicBool::new(false));
         let mut qs = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });
@@ -1300,7 +1308,6 @@ mod test {
 
         let mut qs = Box::new(QpairState {
             dead: dead_flag.clone(),
-            active: false,
             pending: Vec::new(),
             stale: Vec::new(),
         });

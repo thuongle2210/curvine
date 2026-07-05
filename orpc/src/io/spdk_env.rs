@@ -3,7 +3,7 @@
 use crate::common::DurationUnit;
 use crate::err_msg;
 use crate::io::spdk_ffi;
-use crate::io::spdk_poller::PollerConfig;
+use crate::io::spdk_poller::{CtrlHandle, PollerConfig};
 use crate::io::spdk_poller::{IoRequest, SpdkPoller};
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
@@ -362,13 +362,15 @@ impl SpdkConf {
             } else {
                 self.keep_alive_timeout_ms
             };
-            if resolved_ka_ms < self.poll_interval_ms {
+            let min_ka_ms = self.poll_interval_ms * 3;
+            if resolved_ka_ms < min_ka_ms {
                 return err_box!(
-                    "SpdkConf: targets[{}]: resolved keep_alive_timeout_ms ({}) \
-                     must be >= poll_interval_ms ({})",
+                    "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be \
+                     >= 3 * poll_interval_ms ({}) as the worst-case idle->active gap spans \
+                     ~2 poll intervals, requiring 1 interval margin for safety",
                     i,
                     resolved_ka_ms,
-                    self.poll_interval_ms
+                    min_ka_ms
                 );
             }
         }
@@ -617,10 +619,10 @@ impl SpdkEnv {
 
         // Collect unique controllers for admin completion polling (keep-alive)
         let mut seen = HashSet::new();
-        let mut ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = Vec::with_capacity(self.bdevs.len());
+        let mut ctrlrs: Vec<CtrlHandle> = Vec::with_capacity(self.bdevs.len());
         for bdev in &self.bdevs {
             if bdev.ctrlr != 0 && seen.insert(bdev.ctrlr) {
-                ctrlrs.push(bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr);
+                ctrlrs.push(CtrlHandle(bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr));
             }
         }
 
@@ -1282,7 +1284,7 @@ mod test {
                     traddr: "10.0.0.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
-                    keep_alive_timeout_ms: 200, // above poll_interval_ms
+                    keep_alive_timeout_ms: 300, // >= 3 * poll_interval_ms
                     ..Default::default()
                 }],
                 ..Default::default()
