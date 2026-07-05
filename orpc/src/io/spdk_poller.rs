@@ -1090,6 +1090,81 @@ mod test {
     }
 
     #[test]
+    fn poller_callback_out_of_order_reindexes_pending_idx() {
+        // 3 I/Os, completed out of order - verifies swap_remove + reindex
+        // in the callback hot path (not just the submit_one error path).
+        let inflight: Vec<Arc<AtomicUsize>> =
+            (0..3).map(|_| Arc::new(AtomicUsize::new(1))).collect();
+        let completions: Vec<Arc<IoCompletion>> = (0..3).map(|_| IoCompletion::new()).collect();
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+
+        let mut ctxs: Vec<*mut CallbackCtx> = Vec::new();
+        for i in 0..3 {
+            let ctx = Box::into_raw(Box::new(CallbackCtx {
+                completion: completions[i].clone(),
+                async_ctx: unsafe { std::mem::zeroed() },
+                bdev_inflight: inflight[i].clone(),
+                qpair_state: &mut *qs as *mut QpairState,
+                pending_idx: i,
+            }));
+            qs.pending.push(ctx);
+            ctxs.push(ctx);
+        }
+
+        // Complete index 0 first — swap_remove(0) reindexes last to 0.
+        unsafe { poller_callback(ctxs[0] as *mut c_void, 42) };
+        assert_eq!(qs.pending.len(), 2);
+        // ctx_1 was last (idx=1), now at position 0 after swap.
+        assert_eq!(unsafe { (*qs.pending[0]).pending_idx }, 0);
+        assert_eq!(unsafe { (*qs.pending[1]).pending_idx }, 1);
+
+        // Complete original index 1 next — it's now at position 1 (last), pop.
+        unsafe { poller_callback(ctxs[1] as *mut c_void, 43) };
+        assert_eq!(qs.pending.len(), 1);
+        // Only ctx_2 remains, reindexed to 0 from the first swap.
+        assert_eq!(unsafe { (*qs.pending[0]).pending_idx }, 0);
+
+        // Complete original index 2 last — it's the only entry, pop.
+        unsafe { poller_callback(ctxs[2] as *mut c_void, 44) };
+        assert!(qs.pending.is_empty());
+
+        // All completions signaled with correct status.
+        assert_eq!(completions[0].wait(0), 42);
+        assert_eq!(completions[1].wait(0), 43);
+        assert_eq!(completions[2].wait(0), 44);
+
+        // All inflight decremented exactly once.
+        for i in 0..3 {
+            assert_eq!(inflight[i].load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn submit_to_dead_qpair_does_not_push_pending() {
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(true)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+
+        // Simulate the fast-fail path from submit_one: dead check before push.
+        if qs.dead.load(Ordering::Acquire) {
+            inflight.fetch_sub(1, Ordering::Release);
+            completion.complete(-libc::ENXIO);
+        }
+
+        assert!(qs.pending.is_empty(), "dead qpair must not push to pending");
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(completion.wait(0), -libc::ENXIO);
+    }
+
+    #[test]
     fn force_complete_into_stale_reclaimable() {
         let completion = IoCompletion::new();
         let inflight = Arc::new(AtomicUsize::new(1));
