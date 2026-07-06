@@ -57,11 +57,12 @@ impl MasterHandler {
         mount_manager: Arc<MountManager>,
         job_handler: JobHandler,
         replication_manager: Arc<MasterReplicationManager>,
+        metrics: &'static MasterMetrics,
     ) -> Self {
         Self {
             fs,
             retry_cache,
-            metrics: Master::get_metrics(),
+            metrics,
             audit_logging_enabled: conf.master.audit_logging_enabled,
             conn_state,
             mount_manager,
@@ -288,13 +289,15 @@ impl MasterHandler {
             .map(ProtoUtils::commit_block_from_pb)
             .collect();
 
+        let last_block = req.last_block.map(ProtoUtils::extend_block_from_pb);
         let located_block = self.fs.add_block(
             path,
+            req.inode_id,
             client_addr,
             commit_blocks,
             req.exclude_workers,
             req.file_len,
-            req.last_block.map(ProtoUtils::extend_block_from_pb),
+            last_block,
         )?;
         let rep_header = ProtoUtils::located_block_to_pb(located_block);
         ctx.response_buf(rep_header, &mut self.buf)
@@ -318,6 +321,7 @@ impl MasterHandler {
             .collect();
         let file_blocks = self.fs.complete_file(
             req.path,
+            req.inode_id,
             req.len,
             commit_blocks,
             req.client_name,
@@ -365,13 +369,15 @@ impl MasterHandler {
                 .map(ProtoUtils::commit_block_from_pb)
                 .collect();
 
+            let last_block = req.last_block.map(ProtoUtils::extend_block_from_pb);
             let located_block = self.fs.add_block(
                 path,
+                req.inode_id,
                 client_addr,
                 commit_blocks,
                 req.exclude_workers,
                 req.file_len,
-                req.last_block.map(ProtoUtils::extend_block_from_pb),
+                last_block,
             )?;
             results.push(ProtoUtils::located_block_to_pb(located_block));
         }
@@ -394,6 +400,7 @@ impl MasterHandler {
                 .fs
                 .complete_file(
                     req.path,
+                    req.inode_id,
                     req.len,
                     commit_blocks,
                     req.client_name,
@@ -572,7 +579,7 @@ impl MasterHandler {
         let header: MetricsReportRequest = ctx.parse_header()?;
 
         let metrics = ProtoUtils::metrics_report_from_pb(header.metrics);
-        Master::get_metrics().metrics_report(metrics)?;
+        Master::get_metrics()?.metrics_report(metrics)?;
 
         ctx.response_buf(MetricsReportResponse {}, &mut self.buf)
     }

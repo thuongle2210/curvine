@@ -15,6 +15,7 @@
 use crate::master::JobContext;
 use curvine_common::state::{JobTaskProgress, JobTaskState};
 use curvine_common::FsResult;
+use log::{debug, error};
 use orpc::err_box;
 use orpc::sync::FastDashMap;
 use std::collections::HashMap;
@@ -73,18 +74,22 @@ impl JobStore {
         }
     }
 
-    pub fn register_callback(&self, job_id: String, callback: JobCallback) {
-        let mut callbacks = self.callbacks.write().unwrap();
+    pub fn register_callback(&self, job_id: String, callback: JobCallback) -> FsResult<()> {
+        let mut callbacks = match self.callbacks.write() {
+            Ok(callbacks) => callbacks,
+            Err(e) => return err_box!("failed to register job callback for {}: {}", job_id, e),
+        };
         callbacks.entry(job_id).or_default().push(callback);
+        Ok(())
     }
 
-    pub fn register_completion_callback<F>(&self, job_id: String, callback: F)
+    pub fn register_completion_callback<F>(&self, job_id: String, callback: F) -> FsResult<()>
     where
         F: Fn(&str, JobTaskState, JobTaskState, &JobContext) + Send + Sync + 'static,
     {
         let cb = JobCallback::new(callback)
             .with_filter(vec![JobTaskState::Completed, JobTaskState::Failed]);
-        self.register_callback(job_id, cb);
+        self.register_callback(job_id, cb)
     }
 
     fn trigger_callbacks(
@@ -93,8 +98,11 @@ impl JobStore {
         old_state: JobTaskState,
         new_state: JobTaskState,
         job: &JobContext,
-    ) {
-        let callbacks_guard = self.callbacks.read().unwrap();
+    ) -> FsResult<()> {
+        let callbacks_guard = match self.callbacks.read() {
+            Ok(callbacks) => callbacks,
+            Err(e) => return err_box!("failed to trigger job callbacks for {}: {}", job_id, e),
+        };
         if let Some(callbacks) = callbacks_guard.get(job_id) {
             for cb in callbacks {
                 if cb.should_trigger(new_state) {
@@ -102,6 +110,7 @@ impl JobStore {
                 }
             }
         }
+        Ok(())
     }
 
     pub fn update_progress(
@@ -120,6 +129,21 @@ impl JobStore {
         };
 
         let old_state: JobTaskState = job.state.state();
+        if old_state.is_finish() {
+            debug!(
+                "ignore task report for terminal job {}, task {}, state {:?}",
+                job_id, task_id, old_state
+            );
+            return Ok(());
+        }
+
+        if !job.tasks.contains_key(task_id) {
+            debug!(
+                "ignore stale task report for job {}, unknown task {}",
+                job_id, task_id
+            );
+            return Ok(());
+        }
 
         job.update_progress(task_id, progress)?;
 
@@ -130,13 +154,18 @@ impl JobStore {
             let job_clone = (*job).clone();
             drop(job);
 
-            self.trigger_callbacks(&job_id_owned, old_state, new_state, &job_clone);
+            self.trigger_callbacks(&job_id_owned, old_state, new_state, &job_clone)?;
         }
 
         Ok(())
     }
 
-    pub fn update_state(&self, job_id: &str, state: JobTaskState, message: impl Into<String>) {
+    pub fn update_state(
+        &self,
+        job_id: &str,
+        state: JobTaskState,
+        message: impl Into<String>,
+    ) -> FsResult<()> {
         if let Some(mut job) = self.jobs.get_mut(job_id) {
             let old_state: JobTaskState = job.state.state();
             job.update_state(state, message);
@@ -146,14 +175,54 @@ impl JobStore {
                 let job_clone = (*job).clone();
                 drop(job);
 
-                self.trigger_callbacks(job_id, old_state, new_state, &job_clone);
+                self.trigger_callbacks(job_id, old_state, new_state, &job_clone)?;
             }
         }
+        Ok(())
     }
 
-    pub fn remove_callbacks(&self, job_id: &str) {
-        let mut callbacks = self.callbacks.write().unwrap();
+    pub fn update_state_if_run(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        state: JobTaskState,
+        message: impl Into<String>,
+    ) -> bool {
+        let mut job = match self.jobs.get_mut(job_id) {
+            Some(job) => job,
+            None => return false,
+        };
+
+        let old_state: JobTaskState = job.state.state();
+        if job.run_id != run_id || !old_state.is_running() {
+            return false;
+        }
+
+        job.update_state(state, message);
+        let new_state = state;
+
+        if old_state != new_state {
+            let job_clone = (*job).clone();
+            drop(job);
+
+            if let Err(err) = self.trigger_callbacks(job_id, old_state, new_state, &job_clone) {
+                error!(
+                    "failed to trigger job callbacks for {} after run-scoped state update: {}",
+                    job_id, err
+                );
+            }
+        }
+
+        true
+    }
+
+    pub fn remove_callbacks(&self, job_id: &str) -> FsResult<()> {
+        let mut callbacks = match self.callbacks.write() {
+            Ok(callbacks) => callbacks,
+            Err(e) => return err_box!("failed to remove job callbacks for {}: {}", job_id, e),
+        };
         callbacks.remove(job_id);
+        Ok(())
     }
 }
 
