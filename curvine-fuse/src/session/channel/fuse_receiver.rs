@@ -29,7 +29,7 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::AsyncSender;
 use orpc::sync::FastDashMap;
 use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
+use orpc::{err_box, sys};
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
 use tokio_util::bytes::BytesMut;
@@ -43,7 +43,7 @@ pub struct FuseReceiver<T> {
     fs: Arc<T>,
     rt: Arc<Runtime>,
     sender: AsyncSender<FuseTask>,
-    pipe2: Option<Pipe2>,
+    pipe2: Pipe2,
     buf: BytesMut,
     fuse_len: usize,
     debug: bool,
@@ -64,13 +64,8 @@ impl<T: FileSystem> FuseReceiver<T> {
         audit_logging_enabled: bool,
         metrics_enabled: bool,
         pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
-        enable_splice: bool,
     ) -> IOResult<Self> {
-        let pipe2 = if enable_splice {
-            Some(Pipe2::new(PipeFd::new(buf_size, false, false)?)?)
-        } else {
-            None
-        };
+        let pipe2 = Pipe2::new(PipeFd::new(buf_size, false, false)?)?;
         let buf = BytesMut::zeroed(buf_size);
 
         let client = Self {
@@ -92,43 +87,32 @@ impl<T: FileSystem> FuseReceiver<T> {
 
     // Read a data from fuse.
     pub async fn receive(&mut self) -> IOResult<BytesMut> {
-        if self.pipe2.is_some() {
-            self.splice().await
-        } else {
-            self.read().await
-        }
+        self.splice().await
     }
 
-    // Use libc::read to read data directly into the buffer (no splice).
+    // Use libc::read to read data, test it, and there are multiple memory copies.
     pub async fn read(&mut self) -> IOResult<BytesMut> {
-        self.buf.reserve(self.fuse_len);
-        unsafe {
-            self.buf.set_len(self.fuse_len);
-        }
-
         let len = self
             .kernel_fd
             .async_read(|fd| sys::read(fd.fd(), &mut self.buf))
-            .await?;
-        let len = len as usize;
-        if len < FUSE_IN_HEADER_LEN {
-            return err_box!("short read on fuse device");
-        }
-
-        Ok(self.buf.split_to(len))
+            .await
+            .unwrap();
+        Ok(BytesMut::from(&self.buf[..len as usize]))
     }
 
     pub async fn splice(&mut self) -> IOResult<BytesMut> {
-        let pipe2 = try_option_ref!(self.pipe2);
-
-        let write_len = pipe2.write_io(&self.kernel_fd, None, self.fuse_len).await?;
+        let write_len = self
+            .pipe2
+            .write_io(&self.kernel_fd, None, self.fuse_len)
+            .await
+            .unwrap();
 
         self.buf.reserve(write_len);
         unsafe {
             self.buf.set_len(write_len);
         }
 
-        let read_len = pipe2.read_buf(&mut self.buf[..write_len]).await?;
+        let read_len = self.pipe2.read_buf(&mut self.buf[..write_len]).await?;
         if write_len != read_len {
             return err_box!(
                 "splice read and write lengths are inconsistent, write len {}, read len {}",
@@ -140,7 +124,8 @@ impl<T: FileSystem> FuseReceiver<T> {
             return err_box!("short read on fuse device");
         };
 
-        Ok(self.buf.split_to(read_len))
+        let req_buf = self.buf.split_to(read_len);
+        Ok(req_buf)
     }
 
     /// Build a reply handle for `unique`. When `labels` is `Some`, a metrics

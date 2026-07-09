@@ -28,14 +28,18 @@ pub struct LoadStatusCommand {
 
     #[arg(long, short = 'w', default_value = "5s")]
     watch: Option<String>,
+
+    #[arg(long, default_value = "${CURVINE_CONF_FILE}")]
+    conf: String,
 }
 
 impl LoadStatusCommand {
-    pub fn new(job_id: String, verbose: bool, watch: String) -> Self {
+    pub fn new(job_id: String, verbose: bool, watch: String, conf: String) -> Self {
         Self {
             job_id,
             verbose,
             watch: Some(watch),
+            conf,
         }
     }
     pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {

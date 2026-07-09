@@ -21,6 +21,9 @@ use crate::util::*;
 #[derive(Parser, Debug)]
 pub struct CancelLoadCommand {
     job_id: String,
+
+    #[arg(long, default_value = "${CURVINE_CONF_FILE}")]
+    conf: String,
 }
 
 impl CancelLoadCommand {
