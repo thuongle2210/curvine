@@ -179,6 +179,7 @@ impl SpdkPoller {
         let eventfd_arc = Arc::new(eventfd);
 
         let orphaned = Arc::new(Mutex::new(HashMap::new()));
+        let orphaned_clone = orphaned.clone();
 
         let handle = std::thread::Builder::new()
             .name("spdk-poller".to_string())
@@ -189,7 +190,7 @@ impl SpdkPoller {
                     is_sleeping_clone,
                     eventfd_raw,
                     config,
-                    orphaned,
+                    orphaned_clone,
                 );
             })
             .expect("Failed to spawn SPDK poller thread");
