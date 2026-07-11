@@ -158,9 +158,6 @@ pub struct SpdkPoller {
     /// Whether poller is blocked on eventfd (idle). Bdevs check this to
     /// skip eventfd write syscall when poller is already active.
     is_sleeping: Arc<AtomicBool>,
-    /// Orphaned QpairState entries keyed by qpair address.
-    /// Kept alive for late SPDK callbacks during free_io_qpair.
-    orphaned: Arc<Mutex<HashMap<usize, Box<QpairState>>>>,
 }
 
 impl SpdkPoller {
@@ -179,7 +176,6 @@ impl SpdkPoller {
         let eventfd_arc = Arc::new(eventfd);
 
         let orphaned = Arc::new(Mutex::new(HashMap::new()));
-        let orphaned_clone = orphaned.clone();
 
         let handle = std::thread::Builder::new()
             .name("spdk-poller".to_string())
@@ -190,7 +186,7 @@ impl SpdkPoller {
                     is_sleeping_clone,
                     eventfd_raw,
                     config,
-                    orphaned_clone,
+                    orphaned,
                 );
             })
             .expect("Failed to spawn SPDK poller thread");
@@ -201,7 +197,6 @@ impl SpdkPoller {
             shutdown,
             handle: Some(handle),
             is_sleeping,
-            orphaned,
         }
     }
 
