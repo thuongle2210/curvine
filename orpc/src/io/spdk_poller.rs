@@ -1134,10 +1134,10 @@ mod test {
         assert_eq!(unsafe { (*qs.pending[0]).pending_idx }, 0);
         assert_eq!(completion_1.wait(1), -libc::ETIMEDOUT);
         assert_eq!(
--            inflight_1.load(Ordering::Acquire),
--            1,
--            "stale entry inflight must not be decremented"
--       );
+            inflight_1.load(Ordering::Acquire),
+            1,
+            "stale entry inflight must not be decremented"
+        );
         assert_eq!(inflight_1.load(Ordering::Acquire), 1);
 
         // Clean up ctx_1.
