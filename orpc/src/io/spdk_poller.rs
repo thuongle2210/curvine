@@ -870,6 +870,10 @@ mod test {
 
         // Assert: LIVE entry's bdev_inflight unchanged.
         assert_eq!(inflight_3.load(Ordering::Acquire), 1);
+        // Assert: DEAD stays in dead_qpairs with entries in stale.
+        assert!(dead_qpairs.contains_key(&DEAD));
+        assert_eq!(dead_qpairs[&DEAD].stale.len(), 2);
+        assert_eq!(dead_qpairs[&DEAD].pending.len(), 0);
 
         // Assert: dead flag set.
         assert!(dead_flag.load(Ordering::Acquire));
@@ -1455,8 +1459,13 @@ mod test {
             "pending entry must move to stale"
         );
 
-        // stale entry was already signaled (not re-signaled by force_complete)
+        // force_complete did not re-signal stale entries
         assert_eq!(completion_1.wait(1), -libc::ETIMEDOUT);
+        assert_eq!(
+            inflight_1.load(Ordering::Acquire),
+            1,
+            "stale entry inflight must not be decremented"
+        );
         // pending entry was signaled with -EIO
         assert_eq!(completion_2.wait(0), -libc::EIO);
         assert_eq!(inflight_2.load(Ordering::Acquire), 0);
