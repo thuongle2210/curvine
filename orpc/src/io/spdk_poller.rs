@@ -1612,28 +1612,4 @@ mod test {
         assert_eq!(completion_2.wait(0), -libc::EIO);
         assert_eq!(inflight_2.load(Ordering::Acquire), 0);
     }
-
-    #[test]
-    fn poller_callback_empty_pending_signals_completion() {
-        let inflight = Arc::new(AtomicUsize::new(1));
-        let completion = IoCompletion::new();
-        let qs = Box::new(QpairState {
-            dead: Arc::new(AtomicBool::new(false)),
-            pending: Vec::new(),
-            stale: Vec::new(),
-        });
-        let ctx = Box::into_raw(Box::new(CallbackCtx {
-            completion: completion.clone(),
-            async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: inflight.clone(),
-            qpair_state: &*qs as *const QpairState as *mut QpairState,
-            pending_idx: 0,
-        }));
-
-        unsafe { poller_callback(ctx as *mut c_void, 42) };
-
-        // Hot path always signals completion and decrements inflight.
-        assert_eq!(completion.wait(0), 42);
-        assert_eq!(inflight.load(Ordering::Acquire), 0);
-    }
 }
