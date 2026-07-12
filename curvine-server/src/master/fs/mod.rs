@@ -18,6 +18,9 @@ pub use self::worker_manager::WorkerManager;
 mod heartbeat_checker;
 pub use self::heartbeat_checker::HeartbeatChecker;
 
+mod fs_dir_watchdog;
+pub use self::fs_dir_watchdog::FsDirWatchdog;
+
 mod master_actor;
 pub use self::master_actor::MasterActor;
 
@@ -25,7 +28,8 @@ mod fs_retry_cache;
 pub use self::fs_retry_cache::*;
 
 mod master_filesystem;
-pub use self::master_filesystem::MasterFilesystem;
+pub(crate) use self::master_filesystem::BlockInodeState;
+pub use self::master_filesystem::{BlockReportResult, MasterFilesystem};
 
 mod delete_result;
 pub use self::delete_result::DeleteResult;

@@ -17,6 +17,7 @@ use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
 use curvine_common::executor::ScheduledExecutor;
 use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
+use curvine_common::utils::ProtoUtils;
 use dashmap::DashMap;
 use log::info;
 use orpc::common::TimeSpent;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 /// 1. Register worker with master
 /// 2. Report block information to the master
 /// 3. Accept the master's instructions and delete the block data.
+#[derive(Clone)]
 pub struct BlockActor {
     pub(crate) client: MasterClient,
     store: BlockStore,
@@ -51,13 +53,13 @@ impl BlockActor {
         worker_addr: WorkerAddress,
         store: BlockStore,
         worker_ctl: StateCtl,
-    ) -> BlockActor {
-        let context = FsContext::with_rt(conf.clone(), rt).unwrap();
+    ) -> CommonResult<BlockActor> {
+        let context = FsContext::with_rt(conf.clone(), rt)?;
         let context = Arc::new(context);
         let client = MasterClient::new(
             context.clone(),
-            store.cluster_id(),
-            store.worker_id(),
+            store.cluster_id()?,
+            store.worker_id()?,
             worker_addr,
         );
         let executor = GroupExecutor::new(
@@ -67,7 +69,7 @@ impl BlockActor {
         );
         let heartbeat_interval_ms = conf.master.heartbeat_interval_ms();
         let block_report_limit = conf.master.block_report_limit;
-        Self {
+        Ok(Self {
             client,
             store,
             executor: Arc::new(executor),
@@ -75,17 +77,17 @@ impl BlockActor {
             worker_ctl,
             block_report_limit,
             report_blocks: Arc::new(DashMap::new()),
-        }
+        })
     }
 
-    pub fn start(self) {
+    pub fn start(self) -> CommonResult<()> {
         info!("start block actor");
 
-        self.register().unwrap();
+        self.register()?;
         info!("worker register success");
 
         let spend = TimeSpent::new();
-        let total_len = self.full_block_report().unwrap();
+        let total_len = self.full_block_report()?;
         info!(
             "worker block report success, total blocks {}, used {} ms",
             total_len,
@@ -99,31 +101,45 @@ impl BlockActor {
             self.store.clone(),
             self.report_blocks.clone(),
             self.heartbeat_interval_ms,
-        )
-        .unwrap();
+        )?;
+        Ok(())
     }
 
     // Worker registration.
     pub fn register(&self) -> CommonResult<()> {
-        let storages_info = self.store.get_and_check_storages();
+        let storages_info = self.store.get_and_check_storages()?;
         let result = self.client.heartbeat(HeartbeatStatus::Start, storages_info);
         result?;
         Ok(())
     }
 
     pub fn full_block_report(&self) -> CommonResult<usize> {
-        let blocks = self.store.all_blocks();
+        let blocks = self.store.all_blocks()?;
         if blocks.is_empty() {
-            let _ = self.client.full_block_report(0, &[])?;
+            let response = self.client.full_block_report(0, &[])?;
+            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
+            HeartbeatTask::delete_block_task(
+                self.executor.clone(),
+                self.store.clone(),
+                cmds,
+                self.report_blocks.clone(),
+            );
             return Ok(0);
         }
 
         let mut off = 0;
         while off < blocks.len() {
             let end = (off + self.block_report_limit).min(blocks.len());
-            let _ = self
+            let response = self
                 .client
                 .full_block_report(blocks.len(), &blocks[off..end])?;
+            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
+            HeartbeatTask::delete_block_task(
+                self.executor.clone(),
+                self.store.clone(),
+                cmds,
+                self.report_blocks.clone(),
+            );
             off = end;
         }
 

@@ -17,23 +17,28 @@ use curvine_common::error::FsError;
 use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+    CreateFileRequest, DeleteRequest, GetMasterInfoRequest, MkdirOptsProto, MkdirRequest,
+    RenameRequest,
 };
 use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, FileAllocOpts, WorkerInfo,
+    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, StorageType, TtlAction, WorkerInfo,
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
+use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
+use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use orpc::common::LocalTime;
 use orpc::common::Utils;
+use orpc::handler::MessageHandler;
 use orpc::message::Builder;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use orpc::CommonResult;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -147,21 +152,25 @@ fn file_counts(fs: &MasterFilesystem) -> (i64, i64) {
 fn new_handler() -> MasterHandler {
     Master::init_test_metrics();
 
+    let test_id = Utils::rand_str(8);
     let mut conf = ClusterConf::format();
     conf.journal.enable = false;
 
-    conf.master.meta_dir = Utils::test_sub_dir("master-fs-test/meta-retry");
-    conf.journal.journal_dir = Utils::test_sub_dir("master-fs-test/journal-retry");
+    conf.master.meta_dir = Utils::test_sub_dir(format!("master-fs-test/meta-retry-{test_id}"));
+    conf.journal.journal_dir =
+        Utils::test_sub_dir(format!("master-fs-test/journal-retry-{test_id}"));
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
     fs.add_test_worker(WorkerInfo::default());
-    let retry_cache = FsRetryCache::with_conf(&conf.master);
+    let retry_cache = FsRetryCache::with_conf(&conf.master)
+        .expect("test master retry cache configuration should be valid");
 
     let mount_manager = journal_system.mount_manager();
     let rt = Arc::new(AsyncRuntime::single());
     let replication_manager =
-        MasterReplicationManager::new(&fs, &conf, &rt, &journal_system.worker_manager());
+        MasterReplicationManager::new(&fs, &conf, &rt, &journal_system.worker_manager())
+            .expect("test master replication manager should initialize");
     let job_manager = Arc::new(JobManager::from_cluster_conf(
         fs.clone(),
         mount_manager.clone(),
@@ -175,8 +184,60 @@ fn new_handler() -> MasterHandler {
         None,
         mount_manager,
         JobHandler::new(job_manager),
+        Arc::new(GroupExecutor::new("test-master-heartbeat-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-master-block-report-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-master-control-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new("test-master-list-rpc", 1, 8)),
+        Arc::new(GroupExecutor::new(
+            "test-master-get-block-locations-rpc",
+            1,
+            8,
+        )),
         replication_manager,
+        Master::get_metrics().expect("test master metrics should initialize"),
     )
+}
+
+#[test]
+fn worker_reports_and_metadata_reads_do_not_use_master_sync_pool() {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler();
+
+    for code in [
+        RpcCode::SubmitJob,
+        RpcCode::GetJobStatus,
+        RpcCode::CancelJob,
+        RpcCode::ReportTask,
+        RpcCode::GetBlockLocations,
+        RpcCode::GetMasterInfo,
+        RpcCode::ListStatus,
+        RpcCode::ListOptions,
+        RpcCode::WorkerHeartbeat,
+        RpcCode::WorkerBlockReport,
+    ] {
+        let msg = Builder::new_rpc(code).build();
+        assert!(!handler.is_sync(&msg), "{code:?} must use an async lane");
+    }
+
+    let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
+    assert!(handler.is_sync(&mkdir));
+}
+
+#[test]
+fn async_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let mut handler = new_handler();
+    let msg = Builder::new_rpc(RpcCode::GetMasterInfo)
+        .proto_header(GetMasterInfoRequest::default())
+        .build();
+
+    let rt = AsyncRuntime::single();
+    let response = rt.block_on(handler.async_handle(msg))?;
+
+    assert!(!response.is_success());
+    let err = response.check_error_ext::<FsError>().unwrap_err();
+    assert!(matches!(err, FsError::NotLeaderMaster(_)));
+    Ok(())
 }
 
 #[test]
@@ -191,6 +252,355 @@ fn test_master_filesystem_core_operations() -> CommonResult<()> {
     get_file_info(&fs)?;
     list_status(&fs)?;
     state(&fs)?;
+
+    Ok(())
+}
+
+#[test]
+fn block_report_for_non_file_inode_schedules_worker_delete() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "block-report-non-file");
+    fs.mkdir("/dir-block", true)?;
+    let dir_status = fs.file_status("/dir-block")?;
+    let block_id = InodeId::create_block_id(dir_status.id, 0)?;
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 0,
+            full_report: false,
+            total_len: 1,
+            blocks: vec![BlockReportInfo::new(
+                block_id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                1,
+            )],
+        },
+        None,
+    )?;
+
+    assert_eq!(result.delete_blocks, vec![block_id]);
+    Ok(())
+}
+
+#[test]
+fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-reconcile-async");
+    let path = "/full-block-reconcile.log";
+    let addr = ClientAddress::default();
+    let status = fs.create(path, false)?;
+
+    let first = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+    let first_commit = CommitBlock {
+        block_id: first.block.id,
+        block_len: status.block_size,
+        locations: vec![BlockLocation::with_id(100)],
+    };
+    let second = fs.add_block(
+        path,
+        None,
+        addr,
+        vec![first_commit],
+        vec![],
+        status.block_size,
+        Some(first.block.clone()),
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![
+                BlockReportInfo::new(
+                    first.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    first.block.len,
+                ),
+                BlockReportInfo::new(
+                    second.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    second.block.len,
+                ),
+            ],
+        },
+        None,
+    )?;
+
+    let before = fs.get_block_locations(path)?;
+    assert_eq!(before.block_locs.len(), 2);
+    assert!(!before.block_locs[1].locs.is_empty());
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            total_len: 1,
+            blocks: vec![BlockReportInfo::new(
+                first.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                first.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    for _ in 0..50 {
+        let blocks = fs.get_block_locations(path)?;
+        let stale = blocks
+            .block_locs
+            .iter()
+            .find(|block| block.block.id == second.block.id)
+            .expect("second block metadata should remain");
+        if stale.locs.is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let blocks = fs.get_block_locations(path)?;
+    panic!(
+        "stale worker location for block {} was not reconciled: {:?}",
+        second.block.id, blocks
+    );
+}
+
+#[test]
+fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-report-invalidate-session");
+    let path = "/full-block-report-invalidate-session.log";
+    let addr = ClientAddress::default();
+    let status = fs.create(path, false)?;
+
+    let first = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
+    let first_commit = CommitBlock {
+        block_id: first.block.id,
+        block_len: status.block_size,
+        locations: vec![BlockLocation::with_id(100)],
+    };
+    let second = fs.add_block(
+        path,
+        None,
+        addr.clone(),
+        vec![first_commit],
+        vec![],
+        status.block_size,
+        Some(first.block.clone()),
+    )?;
+    let second_commit = CommitBlock {
+        block_id: second.block.id,
+        block_len: status.block_size,
+        locations: vec![BlockLocation::with_id(100)],
+    };
+    let third = fs.add_block(
+        path,
+        None,
+        addr,
+        vec![second_commit],
+        vec![],
+        status.block_size * 2,
+        Some(second.block.clone()),
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![
+                BlockReportInfo::new(
+                    first.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    first.block.len,
+                ),
+                BlockReportInfo::new(
+                    second.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    second.block.len,
+                ),
+                BlockReportInfo::new(
+                    third.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    third.block.len,
+                ),
+            ],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            total_len: 2,
+            blocks: vec![BlockReportInfo::new(
+                first.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                first.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::new(
+                second.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                second.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            total_len: 2,
+            blocks: vec![BlockReportInfo::new(
+                third.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                third.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    for _ in 0..50 {
+        let blocks = fs.get_block_locations(path)?;
+        let protected = blocks
+            .block_locs
+            .iter()
+            .find(|block| block.block.id == second.block.id)
+            .expect("second block metadata should remain");
+        assert!(
+            !protected.locs.is_empty(),
+            "incremental report should protect block {} from stale full-report reconciliation",
+            second.block.id
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-nested-delete");
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let status = fs.create_with_opts(
+        "/ttl/a/b/file.log",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    std::thread::sleep(Duration::from_millis(10));
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let (processed, inode) = executor.execute_by_id(status.id)?;
+
+    assert!(
+        processed,
+        "expired inode should be processed by TTL executor"
+    );
+    assert_eq!(inode.id(), status.id);
+    assert!(
+        fs.file_status("/ttl/a/b/file.log").is_err(),
+        "TTL delete should remove the nested file path resolved from inode id"
+    );
+
+    Ok(())
+}
+
+// Regression: TTL path resolution must not re-acquire the fs_dir read lock while
+// already holding it. std::sync::RwLock is writer-preferring, so a reentrant read
+// deadlocks once a writer is queued. This reproduces the 2026-07-08 freeze shape:
+// a deep path resolved under continuous concurrent writers. It must complete
+// within the timeout.
+#[test]
+fn ttl_path_resolution_no_reentrant_deadlock_under_writers() -> CommonResult<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-reentrant-deadlock");
+
+    let mut deep_path = String::new();
+    for level in 0..12 {
+        deep_path.push_str(&format!("/d{}", level));
+    }
+    deep_path.push_str("/file.log");
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let status = fs.create_with_opts(
+        &deep_path,
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+    std::thread::sleep(Duration::from_millis(10));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_fs = fs.clone();
+    let writer_stop = stop.clone();
+    let writer = std::thread::spawn(move || {
+        let mut i = 0u64;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let _ = writer_fs.mkdir(format!("/writer/{}", i), true);
+            i += 1;
+        }
+    });
+
+    let (tx, rx) = mpsc::channel();
+    let exec_fs = fs.clone();
+    let inode_id = status.id;
+    let resolver = std::thread::spawn(move || {
+        let executor = InodeTtlExecutor::with_managers(exec_fs);
+        let _ = tx.send(executor.execute_by_id(inode_id));
+    });
+
+    let result = rx.recv_timeout(Duration::from_secs(10));
+    stop.store(true, Ordering::Relaxed);
+    let _ = writer.join();
+    let _ = resolver.join();
+
+    let (processed, inode) = result
+        .expect("TTL path resolution deadlocked: no result within 10s under concurrent writers")?;
+    assert!(processed, "expired inode should be processed");
+    assert_eq!(inode.id(), status.id);
+    assert!(
+        fs.file_status(&deep_path).is_err(),
+        "TTL delete should remove the deep path resolved from inode id"
+    );
 
     Ok(())
 }
@@ -226,7 +636,7 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
         let fs = new_fs(true, "restore");
         fs.mkdir("/a", false)?;
         fs.mkdir("/x1/x2/x3", true)?;
-        let hash = fs.sum_hash();
+        let hash = fs.sum_hash()?;
         drop(fs);
         hash
     }; // Scope ensures all resources are dropped before reopening DB
@@ -237,7 +647,7 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
 
     assert!(fs.exists("/a")?);
     assert!(fs.exists("/x1/x2/x3")?);
-    let hash2 = fs.sum_hash();
+    let hash2 = fs.sum_hash()?;
     assert_eq!(hash1, hash2);
 
     Ok(())
@@ -251,7 +661,7 @@ fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonR
         let (fs, js) = new_fs_with_journal(true, &test_name)?;
         fs.mkdir("/a", false)?;
         fs.mkdir("/x1/x2/x3", true)?;
-        let hash = fs.sum_hash();
+        let hash = fs.sum_hash()?;
         drop(fs);
         js.shutdown();
         hash
@@ -262,7 +672,7 @@ fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonR
 
     assert!(fs.exists("/a")?);
     assert!(fs.exists("/x1/x2/x3")?);
-    assert_eq!(hash1, fs.sum_hash());
+    assert_eq!(hash1, fs.sum_hash()?);
 
     drop(fs);
     js.shutdown();
@@ -715,11 +1125,11 @@ fn state(fs: &MasterFilesystem) -> CommonResult<()> {
 
     fs.print_tree();
     let fs_dir = fs.fs_dir.read();
-    let mem_hash = fs_dir.root_dir().sum_hash();
+    let mem_hash = fs_dir.root_dir().sum_hash()?;
 
     let state_tree = fs_dir.create_tree()?;
     state_tree.print_tree();
-    let state_hash = state_tree.sum_hash();
+    let state_hash = state_tree.sum_hash()?;
 
     println!("mem_hash = {}, state_hash = {}", mem_hash, state_hash);
     assert_eq!(mem_hash, state_hash);
@@ -764,10 +1174,10 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let status = fs.create(path, false).unwrap();
 
     let b1 = fs
-        .add_block(path, addr.clone(), vec![], vec![], 0, None)
+        .add_block(path, None, addr.clone(), vec![], vec![], 0, None)
         .unwrap();
     let b2 = fs
-        .add_block(path, addr.clone(), vec![], vec![], 0, None)
+        .add_block(path, None, addr.clone(), vec![], vec![], 0, None)
         .unwrap();
 
     assert_eq!(b1.block.id, b2.block.id);
@@ -792,6 +1202,7 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let b1 = fs
         .add_block(
             path,
+            None,
             addr.clone(),
             vec![commit.clone()],
             vec![],
@@ -802,6 +1213,7 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let b2 = fs
         .add_block(
             path,
+            None,
             addr.clone(),
             vec![commit],
             vec![],
@@ -823,7 +1235,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let addr = ClientAddress::default();
     fs.create(path, false)?;
 
-    let b1 = fs.add_block(path, addr.clone(), vec![], vec![], 0, None)?;
+    let b1 = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
 
     let commit = CommitBlock {
         block_id: b1.block.id,
@@ -836,6 +1248,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
 
     let f1 = fs.complete_file(
         path,
+        None,
         b1.block.len,
         vec![commit.clone()],
         &addr.client_name,
@@ -845,6 +1258,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
 
     let f2 = fs.complete_file(
         path,
+        None,
         b1.block.len,
         vec![commit.clone()],
         &addr.client_name,
@@ -991,7 +1405,7 @@ fn test_idempotent_mkdir() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("mkdir");
     fs.mkdir("/data", false)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1001,7 +1415,7 @@ fn test_idempotent_create_file() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("create-file");
     fs.create("/file.log", true)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1033,7 +1447,7 @@ fn test_idempotent_delete() -> CommonResult<()> {
         "follower file counts must stay non-negative: {:?}",
         follower_counts
     );
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1044,7 +1458,7 @@ fn test_idempotent_rename() -> CommonResult<()> {
     fs.mkdir("/src", false)?;
     fs.rename("/src", "/dst", RenameFlags::empty())?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1058,7 +1472,7 @@ fn test_idempotent_free() -> CommonResult<()> {
     fs.set_attr("/file.log", set_opts)?;
     fs.free("/file.log", false)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1070,7 +1484,7 @@ fn test_idempotent_set_attr() -> CommonResult<()> {
     let opts = SetAttrOptsBuilder::new().owner("test_owner").build();
     fs.set_attr("/data", opts)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1083,7 +1497,7 @@ fn test_idempotent_unmount() -> CommonResult<()> {
     mnt_mgr.mount(None, "/mnt/test", "oss://bucket/", &mnt_opt)?;
     mnt_mgr.umount("/mnt/test")?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1190,7 +1604,7 @@ fn test_idempotent_symlink() -> CommonResult<()> {
         "follower file counts must stay non-negative: {:?}",
         follower_counts
     );
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1268,7 +1682,7 @@ fn test_idempotent_mount() -> CommonResult<()> {
         &mnt_opt,
     )?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 
@@ -1288,7 +1702,7 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
     };
     fs.set_lock("/lockfile.log", lock)?;
     replay_all_then_duplicate_last(&js, &loader)?;
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
 }
 

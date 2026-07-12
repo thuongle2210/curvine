@@ -21,7 +21,8 @@ use curvine_common::conf::ClientConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    JobTaskState, LoadJobCommand, LoadJobResult, LoadTaskInfo, MountInfo, WorkerAddress,
+    JobTaskState, LoadJobCommand, LoadJobInfo, LoadJobResult, LoadTaskInfo, MountInfo,
+    WorkerAddress,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -30,6 +31,7 @@ use futures::future;
 use log::{debug, error, info, warn};
 use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;
+use orpc::sync::AtomicCounter;
 use std::collections::LinkedList;
 use std::sync::Arc;
 
@@ -38,20 +40,42 @@ pub struct LoadJobRunner {
     master_fs: MasterFilesystem,
     factory: Arc<UfsFactory>,
     job_max_files: usize,
+    run_seq: Arc<AtomicCounter>,
+}
+
+#[derive(Clone)]
+pub(crate) struct QueuedLoadJob {
+    pub(crate) job_id: String,
+    pub(crate) run_id: u64,
+}
+
+struct PlannedLoadJob {
+    tasks: FastHashMap<String, TaskDetail>,
+    total_size: i64,
+}
+
+#[derive(Clone, Copy)]
+enum CvSourceMode {
+    LoadUfsOnlyFromUfs,
+    ExportCurvineToUfs,
 }
 
 impl LoadJobRunner {
+    const RUN_ID_SEQ_MOD: u64 = 1_000_000;
+
     pub fn new(
         jobs: JobStore,
         master_fs: MasterFilesystem,
         factory: Arc<UfsFactory>,
         job_max_files: usize,
+        run_seq: Arc<AtomicCounter>,
     ) -> Self {
         Self {
             jobs,
             master_fs,
             factory,
             job_max_files,
+            run_seq,
         }
     }
 
@@ -66,20 +90,77 @@ impl LoadJobRunner {
         }
     }
 
-    async fn check_job_exists(
+    fn build_job_context(
         &self,
-        job: &JobContext,
+        command: &LoadJobCommand,
+        mnt: &MountInfo,
+        cv_source_mode: CvSourceMode,
+    ) -> FsResult<(JobContext, Path, Path)> {
+        let command_source = Path::from_str(&command.source_path)?;
+        let (source_path, target_path) = match (cv_source_mode, command_source.is_cv()) {
+            (CvSourceMode::LoadUfsOnlyFromUfs, false) => {
+                let target_path = mnt.get_cv_path(&command_source)?;
+                (command_source, target_path)
+            }
+            (CvSourceMode::LoadUfsOnlyFromUfs, true) => {
+                let status = self.master_fs.file_status(command_source.path())?;
+                if !status.storage_policy.ufs_only() {
+                    return err_box!(
+                        "load job for CV path {} requires UFS-only metadata",
+                        command_source.full_path()
+                    );
+                }
+                (mnt.get_ufs_path(&command_source)?, command_source)
+            }
+            (CvSourceMode::ExportCurvineToUfs, true) => {
+                let target_path = mnt.get_ufs_path(&command_source)?;
+                (command_source, target_path)
+            }
+            (CvSourceMode::ExportCurvineToUfs, false) => {
+                return err_box!(
+                    "export job source path {} must be a CV path",
+                    command_source.full_path()
+                );
+            }
+        };
+        let job_id = CommonUtils::create_job_id(source_path.full_path());
+        let run_id = self.next_run_id();
+        let job_context = JobContext::with_conf(
+            command,
+            job_id,
+            source_path.clone_uri(),
+            target_path.clone_uri(),
+            mnt,
+            &ClientConf::default(),
+            run_id,
+        );
+
+        Ok((job_context, source_path, target_path))
+    }
+
+    fn next_run_id(&self) -> u64 {
+        LocalTime::mills()
+            .saturating_mul(Self::RUN_ID_SEQ_MOD)
+            .saturating_add(self.run_seq.next() % Self::RUN_ID_SEQ_MOD)
+    }
+
+    fn running_job_result(&self, job_id: &str) -> Option<LoadJobResult> {
+        self.jobs.get(job_id).and_then(|exist_job| {
+            let state: JobTaskState = exist_job.state.state();
+            if state.is_running() {
+                Some(LoadJobResult::with_state(&exist_job.info, state))
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn check_already_loaded(
+        &self,
         mnt: &MountValue,
         source_path: &Path,
         target_path: &Path,
-    ) -> FsResult<Option<LoadJobResult>> {
-        if let Some(exist_job) = self.jobs.get(&job.info.job_id) {
-            let state: JobTaskState = exist_job.state.state();
-            if state.is_running() {
-                return Ok(Some(LoadJobResult::with_state(&exist_job.info, state)));
-            }
-        }
-
+    ) -> FsResult<bool> {
         // Data-state fast-path. Applies whether the slot was vacant or held
         // a terminal ctx — e.g. after JobCleanupTask, after master restart +
         // journal replay, or after an earlier run completed the sync.
@@ -87,31 +168,74 @@ impl LoadJobRunner {
         // Only UFS→CV imports can be fast-skipped here; CV sources always
         // need an explicit export task.
         if source_path.is_cv() {
-            return Ok(None);
+            return Ok(false);
         }
 
         // Target not present in Curvine yet — must load.
         let cv_status = match self.master_fs.file_status(target_path.path()) {
             Ok(cv_status) => cv_status,
-            Err(FsError::FileNotFound(_)) => return Ok(None),
+            Err(FsError::FileNotFound(_)) => return Ok(false),
             Err(err) => return Err(err),
         };
 
         // Cached target exists but its own metadata says it isn't usable — must reload.
         if !cv_status.cv_valid(None) {
-            return Ok(None);
+            return Ok(false);
         }
 
         // Target looks valid locally; confirm against UFS source before skipping.
         let source_status = mnt.ufs.get_status(source_path).await?;
-        if cv_status.cv_valid(Some(&source_status)) {
-            Ok(Some(LoadJobResult::with_state(
-                &job.info,
-                JobTaskState::Completed,
-            )))
-        } else {
-            Ok(None)
+        Ok(cv_status.cv_valid(Some(&source_status)))
+    }
+
+    pub(crate) fn enqueue_load_job(
+        &self,
+        command: LoadJobCommand,
+        mnt: MountInfo,
+    ) -> FsResult<(LoadJobResult, Option<QueuedLoadJob>)> {
+        let (job_context, source_path, target_path) =
+            self.build_job_context(&command, &mnt, CvSourceMode::LoadUfsOnlyFromUfs)?;
+        let job_id = job_context.info.job_id.clone();
+        let run_id = job_context.run_id;
+
+        match self.jobs.entry(job_id.clone()) {
+            Entry::Occupied(mut e) => {
+                let state: JobTaskState = e.get().state.state();
+                if state.is_running() {
+                    let existing = e.get();
+                    debug!(
+                        "job {} already running during enqueue (state={:?})",
+                        job_id, state
+                    );
+                    return Ok((LoadJobResult::with_state(&existing.info, state), None));
+                }
+                info!(
+                    "job {} previous run in terminal state {:?}, replacing",
+                    job_id, state
+                );
+                e.insert(job_context);
+            }
+
+            Entry::Vacant(e) => {
+                e.insert(job_context);
+            }
         }
+
+        debug!(
+            "queued load job {}: {} -> {}",
+            job_id,
+            source_path.full_path(),
+            target_path.full_path()
+        );
+
+        let job = match self.jobs.get(&job_id) {
+            Some(job) => job,
+            None => return err_box!("queued job {} missing after insert", job_id),
+        };
+        Ok((
+            LoadJobResult::with_job(&job.info),
+            Some(QueuedLoadJob { job_id, run_id }),
+        ))
     }
 
     /// Submits a load job for the given source path (and mount).
@@ -128,45 +252,89 @@ impl LoadJobRunner {
         command: LoadJobCommand,
         mnt: MountInfo,
     ) -> FsResult<LoadJobResult> {
-        let source_path = Path::from_str(&command.source_path)?;
-        let target_path = mnt.toggle_path(&source_path)?;
+        self.submit_direct_task(command, mnt, CvSourceMode::LoadUfsOnlyFromUfs, "load")
+            .await
+    }
 
-        let job_id = CommonUtils::create_job_id(source_path.full_path());
-        let mut job_context = JobContext::with_conf(
-            &command,
-            job_id.clone(),
-            source_path.clone_uri(),
-            target_path.clone_uri(),
-            &mnt,
-            &ClientConf::default(),
-        );
+    /// Submits a durable export job used by fs_mode journal replay.
+    ///
+    /// CV source paths stay CV sources here. This preserves the journal contract:
+    /// committed Curvine data is copied back to the mounted UFS.
+    pub async fn submit_export_task(
+        &self,
+        command: LoadJobCommand,
+        mnt: MountInfo,
+    ) -> FsResult<LoadJobResult> {
+        self.submit_direct_task(command, mnt, CvSourceMode::ExportCurvineToUfs, "export")
+            .await
+    }
 
-        let mnt_value = self.factory.get_mnt(&mnt)?;
-        if let Some(res) = self
-            .check_job_exists(&job_context, &mnt_value, &source_path, &target_path)
-            .await?
-        {
-            info!(
-                "skip load job {}: source_path {} already loaded or in progress",
-                job_id,
-                source_path.full_path()
-            );
+    async fn submit_direct_task(
+        &self,
+        command: LoadJobCommand,
+        mnt: MountInfo,
+        cv_source_mode: CvSourceMode,
+        job_kind: &str,
+    ) -> FsResult<LoadJobResult> {
+        let (mut job_context, source_path, target_path) =
+            self.build_job_context(&command, &mnt, cv_source_mode)?;
+        let job_id = job_context.info.job_id.clone();
+        let run_id = job_context.run_id;
+
+        if let Some(res) = self.running_job_result(&job_id) {
             return Ok(res);
         }
 
+        let mnt_value = self.factory.get_mnt(&mnt)?;
+        if self
+            .check_already_loaded(&mnt_value, &source_path, &target_path)
+            .await?
+        {
+            info!(
+                "skip {} job {}: source_path {} already loaded or in progress",
+                job_kind,
+                job_id,
+                source_path.full_path()
+            );
+            return Ok(LoadJobResult::with_state(
+                &job_context.info,
+                JobTaskState::Completed,
+            ));
+        }
+
         debug!(
-            "submitting load job {}: {} -> {}",
+            "submitting {} job {}: {} -> {}",
+            job_kind,
             job_id,
             source_path.full_path(),
             target_path.full_path()
         );
 
-        let total_size = self
-            .create_all_tasks(&mut job_context, &source_path, &mnt)
+        let planned = self
+            .create_all_tasks(&job_context.info, &source_path, &mnt, run_id)
             .await?;
+        let total_size = planned.total_size;
+        if planned.tasks.is_empty() {
+            info!(
+                "{} job {} has no tasks: {} -> {}",
+                job_kind,
+                job_id,
+                source_path.full_path(),
+                target_path.full_path()
+            );
+            return Ok(LoadJobResult::with_state(
+                &job_context.info,
+                JobTaskState::Completed,
+            ));
+        }
+        let tasks = planned.tasks.clone();
+        for (task_id, detail) in planned.tasks.take() {
+            job_context.add_task_detail(task_id, detail);
+        }
 
         info!(
-            "load job {} submitted: {} -> {}, tasks {}, total_size {}",
+            "{} job {} submitted: {} -> {}, tasks {}, total_size {}",
+            job_kind,
             job_id,
             source_path.full_path(),
             target_path.full_path(),
@@ -174,13 +342,12 @@ impl LoadJobRunner {
             ByteUnit::byte_to_string(total_size as u64)
         );
 
-        let tasks = job_context.tasks.clone();
         let res = LoadJobResult::with_job(&job_context.info);
 
         // Install / replace the ctx into the store atomically. We branch into:
         //   - Vacant: first submitter, install and dispatch.
         //   - Occupied + running: another submitter won the race; return that job’s
-        //     state (this request’s command is not applied—see `submit_load_task` doc).
+        //     state (this request's command options are not applied).
         //   - Occupied + terminal: previous run finished/failed/canceled and
         //     hasn't been cleaned up yet. Replace with the new ctx and dispatch.
         match self.jobs.entry(job_id.clone()) {
@@ -207,17 +374,190 @@ impl LoadJobRunner {
         }
 
         if let Err(err) = self.submit_all_task(tasks).await {
-            warn!("dispatch load job {} failed: {}", job_id, err);
+            warn!("dispatch {} job {} failed: {}", job_kind, job_id, err);
             // @todo Cancel sub-tasks that may have already been dispatched.
-            self.jobs.update_state(
+            if let Err(update_err) = self.jobs.update_state(
                 &job_id,
                 JobTaskState::Failed,
                 format!("dispatch failed: {}", err),
-            );
+            ) {
+                error!(
+                    "failed to mark {} job {} as failed after dispatch error: {}",
+                    job_kind, job_id, update_err
+                );
+            }
             return Err(err);
         }
 
         Ok(res)
+    }
+
+    pub(crate) async fn run_queued_load_job(&self, queued: QueuedLoadJob) -> FsResult<()> {
+        let job_info = match self.current_job_info(&queued) {
+            Some(job_info) => job_info,
+            None => return Ok(()),
+        };
+
+        let source_path = Path::from_str(&job_info.source_path)?;
+        let target_path = Path::from_str(&job_info.target_path)?;
+        let mnt = job_info.mount_info.clone();
+        let mnt_value = match self.factory.get_mnt(&mnt) {
+            Ok(mnt_value) => mnt_value,
+            Err(err) => {
+                self.jobs.update_state_if_run(
+                    &queued.job_id,
+                    queued.run_id,
+                    JobTaskState::Failed,
+                    format!("prepare UFS failed: {}", err),
+                );
+                return Err(err);
+            }
+        };
+
+        let already_loaded = match self
+            .check_already_loaded(&mnt_value, &source_path, &target_path)
+            .await
+        {
+            Ok(already_loaded) => already_loaded,
+            Err(err) => {
+                self.jobs.update_state_if_run(
+                    &queued.job_id,
+                    queued.run_id,
+                    JobTaskState::Failed,
+                    format!("check cached file failed: {}", err),
+                );
+                return Err(err);
+            }
+        };
+        if already_loaded {
+            info!(
+                "queued load job {} already loaded: {} -> {}",
+                queued.job_id,
+                source_path.full_path(),
+                target_path.full_path()
+            );
+            self.jobs.update_state_if_run(
+                &queued.job_id,
+                queued.run_id,
+                JobTaskState::Completed,
+                "Already loaded",
+            );
+            return Ok(());
+        }
+
+        let planned = match self
+            .create_all_tasks(&job_info, &source_path, &mnt, queued.run_id)
+            .await
+        {
+            Ok(planned) => planned,
+            Err(err) => {
+                self.jobs.update_state_if_run(
+                    &queued.job_id,
+                    queued.run_id,
+                    JobTaskState::Failed,
+                    format!("plan load job failed: {}", err),
+                );
+                return Err(err);
+            }
+        };
+        let total_size = planned.total_size;
+        let task_count = planned.tasks.len();
+        if task_count == 0 {
+            info!(
+                "queued load job {} has no tasks: {} -> {}",
+                queued.job_id,
+                source_path.full_path(),
+                target_path.full_path()
+            );
+            self.jobs.update_state_if_run(
+                &queued.job_id,
+                queued.run_id,
+                JobTaskState::Completed,
+                "No load tasks to dispatch",
+            );
+            return Ok(());
+        }
+        let tasks = planned.tasks.clone();
+        let assigned_workers = Self::assigned_workers(&tasks);
+
+        if !self.install_plan_if_current(&queued, planned) {
+            debug!(
+                "skip dispatch for stale queued load job {} run {}",
+                queued.job_id, queued.run_id
+            );
+            return Ok(());
+        }
+
+        info!(
+            "queued load job {} planned: {} -> {}, tasks {}, total_size {}",
+            queued.job_id,
+            source_path.full_path(),
+            target_path.full_path(),
+            task_count,
+            ByteUnit::byte_to_string(total_size as u64)
+        );
+
+        if !self.is_current_running(&queued) {
+            return Ok(());
+        }
+
+        if let Err(err) = self.submit_all_task(tasks).await {
+            warn!("dispatch load job {} failed: {}", queued.job_id, err);
+            let failed_current_run = self.jobs.update_state_if_run(
+                &queued.job_id,
+                queued.run_id,
+                JobTaskState::Failed,
+                format!("dispatch failed: {}", err),
+            );
+            if failed_current_run {
+                self.cancel_workers_best_effort(&queued.job_id, &assigned_workers)
+                    .await;
+            }
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn assigned_workers(tasks: &FastHashMap<String, TaskDetail>) -> FastHashSet<WorkerAddress> {
+        let mut workers = FastHashSet::default();
+        for detail in tasks.values() {
+            workers.insert(detail.task.worker.clone());
+        }
+        workers
+    }
+
+    fn current_job_info(&self, queued: &QueuedLoadJob) -> Option<LoadJobInfo> {
+        self.jobs.get(&queued.job_id).and_then(|job| {
+            let state: JobTaskState = job.state.state();
+            if job.run_id == queued.run_id && state.is_running() {
+                Some(job.info.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn is_current_running(&self, queued: &QueuedLoadJob) -> bool {
+        self.current_job_info(queued).is_some()
+    }
+
+    fn install_plan_if_current(&self, queued: &QueuedLoadJob, planned: PlannedLoadJob) -> bool {
+        let mut job = match self.jobs.get_mut(&queued.job_id) {
+            Some(job) => job,
+            None => return false,
+        };
+
+        let state: JobTaskState = job.state.state();
+        if job.run_id != queued.run_id || !state.is_running() {
+            return false;
+        }
+
+        for (task_id, detail) in planned.tasks.take() {
+            job.add_task_detail(task_id, detail);
+        }
+
+        true
     }
 
     async fn submit_all_task(&self, tasks: FastHashMap<String, TaskDetail>) -> FsResult<()> {
@@ -239,10 +579,11 @@ impl LoadJobRunner {
 
     async fn create_all_tasks(
         &self,
-        job: &mut JobContext,
+        job: &LoadJobInfo,
         source_path: &Path,
         mnt: &MountInfo,
-    ) -> FsResult<i64> {
+        run_id: u64,
+    ) -> FsResult<PlannedLoadJob> {
         let source_status = if source_path.is_cv() {
             self.master_fs.file_status(source_path.path())?
         } else {
@@ -250,16 +591,16 @@ impl LoadJobRunner {
             ufs.get_status(source_path).await?
         };
 
-        job.update_state(JobTaskState::Pending, "Assigning workers");
-        let block_size = job.info.block_size;
+        let block_size = job.block_size;
 
         let mut total_size = 0;
+        let mut tasks = FastHashMap::new();
         let mut stack = LinkedList::new();
         let mut task_index = 0;
         stack.push_back(source_status);
 
         // Get target base path for direction detection
-        let target_base = Path::from_str(&job.info.target_path)?;
+        let target_base = Path::from_str(&job.target_path)?;
 
         while let Some(status) = stack.pop_front() {
             if status.is_dir {
@@ -298,26 +639,22 @@ impl LoadJobRunner {
                     );
                 };
 
-                let task_id = format!("{}_task_{}", job.info.job_id, task_index);
+                let task_id = format!("{}_run_{}_task_{}", job.job_id, run_id, task_index);
                 task_index += 1;
                 total_size += status.len;
 
                 let task = LoadTaskInfo {
-                    job: job.info.clone(),
+                    job: job.clone(),
                     task_id: task_id.clone(),
                     worker: worker.clone(),
                     source_path: source_path.clone_uri(),
                     target_path: target_path.clone_uri(),
                     create_time: LocalTime::mills() as i64,
                 };
-                job.add_task(task.clone());
+                tasks.insert(task_id.clone(), TaskDetail::new(task));
 
-                if job.tasks.len() > self.job_max_files {
-                    return err_box!(
-                        "Job {} files exceeds {}",
-                        job.info.job_id,
-                        self.job_max_files
-                    );
+                if tasks.len() > self.job_max_files {
+                    return err_box!("Job {} files exceeds {}", job.job_id, self.job_max_files);
                 }
                 debug!(
                     "created sub-task {} ({} -> {})",
@@ -328,7 +665,7 @@ impl LoadJobRunner {
             }
         }
 
-        Ok(total_size)
+        Ok(PlannedLoadJob { tasks, total_size })
     }
 
     pub async fn cancel_job(
@@ -343,14 +680,45 @@ impl LoadJobRunner {
 
             if let Err(e) = res {
                 error!("failed to send cancel request to worker {}: {}", worker, e);
-                self.jobs.update_state(
+                if let Err(update_err) = self.jobs.update_state(
                     job_id,
                     JobTaskState::Canceled,
                     format!("failed to send cancel request to worker {}: {}", worker, e),
-                );
+                ) {
+                    error!(
+                        "failed to mark load job {} as canceled after worker cancel error: {}",
+                        job_id, update_err
+                    );
+                }
             }
         }
 
         Ok(())
+    }
+
+    async fn cancel_workers_best_effort(
+        &self,
+        job_id: &str,
+        assigned_workers: &FastHashSet<WorkerAddress>,
+    ) {
+        for worker in assigned_workers.iter() {
+            let client = match self.factory.get_worker_client(worker).await {
+                Ok(client) => client,
+                Err(err) => {
+                    error!(
+                        "failed to create cancel client for worker {}: {}",
+                        worker, err
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(err) = client.cancel_job(job_id).await {
+                error!(
+                    "failed to send cancel request to worker {}: {}",
+                    worker, err
+                );
+            }
+        }
     }
 }

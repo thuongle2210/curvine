@@ -66,6 +66,14 @@ pub struct MasterMetrics {
 
     pub(crate) ttl_bucket_len: Gauge,
     pub(crate) ttl_total_inodes: Gauge,
+    pub(crate) ttl_skipped_inodes: Counter,
+
+    // fs_dir global lock health. The metadata lock cannot be sharded yet, so a
+    // stalled or wedged lock freezes the whole control plane. These give the
+    // stall an observable signal instead of a silent multi-minute freeze.
+    pub(crate) fs_dir_stalled: Gauge,
+    pub(crate) fs_dir_stall_total: Counter,
+    pub(crate) fs_dir_probe_acquire_us: Gauge,
 }
 
 impl MasterMetrics {
@@ -156,6 +164,22 @@ impl MasterMetrics {
             )?,
             ttl_bucket_len: m::new_gauge("ttl_bucket_len", "Number of TTL buckets")?,
             ttl_total_inodes: m::new_gauge("ttl_total_inodes", "Total number of inodes")?,
+            ttl_skipped_inodes: m::new_counter(
+                "ttl_skipped_inodes",
+                "Total number of inodes skipped while updating TTL buckets",
+            )?,
+            fs_dir_stalled: m::new_gauge(
+                "fs_dir_stalled",
+                "1 when the fs_dir metadata lock has been unacquirable beyond the stall threshold",
+            )?,
+            fs_dir_stall_total: m::new_counter(
+                "fs_dir_stall_total",
+                "Total number of fs_dir metadata lock stall episodes detected",
+            )?,
+            fs_dir_probe_acquire_us: m::new_gauge(
+                "fs_dir_probe_acquire_us",
+                "Latency in microseconds of the last fs_dir watchdog read-lock probe",
+            )?,
         };
 
         Ok(wm)

@@ -38,12 +38,12 @@ fn main() -> CommonResult<()> {
         ServiceType::Master => {
             conf.check_master_hostname()?;
             let master = Master::with_conf(conf)?;
-            master.block_on_start();
+            master.block_on_start()?;
         }
 
         ServiceType::Worker => {
             let worker = Worker::with_conf(conf)?;
-            worker.block_on_start();
+            worker.block_on_start()?;
         }
     }
 

@@ -67,6 +67,7 @@ fn stress_add_block_vs_block_report_no_hang() {
         for i in 0..loops {
             let res = fs_a.add_block(
                 "/deadlock/file.log",
+                None,
                 client.clone(),
                 vec![],
                 vec![],
@@ -107,7 +108,7 @@ fn stress_add_block_vs_block_report_no_hang() {
                 )],
             };
 
-            let res = fs_b.block_report(report);
+            let res = fs_b.block_report(report, None);
             if res.is_ok() {
                 ok += 1;
             } else {
@@ -167,6 +168,7 @@ fn sanity_single_thread_paths_progress() {
     for i in 0..500 {
         let _ = fs.add_block(
             "/deadlock/file.log",
+            None,
             client.clone(),
             vec![],
             vec![],
@@ -185,6 +187,6 @@ fn sanity_single_thread_paths_progress() {
                 0,
             )],
         };
-        let _ = fs.block_report(report);
+        let _ = fs.block_report(report, None);
     }
 }

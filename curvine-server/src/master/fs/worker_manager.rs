@@ -36,16 +36,16 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
-    pub fn new(conf: &ClusterConf) -> Self {
-        let worker_policy = WorkerPolicyAdapter::from_conf(conf).unwrap();
+    pub fn new(conf: &ClusterConf) -> FsResult<Self> {
+        let worker_policy = WorkerPolicyAdapter::from_conf(conf)?;
 
-        Self {
+        Ok(Self {
             worker_map: WorkerMap::new(),
             block_map: BlockMap::new(),
             worker_policy,
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
-        }
+        })
     }
 
     pub fn heartbeat(
@@ -135,12 +135,12 @@ impl WorkerManager {
 
     pub fn add_blacklist_worker(&mut self, id: u32) -> Option<WorkerInfo> {
         match self.worker_map.workers.get_mut(&id) {
-            Some(v) => {
+            Some(v) if v.status != WorkerStatus::Blacklist => {
                 v.status = WorkerStatus::Blacklist;
                 Some(v.clone())
             }
 
-            None => None,
+            _ => None,
         }
     }
 
@@ -264,12 +264,5 @@ impl Display for WorkerManager {
         }
 
         write!(f, "{}", str)
-    }
-}
-
-impl Default for WorkerManager {
-    fn default() -> Self {
-        let conf = ClusterConf::default();
-        Self::new(&conf)
     }
 }
