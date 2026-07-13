@@ -161,6 +161,9 @@ pub struct SpdkPoller {
     /// Orphaned QpairState entries keyed by qpair address.
     /// Kept alive for late SPDK callbacks during free_io_qpair.
     orphaned: Arc<Mutex<HashMap<usize, Box<QpairState>>>>,
+    /// Fast-fail gate for submit_one: true if any qpair has been orphaned.
+    /// Reset to false when the orphaned map drains empty.
+    has_orphaned: Arc<AtomicBool>,
 }
 
 impl SpdkPoller {
@@ -180,6 +183,8 @@ impl SpdkPoller {
 
         let orphaned = Arc::new(Mutex::new(HashMap::new()));
         let orphaned_clone = orphaned.clone();
+        let has_orphaned = Arc::new(AtomicBool::new(false));
+        let has_orphaned_clone = has_orphaned.clone();
 
         let handle = std::thread::Builder::new()
             .name("spdk-poller".to_string())
@@ -191,6 +196,7 @@ impl SpdkPoller {
                     eventfd_raw,
                     config,
                     orphaned_clone,
+                    has_orphaned_clone,
                 );
             })
             .expect("Failed to spawn SPDK poller thread");
@@ -202,6 +208,7 @@ impl SpdkPoller {
             handle: Some(handle),
             is_sleeping,
             orphaned,
+            has_orphaned,
         }
     }
 
@@ -275,12 +282,12 @@ impl SpdkPoller {
         eventfd: RawFd,
         mut config: PollerConfig,
         orphaned: Arc<Mutex<HashMap<usize, Box<QpairState>>>>,
+        has_orphaned: Arc<AtomicBool>,
     ) {
         let active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
-        let has_orphaned = AtomicBool::new(false);
 
         // Verify curvine_async_ctx buffer fits the C struct.
         debug_assert!(
@@ -701,6 +708,9 @@ impl SpdkPoller {
                         drop(Box::from_raw(ptr));
                     }
                 }
+                if guard.is_empty() {
+                    self.has_orphaned.store(false, Ordering::Release);
+                }
                 return true;
             }
         }
@@ -724,6 +734,7 @@ impl SpdkPoller {
                     }
                 }
             }
+            self.has_orphaned.store(false, Ordering::Release);
         }
     }
 
@@ -774,7 +785,6 @@ impl SpdkPoller {
             }
         }
         has_orphaned.store(true, Ordering::Release);
-        // TODO: reset has_orphaned when orphaned map drains empty (in reclaim_stale)
         error!(
             "{} qpair(s) failed, removed from active set",
             err_keys.len()
@@ -798,7 +808,6 @@ unsafe impl Send for QpairState {}
 
 impl QpairState {
     #[cfg(test)]
-    // TODO: when this becomes production (deferred cleanup PR), reset has_orphaned after draining empty
     fn reclaim_stale(&mut self) {
         for ptr in self.stale.drain(..) {
             unsafe { drop(Box::from_raw(ptr as *mut CallbackCtx)) };

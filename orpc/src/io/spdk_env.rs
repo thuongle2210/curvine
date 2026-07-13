@@ -736,6 +736,8 @@ impl SpdkEnv {
             poller.stop();
             // Resolve deferred before drain_all — free_io_qpair fires late callbacks.
             self.resolve_deferred_qpairs_with(&poller);
+            // Reclaim any remaining orphaned entries
+            poller.reclaim_stale();
             info!("SPDK poller thread stopped");
         }
 
@@ -891,30 +893,23 @@ impl SpdkEnv {
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
-        // Opportunistically resolve any deferred qpairs.
-        self.resolve_deferred_qpairs();
+        // Single lock acquisition for all poller operations — eliminates the race
+        // window where shutdown could take the poller between check and reclaim.
+        let poller_guard = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+        let poller = poller_guard.as_ref();
 
-        // Check if this qpair has orphaned entries (dead/error path).
-        let has_orphaned = self
-            .poller
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .map(|p| p.has_orphaned_for_qpair(qpair))
-            .unwrap_or(false);
-        if has_orphaned {
-            unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
-            // Late SPDK callbacks have fired inside free_io_qpair.
-            // Reclaim the orphaned entries.
-            if let Some(poller) = self
-                .poller
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .as_ref()
-            {
+        // Opportunistically resolve any deferred qpairs.
+        if let Some(poller) = poller {
+            self.resolve_deferred_qpairs_with(poller);
+        }
+
+        // Check + reclaim under the same lock.
+        if let Some(poller) = poller {
+            if poller.has_orphaned_for_qpair(qpair) {
+                unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
                 poller.reclaim_orphaned_for_qpair(qpair);
+                return;
             }
-            return;
         }
 
         // Don't release to pool if qpair is in deferred_qpairs (unregister timed out).
