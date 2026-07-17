@@ -208,6 +208,39 @@ impl IoUringEnv {
         opcode::Fsync::new(Fixed(index)).build().user_data(user_data)
     }
 
+    // --- Splice operations (Phase 4) ---
+
+    /// Prepare a SPLICE SQE (kernel 5.7+). Splices data between two file descriptors,
+    /// at least one of which must be a pipe.
+    ///
+    /// - `fd_in`: Source file descriptor (file or pipe)
+    /// - `off_in`: Source offset. Use `-1` if `fd_in` is a pipe.
+    /// - `fd_out`: Destination file descriptor (pipe or socket)
+    /// - `off_out`: Destination offset. Use `-1` if `fd_out` is a pipe.
+    /// - `len`: Number of bytes to splice
+    /// - `flags`: Splice flags (e.g., `libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK`)
+    ///
+    /// # Splice Data Flow
+    /// ```text
+    /// File ──splice──> Pipe ──splice──> Socket
+    ///        (fd_in)         (fd_out)
+    /// ```
+    pub fn prep_splice(
+        &self,
+        fd_in: RawFd,
+        off_in: i64,
+        fd_out: RawFd,
+        off_out: i64,
+        len: u32,
+        flags: u32,
+        user_data: u64,
+    ) -> Entry {
+        opcode::Splice::new(Fd(fd_in), off_in, Fd(fd_out), off_out, len)
+            .flags(flags)
+            .build()
+            .user_data(user_data)
+    }
+
     /// Push an SQE into the submission queue.
     pub fn push(&mut self, sqe: &Entry) -> IOResult<()> {
         // SAFETY: The SQE is a Copy type. The safety of buffer pointers

@@ -15,8 +15,10 @@
 use crate::io::block_io::BlockIO;
 use crate::io::io_uring_env::IoUringEnv;
 use crate::io::{IOError, IOResult};
+use crate::sys;
 use crate::sys::DataSlice;
 use bytes::BytesMut;
+use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -271,6 +273,192 @@ impl Display for IoUringBdev {
     }
 }
 
+/// A simple pool of pipe file descriptors for io_uring splice operations.
+///
+/// Each pipe has `[read_fd, write_fd]`. The pool manages creation and recycling.
+/// Pipes are kept open (never closed) to avoid the overhead of repeated
+/// `pipe2()` syscalls, matching the design of Curvine's `PipePool`.
+struct IoUringPipePool {
+    pipes: VecDeque<[RawFd; 2]>,
+    max_size: usize,
+    pipe_buf_size: usize,
+}
+
+impl IoUringPipePool {
+    fn new(max_size: usize, pipe_buf_size: usize) -> Self {
+        Self {
+            pipes: VecDeque::with_capacity(max_size),
+            max_size,
+            pipe_buf_size,
+        }
+    }
+
+    fn acquire(&mut self) -> IOResult<[RawFd; 2]> {
+        if let Some(pipe) = self.pipes.pop_front() {
+            return Ok(pipe);
+        }
+        let fds = sys::pipe2(self.pipe_buf_size)?;
+        Ok(fds)
+    }
+
+    fn release(&mut self, pipe: [RawFd; 2]) {
+        if self.pipes.len() < self.max_size {
+            self.pipes.push_back(pipe);
+        } else {
+            // Pool full, close the pipe
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+        }
+    }
+}
+
+impl Drop for IoUringPipePool {
+    fn drop(&mut self) {
+        for pipe in self.pipes.drain(..) {
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+        }
+    }
+}
+
+impl IoUringBdev {
+    /// Splice data from the current file position to `fd_out` using io_uring.
+    ///
+    /// Uses `IORING_OP_SPLICE` to transfer data through an intermediate pipe:
+    /// ```text
+    /// File ──splice──> Pipe ──splice──> fd_out (socket)
+    /// ```
+    ///
+    /// This is a zero-copy operation — the kernel moves data between page cache
+    /// and the socket buffer without copying through userspace.
+    ///
+    /// # Arguments
+    /// * `fd_out` - Destination file descriptor (typically a TCP socket)
+    /// * `len` - Number of bytes to splice from current position
+    ///
+    /// # Returns
+    /// Number of bytes actually spliced.
+    pub fn splice_to(&mut self, fd_out: RawFd, len: usize) -> IOResult<usize> {
+        let mut remaining = len;
+        let mut total_spliced = 0usize;
+        let mut pipe_pool = IoUringPipePool::new(2, 128 * 1024); // 128KB pipe buffers
+        let flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32;
+
+        while remaining > 0 {
+            let pipe = pipe_pool.acquire()?;
+            let pipe_read = pipe[0];
+            let pipe_write = pipe[1];
+            let chunk = remaining.min(128 * 1024);
+
+            // Step 1: splice file -> pipe (file is at self.pos)
+            let sqe = self.env.prep_splice(
+                self.fd,
+                self.pos,
+                pipe_write,
+                -1,
+                chunk as u32,
+                flags,
+                0,
+            );
+            self.env.push(&sqe)?;
+            self.env.submit_and_wait(1)?;
+            let cqe = self.env.next_cqe().ok_or_else(|| {
+                IOError::create("No CQE for splice file->pipe")
+            })?;
+            let result = cqe.result();
+            if result < 0 {
+                pipe_pool.release(pipe);
+                return Err(IOError::create(format!(
+                    "io_uring splice file->pipe failed: {}",
+                    io::Error::from_raw_os_error(-result)
+                )));
+            }
+            if result == 0 {
+                pipe_pool.release(pipe);
+                break; // EOF
+            }
+            let spliced_in = result as usize;
+
+            // Step 2: splice pipe -> fd_out (socket)
+            let sqe = self.env.prep_splice(
+                pipe_read,
+                -1,
+                fd_out,
+                -1,
+                spliced_in as u32,
+                flags,
+                1,
+            );
+            self.env.push(&sqe)?;
+            self.env.submit_and_wait(1)?;
+            let cqe = self.env.next_cqe().ok_or_else(|| {
+                IOError::create("No CQE for splice pipe->socket")
+            })?;
+            let result = cqe.result();
+            if result < 0 {
+                pipe_pool.release(pipe);
+                return Err(IOError::create(format!(
+                    "io_uring splice pipe->socket failed: {}",
+                    io::Error::from_raw_os_error(-result)
+                )));
+            }
+            if result == 0 {
+                pipe_pool.release(pipe);
+                break; // socket closed
+            }
+            let spliced_out = result as usize;
+
+            self.pos += spliced_out as i64;
+            remaining -= spliced_out;
+            total_spliced += spliced_out;
+            pipe_pool.release(pipe);
+        }
+
+        Ok(total_spliced)
+    }
+
+    /// Splice a region of data to `fd_out` using io_uring.
+    /// This is the zero-copy equivalent of `read_region()` + write to socket.
+    ///
+    /// Instead of reading data into a userspace buffer, this splices directly
+    /// from the file's page cache through a pipe to the destination socket.
+    pub fn splice_region_to(
+        &mut self,
+        fd_out: RawFd,
+        enable_send_file: bool,
+        len: i32,
+    ) -> IOResult<DataSlice> {
+        if !enable_send_file {
+            // Fallback: read into buffer and return as DataSlice::Buffer
+            let chunk = (len as i64).min(self.len - self.pos);
+            if chunk <= 0 {
+                return Err(IOError::create(format!(
+                    "No data to read: file_len={}, pos={}",
+                    self.len, self.pos
+                )));
+            }
+            let mut buf = BytesMut::with_capacity(chunk as usize);
+            unsafe { buf.set_len(chunk as usize); }
+            self.read_all(&mut buf)?;
+            return Ok(DataSlice::Buffer(buf));
+        }
+
+        let total = self.splice_to(fd_out, len as usize)?;
+        if total == 0 {
+            return Err(IOError::create(format!(
+                "No data spliced: file_len={}, pos={}",
+                self.len, self.pos
+            )));
+        }
+        // Data already sent to socket via splice, return empty
+        Ok(DataSlice::Empty)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -395,6 +583,54 @@ mod test {
         let mut reader = IoUringBdev::with_read(path_str, 0, 0, None)?;
         assert!(reader.env.fixed_file_index().is_some());
         reader.read_all(&mut read_buf)?;
+        assert_eq!(&read_buf, data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn io_uring_splice_to_pipe() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("test_splice.bin");
+        let path_str = path.to_str().unwrap();
+        let data = b"Splice zero-copy transfer test data through io_uring";
+
+        // Write test data
+        let mut writer = IoUringBdev::with_write_offset(path_str, true, 0, 0, None)?;
+        writer.write_all(data)?;
+        writer.flush()?;
+        drop(writer);
+
+        // Create a pipe as the destination
+        let pipe_fds = sys::pipe2(data.len())?;
+        let pipe_read = pipe_fds[0];
+        let pipe_write = pipe_fds[1];
+
+        // Splice from file to pipe using io_uring
+        let mut reader = IoUringBdev::with_read(path_str, 0, 0, None)?;
+        let spliced = reader.splice_to(pipe_write, data.len())?;
+        assert_eq!(spliced, data.len());
+
+        // Close write end so read can EOF
+        unsafe { libc::close(pipe_write); }
+
+        // Read from pipe and verify
+        let mut read_buf = vec![0u8; data.len()];
+        let mut total_read = 0usize;
+        while total_read < data.len() {
+            let n = unsafe {
+                libc::read(
+                    pipe_read,
+                    read_buf[total_read..].as_mut_ptr() as *mut libc::c_void,
+                    data.len() - total_read,
+                )
+            };
+            if n <= 0 { break; }
+            total_read += n as usize;
+        }
+        unsafe { libc::close(pipe_read); }
+
+        assert_eq!(total_read, data.len());
         assert_eq!(&read_buf, data);
 
         Ok(())
