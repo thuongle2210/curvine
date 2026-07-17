@@ -70,7 +70,8 @@ impl BlockReaderLocal {
         let path = try_option!(read_context.path);
         #[cfg(feature = "io-uring")]
         let device = if fs_context.conf.client.enable_io_uring {
-            BlockDevice::IoUring(IoUringBdev::with_read(path, off as u64)?)
+            let sqpoll_ms = fs_context.conf.client.io_uring_sqpoll_idle_ms;
+            BlockDevice::IoUring(IoUringBdev::with_read(path, off as u64, sqpoll_ms, None)?)
         } else {
             BlockDevice::Local(LocalFile::with_read(path, off as u64)?)
         };

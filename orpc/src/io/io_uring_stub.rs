@@ -22,7 +22,7 @@ use crate::sys::DataSlice;
 pub struct IoUringBdev;
 
 impl IoUringBdev {
-    pub fn new(_path: impl AsRef<str>, _is_write: bool) -> IOResult<Self> {
+    pub fn new(_path: impl AsRef<str>, _is_write: bool, _sqpoll_idle_ms: u32, _sqpoll_cpu: Option<u32>) -> IOResult<Self> {
         Err(IOError::create("io_uring not available (feature disabled or unsupported kernel)"))
     }
 
@@ -30,11 +30,13 @@ impl IoUringBdev {
         _path: impl AsRef<str>,
         _truncate: bool,
         _offset: i64,
+        _sqpoll_idle_ms: u32,
+        _sqpoll_cpu: Option<u32>,
     ) -> IOResult<Self> {
         Err(IOError::create("io_uring not available (feature disabled or unsupported kernel)"))
     }
 
-    pub fn with_read(_path: impl AsRef<str>, _offset: u64) -> IOResult<Self> {
+    pub fn with_read(_path: impl AsRef<str>, _offset: u64, _sqpoll_idle_ms: u32, _sqpoll_cpu: Option<u32>) -> IOResult<Self> {
         Err(IOError::create("io_uring not available (feature disabled or unsupported kernel)"))
     }
 }

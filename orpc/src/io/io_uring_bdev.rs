@@ -50,7 +50,10 @@ unsafe impl Send for IoUringBdev {}
 
 impl IoUringBdev {
     /// Open a file for io_uring I/O.
-    pub fn new(path: impl AsRef<str>, is_write: bool) -> IOResult<Self> {
+    ///
+    /// - `sqpoll_idle_ms`: SQPOLL idle timeout in ms. 0 = standard io_uring.
+    /// - `sqpoll_cpu`: Optional CPU core to pin the SQPOLL kernel thread to.
+    pub fn new(path: impl AsRef<str>, is_write: bool, sqpoll_idle_ms: u32, sqpoll_cpu: Option<u32>) -> IOResult<Self> {
         let path_str = path.as_ref().to_string();
         let file = if is_write {
             OpenOptions::new()
@@ -64,7 +67,12 @@ impl IoUringBdev {
 
         let fd = file.as_raw_fd();
         let len = file.metadata().map(|m| m.len() as i64).unwrap_or(0);
-        let env = IoUringEnv::new(8)?;
+        let queue_depth = 8;
+        let env = if sqpoll_idle_ms > 0 {
+            IoUringEnv::new_with_sqpoll(queue_depth, sqpoll_idle_ms, sqpoll_cpu)?
+        } else {
+            IoUringEnv::new(queue_depth)?
+        };
 
         Ok(Self {
             env,
@@ -81,8 +89,10 @@ impl IoUringBdev {
         path: impl AsRef<str>,
         _truncate: bool,
         offset: i64,
+        sqpoll_idle_ms: u32,
+        sqpoll_cpu: Option<u32>,
     ) -> IOResult<Self> {
-        let mut bdev = Self::new(path, true)?;
+        let mut bdev = Self::new(path, true, sqpoll_idle_ms, sqpoll_cpu)?;
         if offset > 0 {
             bdev.seek(offset)?;
         }
@@ -90,8 +100,8 @@ impl IoUringBdev {
     }
 
     /// Open a file for reading at the given offset.
-    pub fn with_read(path: impl AsRef<str>, offset: u64) -> IOResult<Self> {
-        let mut bdev = Self::new(path, false)?;
+    pub fn with_read(path: impl AsRef<str>, offset: u64, sqpoll_idle_ms: u32, sqpoll_cpu: Option<u32>) -> IOResult<Self> {
+        let mut bdev = Self::new(path, false, sqpoll_idle_ms, sqpoll_cpu)?;
         if offset > 0 {
             bdev.seek(offset as i64)?;
         }
@@ -270,7 +280,7 @@ mod test {
         let mut read_buf = vec![0u8; data.len()];
 
         // Write
-        let mut writer = IoUringBdev::with_write_offset(path_str, true, 0)?;
+        let mut writer = IoUringBdev::with_write_offset(path_str, true, 0, 0, None)?;
         assert_eq!(writer.pos(), 0);
         writer.write_all(data)?;
         writer.flush()?;
@@ -278,7 +288,7 @@ mod test {
         drop(writer);
 
         // Read
-        let mut reader = IoUringBdev::with_read(path_str, 0)?;
+        let mut reader = IoUringBdev::with_read(path_str, 0, 0, None)?;
         assert_eq!(reader.len(), data.len() as i64);
         reader.read_all(&mut read_buf)?;
         assert_eq!(&read_buf, data);
@@ -294,7 +304,7 @@ mod test {
         let path_str = path.to_str().unwrap();
         let data = b"0123456789ABCDEF";
 
-        let mut writer = IoUringBdev::with_write_offset(path_str, true, 0)?;
+        let mut writer = IoUringBdev::with_write_offset(path_str, true, 0, 0, None)?;
         writer.write_all(data)?;
         writer.flush()?;
 
@@ -306,7 +316,7 @@ mod test {
         writer.flush()?;
 
         // Read back and verify
-        let mut reader = IoUringBdev::with_read(path_str, 0)?;
+        let mut reader = IoUringBdev::with_read(path_str, 0, 0, None)?;
         let mut full = vec![0u8; data.len()];
         reader.read_all(&mut full)?;
         assert_eq!(&full[0..8], b"01234567");
@@ -322,16 +332,40 @@ mod test {
         let path = dir.path().join("test_region.bin");
         let path_str = path.to_str().unwrap();
 
-        let mut writer = IoUringBdev::with_write_offset(path_str, true, 0)?;
+        let mut writer = IoUringBdev::with_write_offset(path_str, true, 0, 0, None)?;
         let data = b"region data";
         let region = DataSlice::Buffer(BytesMut::from(data.as_slice()));
         writer.write_region(&region)?;
         writer.flush()?;
 
-        let mut reader = IoUringBdev::with_read(path_str, 0)?;
+        let mut reader = IoUringBdev::with_read(path_str, 0, 0, None)?;
         let region_out = reader.read_region(false, data.len() as i32)?;
         assert_eq!(region_out.len(), data.len());
         assert_eq!(&region_out.as_slice()[..], data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn io_uring_sqpoll_write_read_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("test_sqpoll.bin");
+        let path_str = path.to_str().unwrap();
+        let data = b"SQPOLL mode write+read roundtrip test";
+        let mut read_buf = vec![0u8; data.len()];
+
+        // Write with SQPOLL (100ms idle, auto CPU)
+        let mut writer = IoUringBdev::with_write_offset(path_str, true, 0, 100, None)?;
+        assert!(writer.env.sqpoll_enabled());
+        writer.write_all(data)?;
+        writer.flush()?;
+        drop(writer);
+
+        // Read with SQPOLL
+        let mut reader = IoUringBdev::with_read(path_str, 0, 100, None)?;
+        assert!(reader.env.sqpoll_enabled());
+        reader.read_all(&mut read_buf)?;
+        assert_eq!(&read_buf, data);
 
         Ok(())
     }

@@ -164,6 +164,13 @@ pub struct WorkerConf {
     pub enable_io_uring: bool,
     /// io_uring submission queue depth per file.
     pub io_uring_queue_depth: u32,
+
+    /// SQPOLL idle timeout in milliseconds. When > 0, enables kernel-side
+    /// polling (requires Linux 5.13+ and root/CAP_SYS_NICE). Default: 100ms.
+    pub io_uring_sqpoll_idle_ms: u32,
+    /// CPU core to pin the SQPOLL kernel thread to. When None, the kernel
+    /// chooses automatically. Only used when io_uring_sqpoll_idle_ms > 0.
+    pub io_uring_sqpoll_cpu: Option<u32>,
 }
 
 impl WorkerConf {
@@ -210,6 +217,8 @@ impl Default for WorkerConf {
             spdk_disk: SpdkConf::default(),
             enable_io_uring: false,
             io_uring_queue_depth: 8,
+            io_uring_sqpoll_idle_ms: 100,
+            io_uring_sqpoll_cpu: None,
         }
     }
 }

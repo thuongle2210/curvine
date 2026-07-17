@@ -90,6 +90,10 @@ pub struct ClientConf {
     #[client_cli]
     pub enable_io_uring: bool,
 
+    /// SQPOLL idle timeout in ms. When > 0, enables kernel-side polling
+    /// (requires Linux 5.13+ and root/CAP_SYS_NICE). Default: 100ms.
+    pub io_uring_sqpoll_idle_ms: u32,
+
     #[serde(skip)]
     pub storage_type: StorageType,
     #[serde(alias = "storage_type")]
@@ -386,6 +390,7 @@ impl Default for ClientConf {
 
             short_circuit: true,
             enable_io_uring: false,
+            io_uring_sqpoll_idle_ms: 100,
 
             storage_type: StorageType::Disk,
             storage_type_str: "disk".to_string(),

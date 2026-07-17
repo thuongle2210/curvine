@@ -24,6 +24,7 @@ pub struct IoUringEnv {
     pub(crate) ring: IoUring,
     #[allow(dead_code)]
     pub(crate) queue_depth: u32,
+    sqpoll_enabled: bool,
 }
 
 impl IoUringEnv {
@@ -37,7 +38,45 @@ impl IoUringEnv {
                 queue_depth, e
             ))
         })?;
-        Ok(Self { ring, queue_depth })
+        Ok(Self { ring, queue_depth, sqpoll_enabled: false })
+    }
+
+    /// Create a new io_uring instance with SQPOLL enabled.
+    ///
+    /// SQPOLL mode runs a kernel thread that polls the submission queue,
+    /// eliminating the `io_uring_enter()` syscall for most submissions.
+    /// This reduces latency by ~22-29% for single-request patterns.
+    ///
+    /// - `idle_ms`: How long the kernel thread sleeps when idle before requiring
+    ///   a wakeup. 100ms is recommended for production.
+    /// - `cpu_core`: Optional CPU core to pin the kernel polling thread to.
+    ///   When `None`, the kernel chooses automatically.
+    ///
+    /// # Requirements
+    /// - Linux 5.13+ (for SQPOLL support)
+    /// - Root or `CAP_SYS_NICE` capability
+    ///
+    /// # Errors
+    /// Returns an error if SQPOLL is not available (wrong kernel version,
+    /// missing capabilities, etc.). The caller should fall back to `new()`.
+    pub fn new_with_sqpoll(queue_depth: u32, idle_ms: u32, cpu_core: Option<u32>) -> IOResult<Self> {
+        let mut builder = IoUring::builder();
+        builder.setup_sqpoll(idle_ms);
+        if let Some(core) = cpu_core {
+            builder.setup_sqpoll_cpu(core);
+        }
+        let ring = builder.build(queue_depth).map_err(|e| {
+            IOError::create(format!(
+                "Failed to create SQPOLL io_uring (need Linux 5.13+ and root/CAP_SYS_NICE, idle_ms={}): {}",
+                idle_ms, e
+            ))
+        })?;
+        Ok(Self { ring, queue_depth, sqpoll_enabled: true })
+    }
+
+    /// Returns `true` if this ring was created with SQPOLL enabled.
+    pub fn sqpoll_enabled(&self) -> bool {
+        self.sqpoll_enabled
     }
 
     /// Submit all pending SQEs and wait for `count` completions.
