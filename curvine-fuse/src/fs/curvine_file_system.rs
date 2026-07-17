@@ -69,6 +69,10 @@ impl CurvineFileSystem {
         &self.conf
     }
 
+    pub(crate) fn fs(&self) -> &UnifiedFileSystem {
+        &self.fs
+    }
+
     async fn ensure_writable_path(&self, path: &Path, rpc_code: RpcCode) -> FuseResult<()> {
         if self.conf.readonly {
             return Err(FsError::read_only(path.full_path()).into());
@@ -437,6 +441,9 @@ impl fs::FileSystem for CurvineFileSystem {
     // Query inode.
     async fn lookup(&self, op: Lookup<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
+        if name.len() > FUSE_MAX_NAME_LENGTH {
+            return err_fuse!(libc::ENAMETOOLONG);
+        }
 
         self.check_permissions(op.header, libc::X_OK as u32).await?;
 
@@ -658,7 +665,7 @@ impl fs::FileSystem for CurvineFileSystem {
             .state
             .new_dir_handle(op.header.nodeid, &dir_path)
             .await?;
-        let open_flags = FuseUtils::fill_open_flags(&self.conf, op.arg.flags);
+        let open_flags = FuseUtils::dir_open_flags(&self.conf);
         let attr = fuse_open_out {
             fh: handle.fh,
             open_flags,
@@ -765,9 +772,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let handle = self.state.fs_open(ino, op.arg.flags, opts).await?;
 
-        let mut open_flags = op.arg.flags;
-        if self.conf.direct_io {
-            open_flags |= FUSE_FOPEN_DIRECT_IO;
+        let keep_cache = if self.conf.direct_io {
+            false
         } else {
             // Page cache consistency is handled here rather than via explicit inode
             // invalidation notifications, for two reasons:
@@ -787,13 +793,9 @@ impl fs::FileSystem for CurvineFileSystem {
             // keep_cache may return true even after a remote modification, causing stale
             // reads.  This is intentional — metadata caching trades strict consistency
             // for performance, and callers that enable it accept this trade-off.
-            let keep_cache = self.state.keep_cache(ino, handle.status());
-            if keep_cache {
-                open_flags |= FUSE_FOPEN_KEEP_CACHE;
-            } else if self.conf.open_direct_on_stale {
-                open_flags |= FUSE_FOPEN_DIRECT_IO;
-            }
-        }
+            self.state.keep_cache(ino, &handle.status())
+        };
+        let open_flags = FuseUtils::file_open_flags(&self.conf, keep_cache);
 
         let entry = fuse_open_out {
             fh: handle.fh(),
@@ -819,9 +821,14 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&path, RpcCode::CreateFile)
             .await?;
 
-        let opts = FuseUtils::create_opts(&op, &self.fs);
+        let mut opts = FuseUtils::create_opts(&op, &self.fs);
+        let parent_status = self.state.fs_stat(ino, None).await?;
+        if parent_status.mode & FUSE_S_ISGID != 0 {
+            opts.group = parent_status.group;
+        }
+
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
-        let attr = FuseUtils::status_to_attr(&self.conf, handle.status())?;
+        let attr = FuseUtils::status_to_attr(&self.conf, &handle.status())?;
 
         if attr.ino != handle.ino() {
             return err_fuse!(
@@ -844,7 +851,7 @@ impl fs::FileSystem for CurvineFileSystem {
             },
             fuse_open_out {
                 fh: handle.fh(),
-                open_flags: op.arg.flags,
+                open_flags: FuseUtils::file_open_flags(&self.conf, true),
                 padding: 0,
             },
         );
@@ -992,7 +999,11 @@ impl fs::FileSystem for CurvineFileSystem {
         let link_path = self.state.get_path_common(id, Some(linkname))?;
         self.ensure_writable_path(&link_path, RpcCode::Symlink)
             .await?;
-        self.fs.symlink(target, &link_path, false).await?;
+        let owner = sys::get_username_by_uid(op.header.uid).unwrap_or(op.header.uid.to_string());
+        let group = sys::get_groupname_by_gid(op.header.gid).unwrap_or(op.header.gid.to_string());
+        self.fs
+            .symlink_with_owner_group(target, &link_path, false, Some(owner), Some(group))
+            .await?;
 
         let attr = self.state.lookup_common(id, linkname).await?;
         Ok(FuseUtils::create_entry_out(&self.conf, attr))
@@ -1157,11 +1168,11 @@ impl fs::FileSystem for CurvineFileSystem {
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
         let conf = &self.fs.conf().client;
-        let check_interval_min = conf.sync_check_interval_min;
-        let check_interval_max = conf.sync_check_interval_max;
+        let check_interval_min_ms = conf.sync_check_interval_min_ms;
+        let check_interval_max_ms = conf.sync_check_interval_max_ms;
         let log_ticks = conf.sync_check_log_tick;
 
-        let mut ticks = 0;
+        let mut ticks: u64 = 0;
         let time = TimeSpent::new();
 
         // NOTE: `setlkw_wait_duration_us` is NOT observed here. Its RAII timer is
@@ -1179,10 +1190,10 @@ impl fs::FileSystem for CurvineFileSystem {
             }
 
             ticks += 1;
-            let sleep_time = check_interval_max.min(check_interval_min * ticks);
-            tokio::time::sleep(sleep_time).await;
+            let sleep_ms = check_interval_max_ms.min(check_interval_min_ms.saturating_mul(ticks));
+            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 
-            if ticks % log_ticks == 0 {
+            if ticks.is_multiple_of(log_ticks as u64) {
                 info!("waiting lock for {}, elapsed: {} ms", path, time.used_ms());
             }
         }

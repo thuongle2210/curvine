@@ -35,32 +35,44 @@ use std::slice;
 pub struct FuseUtils;
 
 impl FuseUtils {
-    pub fn struct_as_bytes<T>(dst: &T) -> &[u8] {
+    /// Reinterpret a value as its raw bytes for writing to the FUSE device.
+    ///
+    /// SAFETY / usage contract: `T` MUST be a FUSE C-ABI (`#[repr(C)]`) struct.
+    /// `slice::from_raw_parts` reads all `size_of::<T>()` bytes verbatim,
+    /// *including padding* — so the caller must ensure `T` has no uninitialized
+    /// padding (all current FUSE ABI structs zero their `padding` fields, e.g.
+    /// `fuse_attr` in `status_to_attr`). Passing a non-`repr(C)` type, or one
+    /// with pointers / uninit fields, risks ABI mismatch and info leakage.
+    /// Kept crate-private so only FUSE ABI structs reach it.
+    pub(crate) fn struct_as_bytes<T>(dst: &T) -> &[u8] {
         let len = size_of::<T>();
         let ptr = dst as *const T as *const u8;
         unsafe { slice::from_raw_parts(ptr, len) }
     }
 
-    pub fn struct_as_buf<T>(dst: &T) -> BytesMut {
+    /// Owned-buffer variant of [`struct_as_bytes`]; same C-ABI contract applies.
+    pub(crate) fn struct_as_buf<T>(dst: &T) -> BytesMut {
         let bytes = Self::struct_as_bytes(dst);
         BytesMut::from(bytes)
     }
 
-    pub fn get_kernel_version() -> f32 {
-        let output = Command::new("uname")
-            .arg("-r")
-            .output()
-            .expect("Failed to execute 'uname -r'");
-
-        // Convert output to string and remove the line break at the end
-        let kernel_ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        let parts: Vec<&str> = kernel_ver.split('.').collect();
-        if parts.len() < 2 {
-            1f32
-        } else {
-            format!("{}.{}", parts[0], parts[1]).parse::<f32>().unwrap()
+    pub fn get_kernel_version() -> (u32, u32) {
+        let Ok(output) = Command::new("uname").arg("-r").output() else {
+            return (0, 0);
+        };
+        if !output.status.success() {
+            return (0, 0);
         }
+
+        let kernel_release = String::from_utf8_lossy(&output.stdout);
+        Self::parse_kernel_version(kernel_release.trim()).unwrap_or((0, 0))
+    }
+
+    fn parse_kernel_version(kernel_release: &str) -> Option<(u32, u32)> {
+        let mut parts = kernel_release.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        Some((major, minor))
     }
 
     pub fn get_mode(perm: u32, typ: FileType) -> u32 {
@@ -113,15 +125,6 @@ impl FuseUtils {
         file_type == libc::S_IFDIR as u32
     }
 
-    pub fn aligned_sub_buf(buf: &mut [u8], alignment: usize) -> &mut [u8] {
-        let off = alignment - (buf.as_ptr() as usize) % alignment;
-        if off == alignment {
-            buf
-        } else {
-            &mut buf[off..]
-        }
-    }
-
     // In fuse 2, this default size is 132kb (128 + 4)
     pub fn get_fuse_buf_size() -> usize {
         let page_size = sys::get_pagesize().unwrap_or(FUSE_DEFAULT_PAGE_SIZE);
@@ -149,14 +152,31 @@ impl FuseUtils {
     pub fn fuse_clone_fd(source_fd: RawIO) -> IOResult<RawIO> {
         let path = FFIUtils::new_cs_string(FUSE_DEVICE_NAME);
         let clone_fd = sys::open(&path, libc::O_RDWR)?;
+        Self::clone_fd_ioctl(clone_fd, source_fd)
+    }
 
+    // Issue the FUSE_DEV_IOC_CLONE ioctl on an already-opened `clone_fd`.
+    // On failure, close `clone_fd` before propagating so it does not leak:
+    // the caller (fuse_mnt.rs) falls back to dup(self.fd) and never sees this
+    // fd again, so nothing else would ever close it.
+    //
+    // NOTE: close(2) releases the fd even when it returns an error (EINTR/EIO),
+    // so we log-and-ignore the close error rather than retry — retrying would
+    // risk a double-close of a since-reused fd. The original ioctl error is
+    // returned unchanged because it carries the more useful diagnostic.
+    pub(crate) fn clone_fd_ioctl(clone_fd: RawIO, source_fd: RawIO) -> IOResult<RawIO> {
         let request = Self::fuse_dev_ioc_clone();
         let mut master_fd = source_fd;
-        sys::ioctl(
+        if let Err(e) = sys::ioctl(
             clone_fd,
             request,
             &mut master_fd as *mut _ as *mut libc::c_void,
-        )?;
+        ) {
+            if let Err(ce) = sys::close(clone_fd) {
+                log::warn!("fuse_clone_fd: close leaked fd {} failed: {}", clone_fd, ce);
+            }
+            return Err(e);
+        }
 
         Ok(clone_fd)
     }
@@ -174,16 +194,13 @@ impl FuseUtils {
     }
 
     pub fn create_opts(op: &Create<'_>, fs: &UnifiedFileSystem) -> CreateFileOpts {
-        let mut builder = CreateFileOptsBuilder::with_conf(&fs.conf().client);
-        if op.arg.mode != 0 {
-            builder = builder.acl(
+        CreateFileOptsBuilder::with_conf(&fs.conf().client)
+            .acl(
                 op.header.uid,
                 op.header.gid,
                 op.arg.mode & 0o7777 & !op.arg.umask,
             )
-        }
-
-        builder.build()
+            .build()
     }
 
     pub fn check_xattr(name: &str, read: bool) -> FuseResult<()> {
@@ -207,18 +224,26 @@ impl FuseUtils {
         }
     }
 
-    pub fn fill_open_flags(conf: &FuseConf, v: u32) -> u32 {
-        let mut flags = v;
+    pub fn file_open_flags(conf: &FuseConf, keep_cache: bool) -> u32 {
+        let mut flags = 0;
         if conf.direct_io {
             flags |= FUSE_FOPEN_DIRECT_IO;
-        } else {
+        } else if keep_cache {
             flags |= FUSE_FOPEN_KEEP_CACHE;
-        }
-        if conf.cache_readdir {
-            flags |= FUSE_FOPEN_CACHE_DIR
+        } else if conf.open_direct_on_stale {
+            flags |= FUSE_FOPEN_DIRECT_IO;
         }
         if conf.non_seekable {
-            flags |= FUSE_FOPEN_NONSEEKABLE
+            flags |= FUSE_FOPEN_NONSEEKABLE;
+        }
+
+        flags
+    }
+
+    pub fn dir_open_flags(conf: &FuseConf) -> u32 {
+        let mut flags = Self::file_open_flags(conf, true);
+        if conf.cache_readdir {
+            flags |= FUSE_FOPEN_CACHE_DIR;
         }
 
         flags
@@ -262,11 +287,12 @@ impl FuseUtils {
             }
         };
 
-        let mode = if status.mode != 0 {
-            FuseUtils::get_mode(status.mode, status.file_type)
+        let perm = if status.id == FUSE_UNKNOWN_INO as i64 && FuseUtils.is_dot(&status.name) {
+            FUSE_DEFAULT_MODE & !conf.umask
         } else {
-            FuseUtils::get_mode(FUSE_DEFAULT_MODE & !conf.umask, status.file_type)
+            status.mode
         };
+        let mode = FuseUtils::get_mode(perm, status.file_type);
         let size = FuseUtils::fuse_st_size(status);
 
         // For links, nlink should be greater than 1
@@ -294,16 +320,13 @@ impl FuseUtils {
     }
 
     pub fn mkdir_opts(op: &MkDir<'_>, fs: &UnifiedFileSystem) -> MkdirOpts {
-        let mut builder = MkdirOptsBuilder::with_conf(&fs.conf().client);
-        if op.arg.mode != 0 {
-            builder = builder.acl(
+        MkdirOptsBuilder::with_conf(&fs.conf().client)
+            .acl(
                 op.header.uid,
                 op.header.gid,
                 op.arg.mode & 0o7777 & !op.arg.umask,
             )
-        }
-
-        builder.build()
+            .build()
     }
 
     pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
@@ -323,6 +346,9 @@ impl FuseUtils {
     }
 
     pub fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
+        // FATTR_SIZE is intentionally handled by CurvineFileSystem::set_attr because resizing
+        // requires the file handle and cache invalidation managed by the caller.
+
         // Only set fields when the corresponding valid flag is present
         let owner = if (setattr.valid & FATTR_UID) != 0 {
             match sys::get_username_by_uid(setattr.uid) {
@@ -354,13 +380,21 @@ impl FuseUtils {
         let mut mtime = None;
 
         if (setattr.valid & FATTR_ATIME) != 0 {
-            atime = Some((setattr.atime * 1000) as i64);
+            atime = Some(Self::timestamp_to_millis(
+                "atime",
+                setattr.atime,
+                setattr.atimensec,
+            )?);
         } else if (setattr.valid & FATTR_ATIME_NOW) != 0 {
             atime = Some(LocalTime::mills() as i64);
         }
 
         if (setattr.valid & FATTR_MTIME) != 0 {
-            mtime = Some((setattr.mtime * 1000) as i64);
+            mtime = Some(Self::timestamp_to_millis(
+                "mtime",
+                setattr.mtime,
+                setattr.mtimensec,
+            )?);
         } else if (setattr.valid & FATTR_MTIME_NOW) != 0 {
             mtime = Some(LocalTime::mills() as i64);
         }
@@ -373,6 +407,28 @@ impl FuseUtils {
             mtime,
             ..Default::default()
         })
+    }
+
+    fn timestamp_to_millis(field: &str, seconds: u64, nanoseconds: u32) -> FuseResult<i64> {
+        if nanoseconds >= 1_000_000_000 {
+            return err_fuse!(
+                libc::EINVAL,
+                "{} nanoseconds out of range: {}",
+                field,
+                nanoseconds
+            );
+        }
+
+        // FUSE represents seconds as u64, including negative Unix timestamps encoded in two's
+        // complement. Reinterpret it as i64 before doing checked arithmetic.
+        let seconds = seconds as i64;
+        match seconds
+            .checked_mul(1000)
+            .and_then(|millis| millis.checked_add(i64::from(nanoseconds / 1_000_000)))
+        {
+            Some(millis) => Ok(millis),
+            None => err_fuse!(libc::EINVAL, "{} timestamp out of range", field),
+        }
     }
 
     pub fn file_opts_to_status(path: &Path, opts: &CreateFileOpts) -> FileStatus {
@@ -390,5 +446,162 @@ impl FuseUtils {
             nlink: 1,
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw::fuse_abi::fuse_setattr_in;
+
+    #[test]
+    fn file_open_flags_are_built_only_from_response_flags() {
+        let mut conf = FuseConf::default();
+
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, true),
+            FUSE_FOPEN_KEEP_CACHE
+        );
+        assert_eq!(FuseUtils::file_open_flags(&conf, false), 0);
+
+        conf.open_direct_on_stale = true;
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, false),
+            FUSE_FOPEN_DIRECT_IO
+        );
+
+        conf.non_seekable = true;
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, false),
+            FUSE_FOPEN_DIRECT_IO | FUSE_FOPEN_NONSEEKABLE
+        );
+
+        conf.direct_io = true;
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, true),
+            FUSE_FOPEN_DIRECT_IO | FUSE_FOPEN_NONSEEKABLE
+        );
+
+        let request_only_flags = (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) as u32;
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, true) & request_only_flags,
+            0
+        );
+    }
+
+    #[test]
+    fn cache_dir_flag_is_limited_to_directory_responses() {
+        let mut conf = FuseConf {
+            cache_readdir: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            FuseUtils::file_open_flags(&conf, true),
+            FUSE_FOPEN_KEEP_CACHE
+        );
+        assert_eq!(
+            FuseUtils::dir_open_flags(&conf),
+            FUSE_FOPEN_KEEP_CACHE | FUSE_FOPEN_CACHE_DIR
+        );
+
+        conf.direct_io = true;
+        conf.non_seekable = true;
+        assert_eq!(
+            FuseUtils::dir_open_flags(&conf),
+            FUSE_FOPEN_DIRECT_IO | FUSE_FOPEN_NONSEEKABLE | FUSE_FOPEN_CACHE_DIR
+        );
+    }
+
+    #[test]
+    fn setattr_preserves_millisecond_from_nsec() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_ATIME | FATTR_MTIME,
+            atime: 1_700_000_000,
+            mtime: 1_800_000_000,
+            atimensec: 123_456_789,
+            mtimensec: 987_654_321,
+            ..Default::default()
+        };
+
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+
+        assert_eq!(opts.atime, Some(1_700_000_000_123));
+        assert_eq!(opts.mtime, Some(1_800_000_000_987));
+    }
+
+    #[test]
+    fn setattr_rejects_out_of_range_nsec() {
+        for setattr in [
+            fuse_setattr_in {
+                valid: FATTR_ATIME,
+                atimensec: 1_000_000_000,
+                ..Default::default()
+            },
+            fuse_setattr_in {
+                valid: FATTR_MTIME,
+                mtimensec: 1_000_000_000,
+                ..Default::default()
+            },
+        ] {
+            let err = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap_err();
+
+            assert_eq!(err.errno(), libc::EINVAL);
+        }
+    }
+
+    #[test]
+    fn kernel_version_6_10_compares_greater_than_6_9() {
+        let version = FuseUtils::parse_kernel_version("6.10.3").unwrap();
+
+        assert!(version > (6, 9));
+    }
+
+    #[test]
+    fn kernel_version_4_10_enables_clone_fd() {
+        let version = FuseUtils::parse_kernel_version("4.10.0").unwrap();
+
+        assert!(version >= FUSE_CLONE_FD_MIN_VERSION);
+    }
+
+    #[test]
+    fn kernel_version_parse_failure_disables_clone_fd() {
+        let version = FuseUtils::parse_kernel_version("unexpected").unwrap_or((0, 0));
+
+        assert!(version < FUSE_CLONE_FD_MIN_VERSION);
+    }
+
+    // Regression for the clone-fd leak: when the FUSE_DEV_IOC_CLONE ioctl fails,
+    // `clone_fd_ioctl` must close the fd it was handed before returning the error,
+    // otherwise it leaks (the caller falls back to dup and never sees this fd).
+    //
+    // We drive this without touching /dev/fuse: a plain pipe fd does not accept
+    // the FUSE clone ioctl, so `sys::ioctl` fails deterministically and the
+    // close path is exercised. `fcntl(F_GETFD)` on the now-closed fd returns
+    // EBADF, confirming the close happened. Linux-only: pipe2/ioctl/fcntl_get
+    // are not available on other targets.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_clone_fd_closes_fd_on_ioctl_error() {
+        // Non-zero pipe size: pipe2 sets F_SETPIPE_SZ, which rejects 0 on some
+        // kernels; a page size is rounded up to the kernel minimum and is safe.
+        let [r, w] = sys::pipe2(4096).expect("pipe2");
+
+        let res = FuseUtils::clone_fd_ioctl(r, w);
+        // The bogus ioctl on a pipe fd must fail (ENOTTY/EINVAL), and the error
+        // is propagated unchanged.
+        assert!(res.is_err(), "ioctl on a pipe fd should fail");
+
+        // `r` should have been closed by the error path: F_GETFD now returns EBADF.
+        // (Primary guarantee is the propagated error above; this is a best-effort
+        // check — in theory another thread could reuse the fd number, but not in
+        // this single-threaded test.)
+        assert!(
+            sys::fcntl_get(r).is_err(),
+            "clone_fd should have been closed on ioctl error"
+        );
+
+        // `r` is already closed inside clone_fd_ioctl; only close the write end.
+        let _ = sys::close(w);
     }
 }

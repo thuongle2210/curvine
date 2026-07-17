@@ -63,6 +63,10 @@ This script tests basic filesystem operations including:
   - Mmap read/write (MAP_SHARED mmap ↔ pread coherence, issue #850)
   - Active-writer path truncate regression (PR #962)
   - Read-only open with O_CREAT creates a missing file
+  - Mode 0000 is preserved by chmod, fchmod, and umask-filtered create
+  - Overlong lookup names return ENAMETOOLONG
+  - Files created in setgid directories inherit the parent group
+  - Symlink owner and group metadata
 
 For FIO performance tests, use fio-test.sh instead.
 
@@ -1379,6 +1383,38 @@ test_open_creat_rdonly() {
         "open_creat_rdonly_repro.py" --dir "$TEST_DIR"
 }
 
+# Test 23: mode 0000 is a valid persisted permission mode
+test_mode_zero_permissions() {
+    CURRENT_TEST_GROUP="Test 23: Mode Zero Permissions"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing chmod/fchmod/umask preserve mode 0000" \
+        "mode_zero_permissions_repro.py" --dir "$TEST_DIR"
+}
+
+# Test 24: lookup of an overlong name returns ENAMETOOLONG
+test_lookup_enametoolong() {
+    CURRENT_TEST_GROUP="Test 24: Lookup ENAMETOOLONG"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing lookup on overlong names returns ENAMETOOLONG" \
+        "lookup_enametoolong_repro.py" --dir "$TEST_DIR"
+# Test 25: files created in setgid directories inherit the parent group
+test_setgid_group_inherit() {
+    CURRENT_TEST_GROUP="Test 24: Setgid Group Inheritance"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing file group inheritance in setgid directories" \
+        "setgid_group_inherit_repro.py" --dir "$TEST_DIR"
+# Test 26: symlink owner/group metadata
+test_symlink_owner() {
+    CURRENT_TEST_GROUP="Test 24: Symlink Owner"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing symlink owner and group metadata" \
+        "symlink_owner_repro.py" --dir "$TEST_DIR"
+}
+
 # Print final report
 print_report() {
     print_header "Test Summary"
@@ -1486,6 +1522,10 @@ main() {
     test_file_handle_at
     test_pr962_active_writer_truncate
     test_open_creat_rdonly
+    test_mode_zero_permissions
+    test_lookup_enametoolong
+    test_setgid_group_inherit
+    test_symlink_owner
 
     test_git_clone
 
