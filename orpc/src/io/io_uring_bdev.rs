@@ -39,6 +39,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 pub struct IoUringBdev {
     env: IoUringEnv,
     file: fs::File,
+    #[allow(dead_code)]
     fd: RawFd,
     path: String,
     pos: i64,
@@ -68,11 +69,15 @@ impl IoUringBdev {
         let fd = file.as_raw_fd();
         let len = file.metadata().map(|m| m.len() as i64).unwrap_or(0);
         let queue_depth = 8;
-        let env = if sqpoll_idle_ms > 0 {
+        let mut env = if sqpoll_idle_ms > 0 {
             IoUringEnv::new_with_sqpoll(queue_depth, sqpoll_idle_ms, sqpoll_cpu)?
         } else {
             IoUringEnv::new(queue_depth)?
         };
+
+        // Phase 3: Register fd at index 0 for fixed-file I/O.
+        // This avoids per-I/O kernel fd lookup overhead.
+        env.register_file(0, fd)?;
 
         Ok(Self {
             env,
@@ -122,7 +127,7 @@ impl BlockIO for IoUringBdev {
         // ensures the CQE is consumed before the buffer goes out of scope.
         let sqe = unsafe {
             self.env
-                .prep_write(self.fd, buf.as_ptr(), buf.len() as u32, self.pos as u64, 0)
+                .prep_write_fixed(0, buf.as_ptr(), buf.len() as u32, self.pos as u64, 0)
         };
         self.env.push(&sqe)?;
         self.env.submit_and_wait(1)?;
@@ -149,7 +154,7 @@ impl BlockIO for IoUringBdev {
         // and submit_and_wait ensures the CQE is consumed before reuse.
         let sqe = unsafe {
             self.env
-                .prep_read(self.fd, buf.as_mut_ptr(), buf.len() as u32, self.pos as u64, 0)
+                .prep_read_fixed(0, buf.as_mut_ptr(), buf.len() as u32, self.pos as u64, 0)
         };
         self.env.push(&sqe)?;
         self.env.submit_and_wait(1)?;
@@ -180,7 +185,7 @@ impl BlockIO for IoUringBdev {
     }
 
     fn flush(&mut self) -> IOResult<()> {
-        let sqe = self.env.prep_fsync(self.fd, 0);
+        let sqe = self.env.prep_fsync_fixed(0, 0);
         self.env.push(&sqe)?;
         self.env.submit_and_wait(1)?;
 
@@ -364,6 +369,31 @@ mod test {
         // Read with SQPOLL
         let mut reader = IoUringBdev::with_read(path_str, 0, 100, None)?;
         assert!(reader.env.sqpoll_enabled());
+        reader.read_all(&mut read_buf)?;
+        assert_eq!(&read_buf, data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn io_uring_fixed_file_write_read_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("test_fixed.bin");
+        let path_str = path.to_str().unwrap();
+        let data = b"Fixed file registration test data";
+        let mut read_buf = vec![0u8; data.len()];
+
+        // Write using fixed file (fd registered at index 0)
+        let mut writer = IoUringBdev::with_write_offset(path_str, true, 0, 0, None)?;
+        assert!(writer.env.fixed_file_index().is_some());
+        assert_eq!(writer.env.fixed_file_index(), Some(0));
+        writer.write_all(data)?;
+        writer.flush()?;
+        drop(writer);
+
+        // Read using fixed file
+        let mut reader = IoUringBdev::with_read(path_str, 0, 0, None)?;
+        assert!(reader.env.fixed_file_index().is_some());
         reader.read_all(&mut read_buf)?;
         assert_eq!(&read_buf, data);
 

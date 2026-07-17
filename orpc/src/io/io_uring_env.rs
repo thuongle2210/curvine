@@ -14,7 +14,7 @@
 
 use crate::io::{IOError, IOResult};
 use io_uring::squeue::Entry;
-use io_uring::types::Fd;
+use io_uring::types::{Fd, Fixed};
 use io_uring::{opcode, IoUring};
 use std::os::unix::io::RawFd;
 
@@ -25,6 +25,8 @@ pub struct IoUringEnv {
     #[allow(dead_code)]
     pub(crate) queue_depth: u32,
     sqpoll_enabled: bool,
+    /// Index of the registered file descriptor, or `None` if no file is registered.
+    fixed_file_index: Option<u32>,
 }
 
 impl IoUringEnv {
@@ -38,7 +40,7 @@ impl IoUringEnv {
                 queue_depth, e
             ))
         })?;
-        Ok(Self { ring, queue_depth, sqpoll_enabled: false })
+        Ok(Self { ring, queue_depth, sqpoll_enabled: false, fixed_file_index: None })
     }
 
     /// Create a new io_uring instance with SQPOLL enabled.
@@ -71,7 +73,7 @@ impl IoUringEnv {
                 idle_ms, e
             ))
         })?;
-        Ok(Self { ring, queue_depth, sqpoll_enabled: true })
+        Ok(Self { ring, queue_depth, sqpoll_enabled: true, fixed_file_index: None })
     }
 
     /// Returns `true` if this ring was created with SQPOLL enabled.
@@ -137,6 +139,73 @@ impl IoUringEnv {
     /// Prepare an FSYNC SQE.
     pub fn prep_fsync(&self, fd: RawFd, user_data: u64) -> Entry {
         opcode::Fsync::new(Fd(fd)).build().user_data(user_data)
+    }
+
+    // --- Fixed file operations (Phase 3) ---
+
+    /// Register a file descriptor at the given index for use with fixed-file operations.
+    ///
+    /// Once registered, use [`prep_write_fixed`](Self::prep_write_fixed),
+    /// [`prep_read_fixed`](Self::prep_read_fixed), and
+    /// [`prep_fsync_fixed`](Self::prep_fsync_fixed) with the same index.
+    ///
+    /// This avoids per-I/O kernel fd lookup overhead.
+    pub fn register_file(&mut self, index: u32, fd: RawFd) -> IOResult<()> {
+        let mut fds = vec![io_uring::register::SKIP_FILE; index as usize + 1];
+        fds[index as usize] = fd;
+        self.ring.submitter().register_files(&fds).map_err(|e| {
+            IOError::create(format!("Failed to register fixed file at index {}: {}", index, e))
+        })?;
+        self.fixed_file_index = Some(index);
+        Ok(())
+    }
+
+    /// Returns the fixed file index, if a file has been registered.
+    pub fn fixed_file_index(&self) -> Option<u32> {
+        self.fixed_file_index
+    }
+
+    /// Prepare a WRITE SQE using a pre-registered fixed file.
+    ///
+    /// # Safety
+    /// The caller must ensure `buf` points to valid memory of at least `len` bytes
+    /// and remains valid until the CQE is consumed.
+    pub unsafe fn prep_write_fixed(
+        &self,
+        index: u32,
+        buf: *const u8,
+        len: u32,
+        offset: u64,
+        user_data: u64,
+    ) -> Entry {
+        opcode::Write::new(Fixed(index), buf, len)
+            .offset(offset)
+            .build()
+            .user_data(user_data)
+    }
+
+    /// Prepare a READ SQE using a pre-registered fixed file.
+    ///
+    /// # Safety
+    /// The caller must ensure `buf` points to valid mutable memory of at least `len` bytes
+    /// and remains valid until the CQE is consumed.
+    pub unsafe fn prep_read_fixed(
+        &self,
+        index: u32,
+        buf: *mut u8,
+        len: u32,
+        offset: u64,
+        user_data: u64,
+    ) -> Entry {
+        opcode::Read::new(Fixed(index), buf, len)
+            .offset(offset)
+            .build()
+            .user_data(user_data)
+    }
+
+    /// Prepare an FSYNC SQE using a pre-registered fixed file.
+    pub fn prep_fsync_fixed(&self, index: u32, user_data: u64) -> Entry {
+        opcode::Fsync::new(Fixed(index)).build().user_data(user_data)
     }
 
     /// Push an SQE into the submission queue.
