@@ -159,6 +159,11 @@ pub struct WorkerConf {
 
     // SPDK over NVMe-oF/RDMA configuration.
     pub spdk_disk: SpdkConf,
+
+    /// Enable io_uring for local file I/O (Linux only, requires kernel 5.6+).
+    pub enable_io_uring: bool,
+    /// io_uring submission queue depth per file.
+    pub io_uring_queue_depth: u32,
 }
 
 impl WorkerConf {
@@ -203,6 +208,8 @@ impl Default for WorkerConf {
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
             spdk_disk: SpdkConf::default(),
+            enable_io_uring: false,
+            io_uring_queue_depth: 8,
         }
     }
 }

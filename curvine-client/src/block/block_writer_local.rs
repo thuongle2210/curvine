@@ -18,7 +18,9 @@ use curvine_common::error::FsError;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
-use orpc::io::LocalFile;
+use orpc::io::{BlockDevice, BlockIO, LocalFile};
+#[cfg(feature = "io-uring")]
+use orpc::io::IoUringBdev;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::{DataSlice, RawPtr};
 use orpc::{err_box, try_option};
@@ -29,7 +31,7 @@ pub struct BlockWriterLocal {
     client: BlockClient,
     block: ExtendedBlock,
     worker_address: WorkerAddress,
-    file: RawPtr<LocalFile>,
+    file: RawPtr<BlockDevice>,
     block_size: i64,
     seq_id: i32,
     req_id: i64,
@@ -60,14 +62,21 @@ impl BlockWriterLocal {
             .await?;
 
         let path = try_option!(write_context.path);
-        let file = LocalFile::with_write_offset(path, false, pos)?;
+        #[cfg(feature = "io-uring")]
+        let device = if fs_context.conf.client.enable_io_uring {
+            BlockDevice::IoUring(IoUringBdev::with_write_offset(path, false, pos)?)
+        } else {
+            BlockDevice::Local(LocalFile::with_write_offset(path, false, pos)?)
+        };
+        #[cfg(not(feature = "io-uring"))]
+        let device = BlockDevice::Local(LocalFile::with_write_offset(path, false, pos)?);
 
         let writer = Self {
             rt: fs_context.clone_runtime(),
             client,
             block,
             worker_address,
-            file: RawPtr::from_owned(file),
+            file: RawPtr::from_owned(device),
             block_size,
             seq_id,
             req_id,

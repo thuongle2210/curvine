@@ -33,6 +33,7 @@ rand = { workspace = true }
 
 [features]
 default = ["opendal-s3"]
+io-uring = ["orpc/io-uring"]
 
 opendal = ["dep:curvine-ufs", "curvine-ufs/opendal"]
 opendal-s3 = ["opendal", "curvine-ufs/opendal-s3"]

@@ -23,14 +23,27 @@ pub trait BlockIO: Send {
     fn resize(&mut self, truncate: bool, off: i64, len: i64, mode: i32) -> IOResult<()>;
 }
 
-/// Enum-based block device that dispatches to either `LocalFile` or `SpdkBdev`
+/// Enum-based block device that dispatches to either `LocalFile`, `SpdkBdev`, or `IoUringBdev`
 pub enum BlockDevice {
     Local(LocalFile),
     #[cfg(feature = "spdk")]
     Spdk(crate::io::SpdkBdev),
+    #[cfg(feature = "io-uring")]
+    IoUring(crate::io::IoUringBdev),
 }
 /// Macro to delegate a method call to the inner variant.
-#[cfg(feature = "spdk")]
+#[cfg(all(feature = "spdk", feature = "io-uring"))]
+macro_rules! delegate {
+    ($self:ident, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            BlockDevice::Local(f) => f.$method($($arg),*),
+            BlockDevice::Spdk(b) => b.$method($($arg),*),
+            BlockDevice::IoUring(u) => u.$method($($arg),*),
+        }
+    };
+}
+
+#[cfg(all(feature = "spdk", not(feature = "io-uring")))]
 macro_rules! delegate {
     ($self:ident, $method:ident $(, $arg:expr)*) => {
         match $self {
@@ -40,7 +53,17 @@ macro_rules! delegate {
     };
 }
 
-#[cfg(not(feature = "spdk"))]
+#[cfg(all(not(feature = "spdk"), feature = "io-uring"))]
+macro_rules! delegate {
+    ($self:ident, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            BlockDevice::Local(f) => f.$method($($arg),*),
+            BlockDevice::IoUring(u) => u.$method($($arg),*),
+        }
+    };
+}
+
+#[cfg(not(any(feature = "spdk", feature = "io-uring")))]
 macro_rules! delegate {
     ($self:ident, $method:ident $(, $arg:expr)*) => {
         match $self {
@@ -124,6 +147,8 @@ impl Display for BlockDevice {
             BlockDevice::Local(file) => write!(f, "BlockDevice::Local({})", file.path()),
             #[cfg(feature = "spdk")]
             BlockDevice::Spdk(bdev) => write!(f, "BlockDevice::Spdk({})", bdev.name()),
+            #[cfg(feature = "io-uring")]
+            BlockDevice::IoUring(bdev) => write!(f, "BlockDevice::IoUring({})", bdev),
         }
     }
 }

@@ -53,7 +53,19 @@ pub use spdk_bdev::SpdkBdev;
 pub mod spdk_poller;
 
 #[cfg(feature = "spdk")]
-pub use spdk_poller::{CtrlHandle, PollerConfig};
+pub mod spdk_poller;
 
 #[cfg(not(feature = "spdk"))]
 pub mod spdk_poller_stub;
+
+#[cfg(feature = "io-uring")]
+pub mod io_uring_env;
+#[cfg(feature = "io-uring")]
+pub mod io_uring_bdev;
+#[cfg(feature = "io-uring")]
+pub use io_uring_bdev::IoUringBdev;
+
+#[cfg(not(feature = "io-uring"))]
+pub mod io_uring_stub;
+#[cfg(not(feature = "io-uring"))]
+pub use io_uring_stub::IoUringBdev;

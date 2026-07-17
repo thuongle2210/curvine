@@ -86,6 +86,10 @@ pub struct ClientConf {
     #[client_cli]
     pub short_circuit: bool,
 
+    /// Enable io_uring for local block I/O in short-circuit path (Linux only).
+    #[client_cli]
+    pub enable_io_uring: bool,
+
     #[serde(skip)]
     pub storage_type: StorageType,
     #[serde(alias = "storage_type")]
@@ -381,6 +385,7 @@ impl Default for ClientConf {
             max_cache_block_handles: 10,
 
             short_circuit: true,
+            enable_io_uring: false,
 
             storage_type: StorageType::Disk,
             storage_type_str: "disk".to_string(),

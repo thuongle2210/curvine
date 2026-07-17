@@ -19,7 +19,9 @@ use curvine_common::error::FsError;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
-use orpc::io::LocalFile;
+use orpc::io::{BlockDevice, BlockIO, LocalFile};
+#[cfg(feature = "io-uring")]
+use orpc::io::IoUringBdev;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::{CacheManager, DataSlice, RawPtr, ReadAheadTask};
 use orpc::{err_box, try_option};
@@ -31,7 +33,7 @@ pub struct BlockReaderLocal {
     os_cache: CacheManager,
     last_task: Option<ReadAheadTask>,
     block: ExtendedBlock,
-    file: RawPtr<LocalFile>,
+    file: RawPtr<BlockDevice>,
     worker_address: WorkerAddress,
     len: i64,
     req_id: i64,
@@ -66,7 +68,14 @@ impl BlockReaderLocal {
             .await?;
 
         let path = try_option!(read_context.path);
-        let file = LocalFile::with_read(&path, off as u64)?;
+        #[cfg(feature = "io-uring")]
+        let device = if fs_context.conf.client.enable_io_uring {
+            BlockDevice::IoUring(IoUringBdev::with_read(path, off as u64)?)
+        } else {
+            BlockDevice::Local(LocalFile::with_read(path, off as u64)?)
+        };
+        #[cfg(not(feature = "io-uring"))]
+        let device = BlockDevice::Local(LocalFile::with_read(path, off as u64)?);
 
         let reader = Self {
             rt: fs_context.clone_runtime(),
@@ -74,7 +83,7 @@ impl BlockReaderLocal {
             os_cache: fs_context.clone_os_cache(),
             last_task: None,
             block,
-            file: RawPtr::from_owned(file),
+            file: RawPtr::from_owned(device),
             worker_address: addr.clone(),
             len,
             req_id,
@@ -128,11 +137,6 @@ impl BlockReaderLocal {
         let mut chunk = self.get_chunk()?;
         let file = self.file.clone();
 
-        // Perform read-out.
-        self.last_task = file
-            .as_mut()
-            .read_ahead(&self.os_cache, self.last_task.take());
-
         let chunk = self
             .rt
             .spawn_blocking(move || {
@@ -145,10 +149,6 @@ impl BlockReaderLocal {
 
     pub fn blocking_read(&mut self) -> FsResult<DataSlice> {
         let mut chunk = self.get_chunk()?;
-        self.last_task = self
-            .file
-            .as_mut()
-            .read_ahead(&self.os_cache, self.last_task.take());
         self.file.as_mut().read_all(&mut chunk)?;
         Ok(DataSlice::buffer(chunk))
     }

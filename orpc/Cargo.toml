@@ -49,6 +49,14 @@ parking_lot = { workspace = true }
 [features]
 spdk = []
 spdk-rdma = ["spdk"]
+io-uring = ["dep:io-uring"]
+
+[dependencies.io-uring]
+version = "0.6"
+optional = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [build-dependencies]
 pkg-config = "0.3"
