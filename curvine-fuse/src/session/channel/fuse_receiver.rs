@@ -50,6 +50,8 @@ pub struct FuseReceiver<T> {
     audit_logging_enabled: bool,
     metrics_enabled: bool,
     pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+    #[cfg(feature = "io-uring")]
+    uring_reader: Option<crate::session::channel::IoUringFuseReader>,
 }
 
 impl<T: FileSystem> FuseReceiver<T> {
@@ -65,6 +67,8 @@ impl<T: FileSystem> FuseReceiver<T> {
         metrics_enabled: bool,
         pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
         enable_splice: bool,
+        #[cfg(feature = "io-uring")] enable_io_uring: bool,
+        #[cfg(feature = "io-uring")] io_uring_queue_depth: u32,
     ) -> IOResult<Self> {
         let pipe2 = if enable_splice {
             Some(Pipe2::new(PipeFd::new(buf_size, false, false)?)?)
@@ -72,6 +76,17 @@ impl<T: FileSystem> FuseReceiver<T> {
             None
         };
         let buf = BytesMut::zeroed(buf_size);
+
+        #[cfg(feature = "io-uring")]
+        let uring_reader = if enable_io_uring {
+            Some(crate::session::channel::IoUringFuseReader::new(
+                &kernel_fd,
+                io_uring_queue_depth,
+                buf_size,
+            )?)
+        } else {
+            None
+        };
 
         let client = Self {
             kernel_fd,
@@ -85,6 +100,8 @@ impl<T: FileSystem> FuseReceiver<T> {
             audit_logging_enabled,
             metrics_enabled,
             pending_requests,
+            #[cfg(feature = "io-uring")]
+            uring_reader,
         };
 
         Ok(client)
@@ -92,6 +109,13 @@ impl<T: FileSystem> FuseReceiver<T> {
 
     // Read a data from fuse.
     pub async fn receive(&mut self) -> IOResult<BytesMut> {
+        // io_uring path: use IORING_OP_READ on /dev/fuse (1 copy, more efficient)
+        #[cfg(feature = "io-uring")]
+        if let Some(reader) = &mut self.uring_reader {
+            return reader.receive().await;
+        }
+
+        // Existing splice/read path (2 copies via pipe, or direct read)
         if self.pipe2.is_some() {
             self.splice().await
         } else {

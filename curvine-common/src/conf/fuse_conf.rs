@@ -216,6 +216,16 @@ pub struct FuseConf {
     /// pipe management overhead). Default: true.
     pub enable_splice: bool,
 
+    /// Whether to use io_uring for FUSE request reception (read-only).
+    /// When enabled, the receiver uses IORING_OP_READ on /dev/fuse instead of
+    /// splice/read. This is more efficient (1 copy vs 2 copies for splice).
+    /// Requires Linux 6.14+ and the `io-uring` feature. Default: false.
+    pub enable_io_uring: bool,
+
+    /// io_uring queue depth for FUSE request reception.
+    /// Only used when `enable_io_uring` is true. Default: 8.
+    pub io_uring_queue_depth: u32,
+
     pub path_lock_stripes: usize,
 
     pub log: LogConf,
@@ -499,6 +509,8 @@ impl Default for FuseConf {
 
             list_limit: 1000,
             enable_splice: true,
+            enable_io_uring: false,
+            io_uring_queue_depth: 8,
 
             path_lock_stripes: 1024,
 

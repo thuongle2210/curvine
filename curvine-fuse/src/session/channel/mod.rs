@@ -27,6 +27,11 @@ pub use self::fuse_receiver::FuseReceiver;
 mod fuse_sender;
 pub use self::fuse_sender::FuseSender;
 
+#[cfg(feature = "io-uring")]
+mod fuse_receiver_uring;
+#[cfg(feature = "io-uring")]
+pub use self::fuse_receiver_uring::IoUringFuseReader;
+
 pub struct FuseChannel<T> {
     pub senders: Vec<FuseSender<T>>,
     pub receivers: Vec<FuseReceiver<T>>,
@@ -66,6 +71,10 @@ impl<T: FileSystem> FuseChannel<T> {
                 conf.metrics_enabled,
                 pending_requests.clone(),
                 conf.enable_splice,
+                #[cfg(feature = "io-uring")]
+                conf.enable_io_uring,
+                #[cfg(feature = "io-uring")]
+                conf.io_uring_queue_depth,
             )?;
 
             senders.push(sender);
