@@ -574,7 +574,7 @@ impl MasterFilesystem {
             fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len)?;
         let located = LocatedBlock {
             block,
-            locs: choose_workers,
+            locs: choose_workers
         };
 
         Ok(located)
@@ -784,11 +784,6 @@ impl MasterFilesystem {
                 invalidated: false,
             });
 
-        if report.invalidated {
-            report.update_time_ms = now;
-            return None;
-        }
-
         if report.total_len != list.total_len {
             warn!(
                 "full block report for worker {} restarted because total_len changed from {} to {}; discarding {} accumulated block ids",
@@ -801,6 +796,11 @@ impl MasterFilesystem {
             report.reported_blocks.clear();
             report.reported_blocks.reserve(list.total_len as usize);
             report.invalidated = false;
+        }
+
+        if report.invalidated {
+            report.update_time_ms = now;
+            return None;
         }
         report.update_time_ms = now;
 
