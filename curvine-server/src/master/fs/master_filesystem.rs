@@ -574,7 +574,7 @@ impl MasterFilesystem {
             fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len)?;
         let located = LocatedBlock {
             block,
-            locs: choose_workers
+            locs: choose_workers,
         };
 
         Ok(located)
