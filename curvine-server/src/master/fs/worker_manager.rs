@@ -17,8 +17,8 @@ use crate::master::fs::state::{BlockMap, WorkerMap};
 use crate::master::fs::DeleteResult;
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{
-    BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, WorkerAddress,
-    WorkerCommand, WorkerInfo, WorkerStatus,
+    BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, StorageType,
+    WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -53,6 +53,7 @@ impl WorkerManager {
         cluster_id: &str,
         status: HeartbeatStatus,
         addr: WorkerAddress,
+        weight: u32,
         storages: Vec<StorageInfo>,
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
@@ -85,7 +86,7 @@ impl WorkerManager {
             }
         };
 
-        self.worker_map.insert(addr, storages)?;
+        self.worker_map.insert(addr, weight, storages)?;
         Ok(cmds)
     }
 
@@ -168,9 +169,11 @@ impl WorkerManager {
         locs: &[BlockLocation],
     ) -> FsResult<LocatedBlock> {
         let mut addrs = Vec::with_capacity(locs.len());
+        let mut live_storage_types = Vec::with_capacity(locs.len());
         for loc in locs {
             if let Some(info) = self.get_worker(loc.worker_id) {
                 addrs.push(info.address.clone());
+                live_storage_types.push(loc.storage_type);
             } else {
                 warn!(
                     "File {} block {}, worker {} replicas has been lost",
@@ -189,9 +192,29 @@ impl WorkerManager {
             );
         }
 
-        let lb = LocatedBlock { block, locs: addrs };
+        let has_spdk = live_storage_types.contains(&StorageType::SpdkDisk);
+        let lb = LocatedBlock {
+            block,
+            locs: addrs,
+            has_spdk,
+        };
 
         Ok(lb)
+    }
+
+    pub fn workers_have_spdk(&self, addrs: &[WorkerAddress]) -> bool {
+        for addr in addrs {
+            if let Some(info) = self.get_worker(addr.worker_id) {
+                if info
+                    .storage_map
+                    .values()
+                    .any(|s| s.storage_type == StorageType::SpdkDisk)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn add_test_worker(&mut self, worker: WorkerInfo) {

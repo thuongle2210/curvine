@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{FileUtils, LocalTime};
+use crate::common::LocalTime;
 use crate::runtime::Runtime;
 use crate::CommonResult;
 use md5::{Digest, Md5};
@@ -148,8 +148,9 @@ impl Utils {
         let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
         path.push("../testing");
 
-        // Ensure the testing directory exists
-        let _ = FileUtils::create_parent_dir(&path, true);
+        // Create the testing/ directory itself (create_parent_dir would only
+        // ensure the parent of ../testing, i.e. the workspace root).
+        fs::create_dir_all(&path).expect("failed to create testing/ for Utils::test_file");
 
         path.push(format!("test-{}", Self::rand_id()));
         format!("{}", path.display())
@@ -161,7 +162,9 @@ impl Utils {
         path.push(sub);
 
         // Ensure the sub directory exists
-        let _ = fs::create_dir_all(&path);
+        fs::create_dir_all(&path).unwrap_or_else(|e| {
+            panic!("failed to create testing sub dir {}: {}", path.display(), e);
+        });
 
         format!("{}", path.display())
     }
@@ -355,5 +358,60 @@ mod tests {
     fn cur_dir() {
         let dir = Utils::cur_dir_sub("meta");
         println!("{}", dir)
+    }
+
+    #[test]
+    fn test_file_creates_testing_directory() {
+        use std::path::Path;
+
+        let path = Utils::test_file();
+        let parent = Path::new(&path).parent().expect("test file has parent");
+        assert!(
+            parent.is_dir(),
+            "Utils::test_file must create testing/; missing {:?}",
+            parent
+        );
+        // Ensure the returned path is writable (the original ENOENT failure mode).
+        std::fs::File::create(&path).expect("should be able to create file under testing/");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression for #1184: from a clean CWD where `../testing` does not yet
+    /// exist, `test_file()` must create it and return a path under it.
+    #[test]
+    fn test_file_creates_testing_dir() {
+        use std::env;
+        use std::fs;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        // Serialize CWD mutations across parallel tests in this crate.
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap();
+
+        let base = env::temp_dir().join(format!("orpc-test-file-{}", Utils::rand_id()));
+        let work = base.join("crate_cwd");
+        fs::create_dir_all(&work).unwrap();
+
+        let testing = base.join("testing");
+        assert!(!testing.exists());
+
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(&work).unwrap();
+
+        let file = Utils::test_file();
+        let parent = Path::new(&file)
+            .parent()
+            .and_then(|p| p.canonicalize().ok());
+        let testing_canon = testing.canonicalize().ok();
+        let ok = testing.is_dir() && parent == testing_canon;
+
+        env::set_current_dir(prev).unwrap();
+        let _ = fs::remove_dir_all(&base);
+
+        assert!(
+            ok,
+            "test_file() must create ../testing and place the file under it"
+        );
     }
 }
