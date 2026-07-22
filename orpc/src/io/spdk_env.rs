@@ -148,6 +148,12 @@ impl QpairPool {
         }
 
         // Slow path: block if at THIS controller's capacity, then allocate
+        // Todo: optimize this path
+        // - backoff
+        // - Progressive Backoff
+        // - Proactive read_parallel Cap
+        // - Client-Side Backpressure Propagation
+        // - Qpair Pool Warm-Up at Init   
         let deadline = Instant::now() + Self::ACQUIRE_TIMEOUT;
         let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         loop {
