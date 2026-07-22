@@ -812,6 +812,11 @@ impl MasterFilesystem {
             report.reported_blocks.reserve(list.total_len as usize);
             report.invalidated = false;
         }
+
+        if report.invalidated {
+            report.update_time_ms = now;
+            return None;
+        }
         report.update_time_ms = now;
 
         for block in &list.blocks {
