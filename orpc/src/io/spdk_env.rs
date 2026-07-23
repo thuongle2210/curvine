@@ -89,8 +89,6 @@ pub struct QpairPool {
     notify: Condvar,
     /// Idle cache limit per controller (soft — excess freed on release).
     max_per_ctrlr: usize,
-    /// Fallback limit before controllers are registered via register_limit().
-    default_max_active: usize,
 }
 
 // SAFETY: exclusive ownership
@@ -100,8 +98,6 @@ unsafe impl Sync for QpairPool {}
 impl QpairPool {
     /// Default max idle qpairs per controller (soft cache limit).
     const DEFAULT_MAX_PER_CTRLR: usize = 16;
-    /// Default max active qpairs per controller before register_limit() is called.
-    const DEFAULT_MAX_ACTIVE: usize = 128;
     /// Timeout for blocking acquire when at capacity.
     const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -111,17 +107,23 @@ impl QpairPool {
             ctrl_state: Mutex::new(HashMap::new()),
             notify: Condvar::new(),
             max_per_ctrlr: Self::DEFAULT_MAX_PER_CTRLR,
-            default_max_active: Self::DEFAULT_MAX_ACTIVE,
         }
     }
 
-    /// Register the per-controller qpair limit after controller attachment.
-    /// `io_queues` comes from `NvmeTarget.io_queues`.
-    fn register_limit(&self, ctrlr_ptr: usize, io_queues: u32) {
-        let limit = if io_queues > 0 {
-            io_queues as usize
+    /// Register the per-controller qpair limit from the actual negotiated IO queue count.
+    /// `actual_io_queues` is queried from SPDK after controller initialization via
+    /// `spdk_nvme_ctrlr_get_opts()->num_io_queues`.
+    fn register_limit(&self, ctrlr_ptr: usize, actual_io_queues: u32) {
+        let limit = if actual_io_queues > 0 {
+            actual_io_queues as usize
         } else {
-            Self::DEFAULT_MAX_ACTIVE
+            // SPDK bumps 0→1 internally, but if negotiation yields 0 (shouldn't happen),
+            // fall back to a safe minimum.
+            warn!(
+                "QpairPool: ctrlr {:p} has 0 negotiated IO queues, using fallback limit 1",
+                ctrlr_ptr as *const ()
+            );
+            1
         };
         let mut state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         state.insert(ctrlr_ptr, CtrlQpairState::new(limit));
@@ -305,7 +307,7 @@ impl QpairPool {
                 );
             }
         } // inner lock dropped here
-        self.dec_active(key);
+        self.release_reservation(key);
         QPAIR_ACTIVE.dec();
         self.notify.notify_one(); // safe to call without holding inner lock
     }
@@ -352,7 +354,7 @@ impl QpairPool {
         if let Some(s) = state.get(&ctrlr_ptr) {
             (s.active.load(Ordering::Acquire), s.max_active)
         } else {
-            (0, self.default_max_active)
+            (0, 0)
         }
     }
 }
@@ -857,10 +859,24 @@ impl SpdkEnv {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    // Register per-controller qpair limit from NvmeTarget.io_queues
+                    // Register per-controller qpair limit from actual negotiated IO queue count.
+                    // Query SPDK for the real count after controller initialization — this
+                    // accounts for controller negotiation and SPDK's own defaults.
                     if let Some(first) = bdevs.first() {
+                        let actual_io_queues = unsafe {
+                            spdk_ffi::curvine_spdk_ctrlr_get_num_io_queues(
+                                first.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr,
+                            )
+                        };
+                        info!(
+                            "Target[{}] {}: requested io_queues={}, actual negotiated={}",
+                            i,
+                            target.endpoint(),
+                            target.io_queues,
+                            actual_io_queues
+                        );
                         self.qpair_pool
-                            .register_limit(first.ctrlr, target.io_queues);
+                            .register_limit(first.ctrlr, actual_io_queues);
                     }
                     all_bdevs.extend(bdevs);
                 }
@@ -1393,7 +1409,6 @@ mod test {
             ctrl_state: Mutex::new(HashMap::new()),
             notify: Condvar::new(),
             max_per_ctrlr: 2,
-            default_max_active: QpairPool::DEFAULT_MAX_ACTIVE,
         };
         push(&p, 1);
         push(&p, 1);
