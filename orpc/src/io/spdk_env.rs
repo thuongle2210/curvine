@@ -170,9 +170,11 @@ impl QpairPool {
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
     ) -> CommonResult<*mut spdk_ffi::spdk_nvme_qpair> {
         let key = ctrlr as usize;
+        let mut reserved = false;
 
         // Fast path: check capacity, then try pool without blocking
         if self.try_reserve(key) {
+            reserved = true;
             let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(stack) = pool.get_mut(&key) {
                 if let Some(qpair) = stack.pop() {
@@ -185,7 +187,7 @@ impl QpairPool {
                     return Ok(qpair);
                 }
             }
-            // No cached qpair available — fall through to slow path with slot already reserved
+            // No cached qpair — fall through to slow path with slot already reserved
         } else {
             log::trace!(
                 "QpairPool: fast path blocked for ctrlr {:p} (at capacity)",
@@ -206,7 +208,6 @@ impl QpairPool {
             // Check pool again (release may have returned a qpair while we waited)
             if let Some(stack) = pool.get_mut(&key) {
                 if let Some(qpair) = stack.pop() {
-                    // Slot already reserved (by try_reserve above or previous loop iteration)
                     QPAIR_ACTIVE.inc();
                     log::trace!(
                         "QpairPool: reusing cached qpair for ctrlr {:p} after wait",
@@ -216,8 +217,15 @@ impl QpairPool {
                 }
             }
 
-            // Try to reserve a slot atomically (CAS — prevents active > limit race)
-            if self.try_reserve(key) {
+            // Try to reserve a slot atomically (CAS — prevents active > limit race).
+            // Skip if already reserved by fast path to avoid double-reservation.
+            if !reserved {
+                if self.try_reserve(key) {
+                    reserved = true;
+                }
+            }
+
+            if reserved {
                 break;
             }
 
@@ -245,7 +253,7 @@ impl QpairPool {
             QPAIR_EXHAUSTION_WAIT_US.observe(elapsed_us);
         }
 
-        // Slot reserved via try_reserve — allocate the qpair
+        // Slot reserved (by fast path or slow path) — allocate the qpair
         drop(pool);
         let qpair = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
         if qpair.is_null() {
