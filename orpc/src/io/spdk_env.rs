@@ -245,7 +245,7 @@ impl QpairPool {
                     ctrlr,
                 );
             }
-            QPAIR_EXHAUSTION_WAITS.inc(); // count once per blocking event, not per wakeup
+            QPAIR_EXHAUSTION_WAITS.inc(); // count per wait attempt
             let wait_start = now;
             let remaining = deadline.duration_since(now);
             log::trace!("QpairPool: ctrlr {:p} at capacity, waiting...", ctrlr,);
