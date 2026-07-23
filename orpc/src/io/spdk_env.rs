@@ -133,9 +133,9 @@ impl QpairPool {
         );
     }
 
+    // TODO: Arc<CtrlQpairState> — release_reservation() blocked by CAS loop under contention
     /// Atomically reserve a slot for this controller.
-    /// Returns true if reserved (active < max_active), false if at capacity.
-    /// Uses CAS loop to prevent races — no Mutex needed.
+    /// Returns true if reserved (active < max_active), false at capacity.
     fn try_reserve(&self, ctrlr_ptr: usize) -> bool {
         let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = state.get(&ctrlr_ptr) {
@@ -210,20 +210,9 @@ impl QpairPool {
         let deadline = Instant::now() + Self::ACQUIRE_TIMEOUT;
         let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         loop {
-            // Check pool again (release may have returned a qpair while we waited)
-            if let Some(stack) = pool.get_mut(&key) {
-                if let Some(qpair) = stack.pop() {
-                    QPAIR_ACTIVE.inc();
-                    log::trace!(
-                        "QpairPool: reusing cached qpair for ctrlr {:p} after wait",
-                        ctrlr,
-                    );
-                    return Ok(qpair);
-                }
-            }
-
             // Try to reserve a slot atomically (CAS — prevents active > limit race).
-            // Skip if already reserved by fast path to avoid double-reservation.
+            // Must happen before pool check to ensure active count is incremented
+            // when returning a cached qpair.
             if !reserved {
                 if self.try_reserve(key) {
                     reserved = true;
@@ -231,6 +220,18 @@ impl QpairPool {
             }
 
             if reserved {
+                // Slot reserved — check pool for a cached qpair to reuse
+                if let Some(stack) = pool.get_mut(&key) {
+                    if let Some(qpair) = stack.pop() {
+                        QPAIR_ACTIVE.inc();
+                        log::trace!(
+                            "QpairPool: reusing cached qpair for ctrlr {:p} after wait",
+                            ctrlr,
+                        );
+                        return Ok(qpair);
+                    }
+                }
+                // No cached qpair — break out and allocate a new one via FFI
                 break;
             }
 
@@ -1511,6 +1512,42 @@ mod test {
         p.register_limit(ctrlr as usize, 128);
         let (_, limit) = p.controller_stats(ctrlr as usize);
         assert_eq!(limit, 128);
+    }
+
+    #[test]
+    fn acquire_slow_path_increments_active() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let p = Arc::new(QpairPool::new());
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        p.register_limit(ctrlr as usize, 1);
+
+        // Fill capacity directly
+        assert!(p.try_reserve(ctrlr as usize)); // active = 1
+
+        // Spawn a thread that releases after a delay
+        let p2 = Arc::clone(&p);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            // Push a cached qpair then release the slot
+            push(&p2, ctrlr as usize);
+            p2.release_reservation(ctrlr as usize); // active = 0
+            p2.notify.notify_one();
+        });
+
+        // acquire() enters slow path (fast path fails, at capacity),
+        // waits on condvar, wakes up, reserves slot (active=1),
+        // pops cached qpair and returns.
+        let result = p.acquire(ctrlr);
+        assert!(result.is_ok());
+
+        // Verify active count is correct (1, not 0 as with the old bug)
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+
+        handle.join().unwrap();
     }
 
     mod config_tests {
