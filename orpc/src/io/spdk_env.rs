@@ -224,7 +224,6 @@ impl QpairPool {
             // At THIS controller's capacity — wait for a release
             let now = Instant::now();
             if now >= deadline {
-                QPAIR_EXHAUSTION_WAITS.inc();
                 return err_box!(
                     "QpairPool: timeout after {:?} waiting for qpair on ctrlr {:p} \
                      This indicates qpair exhaustion under high concurrency. \
@@ -233,7 +232,7 @@ impl QpairPool {
                     ctrlr,
                 );
             }
-            QPAIR_EXHAUSTION_WAITS.inc();
+            QPAIR_EXHAUSTION_WAITS.inc(); // count once per blocking event, not per wakeup
             let wait_start = now;
             let remaining = deadline.duration_since(now);
             log::trace!("QpairPool: ctrlr {:p} at capacity, waiting...", ctrlr,);
