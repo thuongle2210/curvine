@@ -150,8 +150,11 @@ impl QpairPool {
                 }
             }
         } else {
-            // No state registered — allow (uses default_max_active via caller)
-            true
+            error!(
+                "QpairPool: try_reserve called for unregistered ctrlr {:p}",
+                ctrlr_ptr as *const ()
+            );
+            false
         }
     }
 
