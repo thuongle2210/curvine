@@ -215,6 +215,7 @@ impl QpairPool {
         // - Qpair Pool Warm-Up at Init
         let deadline = Instant::now() + Self::ACQUIRE_TIMEOUT;
         let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut notified = true; // first iteration always checks pool
         loop {
             // Try to reserve a slot atomically (CAS — prevents active > limit race).
             // Must happen before pool check to ensure active count is incremented
@@ -226,15 +227,19 @@ impl QpairPool {
             }
 
             if reserved {
-                // Slot reserved — check pool for a cached qpair to reuse
-                if let Some(stack) = pool.get_mut(&key) {
-                    if let Some(qpair) = stack.pop() {
-                        QPAIR_ACTIVE.inc();
-                        log::trace!(
-                            "QpairPool: reusing cached qpair for ctrlr {:p} after wait",
-                            ctrlr,
-                        );
-                        return Ok(qpair);
+                // Slot reserved — check pool for a cached qpair to reuse.
+                // Skip if no notification was received (spurious wakeup / timeout)
+                // to avoid a pointless HashMap lookup.
+                if notified {
+                    if let Some(stack) = pool.get_mut(&key) {
+                        if let Some(qpair) = stack.pop() {
+                            QPAIR_ACTIVE.inc();
+                            log::trace!(
+                                "QpairPool: reusing cached qpair for ctrlr {:p} after wait",
+                                ctrlr,
+                            );
+                            return Ok(qpair);
+                        }
                     }
                 }
                 // No cached qpair — break out and allocate a new one via FFI
@@ -261,6 +266,7 @@ impl QpairPool {
                 .wait_timeout(pool, remaining)
                 .unwrap_or_else(|p| p.into_inner());
             pool = result.0;
+            notified = result.1;
             let elapsed_us = wait_start.elapsed().as_micros() as f64;
             QPAIR_EXHAUSTION_WAIT_US.observe(elapsed_us);
         }
