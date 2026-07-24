@@ -717,6 +717,25 @@ impl SpdkEnv {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
+                    // Register per-controller qpair limit from actual negotiated IO queue count.
+                    // Query SPDK for the real count after controller initialization — this
+                    // accounts for controller negotiation and SPDK's own defaults.
+                    if let Some(first) = bdevs.first() {
+                        let actual_io_queues = unsafe {
+                            spdk_ffi::curvine_spdk_ctrlr_get_num_io_queues(
+                                first.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr,
+                            )
+                        };
+                        info!(
+                            "Target[{}] {}: requested io_queues={}, actual negotiated={}",
+                            i,
+                            target.endpoint(),
+                            target.io_queues,
+                            actual_io_queues
+                        );
+                        self.qpair_pool
+                            .register_limit(first.ctrlr, actual_io_queues);
+                    }
                     all_bdevs.extend(bdevs);
                 }
                 Err(e) => {
