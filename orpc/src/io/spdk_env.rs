@@ -100,6 +100,47 @@ impl QpairPool {
         }
     }
 
+    // TODO: Arc<CtrlQpairState> — release_reservation() blocked by CAS loop under contention
+    /// Atomically reserve a slot for this controller.
+    /// Returns true if reserved (active < max_active), false at capacity.
+    fn try_reserve(&self, ctrlr_ptr: usize) -> bool {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = state.get(&ctrlr_ptr) {
+            loop {
+                let cur = s.active.load(Ordering::Acquire);
+                if cur >= s.max_active {
+                    return false;
+                }
+                if s.active
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+        } else {
+            error!(
+                "QpairPool: try_reserve called for unregistered ctrlr {:p}",
+                ctrlr_ptr as *const ()
+            );
+            false
+        }
+    }
+
+    /// Release a previously reserved slot.
+    fn release_reservation(&self, ctrlr_ptr: usize) {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = state.get(&ctrlr_ptr) {
+            s.active.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            warn!(
+                "QpairPool: release_reservation for unregistered ctrlr {:p} \
+                 (no active count to decrement — possible double-release or release without acquire)",
+                ctrlr_ptr as *const ()
+            );
+        }
+    }
+
     /// Acquire qpair - returns cached or allocates new
     fn acquire(
         &self,
@@ -1281,6 +1322,72 @@ mod test {
         let (active_c, limit_c) = p.controller_stats(0x3000);
         assert_eq!(active_c, 0);
         assert_eq!(limit_c, 0);
+    }
+
+    #[test]
+    fn try_reserve_respects_limit() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        p.register_limit(ctrlr as usize, 2);
+
+        // Reserve up to limit
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 2);
+
+        // At limit — should fail
+        assert!(!p.try_reserve(ctrlr as usize));
+
+        // Release one — should succeed again
+        p.release_reservation(ctrlr as usize);
+        assert!(p.try_reserve(ctrlr as usize));
+    }
+
+    #[test]
+    fn release_returns_qpair_to_pool() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        p.register_limit(ctrlr as usize, 4);
+
+        // Reserve a slot (simulating acquire path)
+        assert!(p.try_reserve(ctrlr as usize)); // active = 1
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+
+        // Release — qpair goes to pool, active decrements
+        p.release(ctrlr, qpair);
+
+        assert_eq!(cnt(&p, ctrlr as usize), 1);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn release_active_count_decremented() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+
+        p.register_limit(ctrlr as usize, 4);
+
+        // Reserve 3 slots
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 3);
+
+        // Release all 3
+        for i in 0..3 {
+            let qpair = (0x2000 + i) as *mut spdk_ffi::spdk_nvme_qpair;
+            p.release(ctrlr, qpair);
+        }
+
+        assert_eq!(cnt(&p, ctrlr as usize), 3);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
     }
 
     mod config_tests {
