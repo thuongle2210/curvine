@@ -1610,6 +1610,76 @@ mod test {
         assert!(msg.contains("shutdown"), "error should mention shutdown: {}", msg);
     }
 
+    #[test]
+    fn acquire_fast_path_returns_cached_qpair() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 4);
+
+        // Push a cached qpair to the pool
+        push(&p, ctrlr as usize);
+        assert_eq!(cnt(&p, ctrlr as usize), 1);
+
+        // acquire() fast path: try_reserve succeeds, finds cached qpair, returns it
+        let result = p.acquire(ctrlr);
+        assert!(result.is_ok());
+
+        // Pool should be empty (qpair popped)
+        assert_eq!(cnt(&p, ctrlr as usize), 0);
+        // Active should be 1 (reserved + returned)
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    #[ignore = "requires SPDK — curvine_spdk_alloc_io_qpair FFI"]
+    fn acquire_ffi_failure_rolls_back_active() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 1);
+
+        // Fill capacity so acquire must allocate via FFI
+        assert!(p.try_reserve(ctrlr as usize));
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+
+        // acquire() will try reserve (fail), then FFI alloc (fail without SPDK)
+        // On failure, active should be decremented back
+        // NOTE: This test will crash without SPDK, hence #[ignore]
+        let _ = p.acquire(ctrlr);
+
+        // After FFI failure, active should be back to 0
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    #[ignore = "requires SPDK — curvine_spdk_free_io_qpair FFI"]
+    fn release_pool_full_frees_qpair() {
+        let p = QpairPool {
+            inner: Mutex::new(HashMap::new()),
+            ctrl_state: Mutex::new(HashMap::new()),
+            notify: Condvar::new(),
+            max_per_ctrlr: 2,
+            shutdown: AtomicBool::new(false),
+        };
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 4);
+
+        // Fill pool to capacity
+        push(&p, ctrlr as usize);
+        push(&p, ctrlr as usize);
+        assert_eq!(cnt(&p, ctrlr as usize), 2);
+
+        // release() with pool full → should free via FFI, not push
+        // NOTE: This test will crash without SPDK, hence #[ignore]
+        let qpair = 0x3000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        p.release(ctrlr, qpair);
+
+        // Pool should still have 2 (not 3) — the 3rd was freed
+        assert_eq!(cnt(&p, ctrlr as usize), 2);
+    }
+
     mod config_tests {
         use super::*;
 
