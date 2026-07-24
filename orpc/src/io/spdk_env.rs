@@ -1,6 +1,7 @@
 #![cfg(feature = "spdk")]
 
 use crate::common::DurationUnit;
+use crate::common::{Counter, Gauge, Histogram, Metrics as m};
 use crate::err_msg;
 use crate::io::spdk_ffi;
 use crate::io::spdk_poller::{CtrlHandle, PollerConfig};
@@ -8,6 +9,7 @@ use crate::io::spdk_poller::{IoRequest, SpdkPoller};
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
 use nix::sys::eventfd::EventFd;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -21,7 +23,38 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 // Lazy allocate, cache on release.
 // Per-controller limits derived from NvmeTarget.io_queues.
+// Blocks new acquisitions when THIS controller's active count reaches its limit,
+// providing backpressure instead of failing with EIO.
 // ---------------------------------------------------------------------------
+
+// --- Observability metrics ---
+
+static QPAIR_ACTIVE: Lazy<Gauge> = Lazy::new(|| m::new_gauge("qpair_active_count", "Number of in-use NVMe qpairs").unwrap());
+static QPAIR_EXHAUSTION_WAITS: Lazy<Counter> = Lazy::new(|| {
+    m::new_counter(
+        "qpair_exhaustion_waits_total",
+        "Total times QpairPool::acquire blocked due to per-controller capacity",
+    )
+    .unwrap()
+});
+static QPAIR_EXHAUSTION_WAIT_US: Lazy<Histogram> = Lazy::new(|| {
+    m::new_histogram_with_buckets(
+        "qpair_exhaustion_wait_duration_us",
+        "Duration (us) QpairPool::acquire blocked waiting for a qpair",
+        &[
+            100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0, 100_000.0, 500_000.0,
+            1_000_000.0,
+        ],
+    )
+    .unwrap()
+});
+static QPAIR_ALLOC_FAILURES: Lazy<Counter> = Lazy::new(|| {
+    m::new_counter(
+        "qpair_alloc_failures_total",
+        "Total NVMe qpair allocation failures (FFI returned null)",
+    )
+    .unwrap()
+});
 
 // --- Per-controller qpair state ---
 
@@ -156,6 +189,7 @@ impl QpairPool {
             let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(stack) = pool.get_mut(&key) {
                 if let Some(qpair) = stack.pop() {
+                    QPAIR_ACTIVE.inc();
                     log::trace!(
                         "QpairPool: reusing cached qpair for ctrlr {:p} (pool size now {})",
                         ctrlr,
@@ -189,6 +223,7 @@ impl QpairPool {
                 // Slot reserved — check pool for a cached qpair to reuse
                 if let Some(stack) = pool.get_mut(&key) {
                     if let Some(qpair) = stack.pop() {
+                        QPAIR_ACTIVE.inc();
                         log::trace!(
                             "QpairPool: reusing cached qpair for ctrlr {:p} after wait",
                             ctrlr,
@@ -217,6 +252,8 @@ impl QpairPool {
                     ctrlr,
                 );
             }
+            QPAIR_EXHAUSTION_WAITS.inc();
+            let wait_start = now;
             let remaining = deadline.duration_since(now);
             log::trace!("QpairPool: ctrlr {:p} at capacity, waiting...", ctrlr,);
             pool = self
@@ -224,6 +261,8 @@ impl QpairPool {
                 .wait_timeout(pool, remaining)
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
+            let elapsed_us = wait_start.elapsed().as_micros() as f64;
+            QPAIR_EXHAUSTION_WAIT_US.observe(elapsed_us);
         }
 
         // Slot reserved (by fast path or slow path) — allocate the qpair
@@ -231,6 +270,7 @@ impl QpairPool {
         let qpair = unsafe { spdk_ffi::curvine_spdk_alloc_io_qpair(ctrlr) };
         if qpair.is_null() {
             self.release_reservation(key);
+            QPAIR_ALLOC_FAILURES.inc();
             return err_box!(
                 "QpairPool: failed to allocate I/O qpair for ctrlr {:p}. \
                  This may indicate qpair exhaustion under high concurrency. \
@@ -238,6 +278,7 @@ impl QpairPool {
                 ctrlr
             );
         }
+        QPAIR_ACTIVE.inc();
         log::trace!("QpairPool: allocated new qpair for ctrlr {:p}", ctrlr);
         Ok(qpair)
     }
@@ -273,6 +314,7 @@ impl QpairPool {
             }
         } // inner lock dropped here
         self.release_reservation(key);
+        QPAIR_ACTIVE.dec();
         self.notify.notify_one(); // safe to call without holding inner lock
     }
     /// Free all pooled qpairs. Only frees cached (idle) qpairs — active/in-flight
