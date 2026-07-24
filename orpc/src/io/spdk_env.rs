@@ -165,6 +165,12 @@ impl QpairPool {
         let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = state.get(&ctrlr_ptr) {
             s.active.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            warn!(
+                "QpairPool: release_reservation for unregistered ctrlr {:p} \
+                 (no active count to decrement — possible double-release or release without acquire)",
+                ctrlr_ptr as *const ()
+            );
         }
     }
 
@@ -1404,24 +1410,49 @@ mod test {
         assert_eq!(cnt(&p, 2), 1);
     }
     #[test]
-    fn cap() {
-        let p = QpairPool {
-            inner: Mutex::new(HashMap::new()),
-            ctrl_state: Mutex::new(HashMap::new()),
-            notify: Condvar::new(),
-            max_per_ctrlr: 2,
-        };
-        push(&p, 1);
-        push(&p, 1);
-        assert!(cnt(&p, 1) >= 2);
-    }
-    #[test]
-    fn drain() {
+    fn release_returns_qpair_to_pool() {
         let p = QpairPool::new();
-        push(&p, 1);
-        push(&p, 2);
-        p.inner.lock().unwrap().drain();
-        assert_eq!(tot(&p), 0);
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        p.register_limit(ctrlr as usize, 4);
+
+        // Reserve a slot (simulating acquire path)
+        assert!(p.try_reserve(ctrlr as usize)); // active = 1
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
+
+        // Release — qpair goes to pool, active decrements
+        p.release(ctrlr, qpair);
+
+        assert_eq!(cnt(&p, ctrlr as usize), 1);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn release_active_count_decremented() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+
+        p.register_limit(ctrlr as usize, 4);
+
+        // Reserve 3 slots
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        assert!(p.try_reserve(ctrlr as usize));
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 3);
+
+        // Release all 3
+        for i in 0..3 {
+            let qpair = (0x2000 + i) as *mut spdk_ffi::spdk_nvme_qpair;
+            p.release(ctrlr, qpair);
+        }
+
+        assert_eq!(cnt(&p, ctrlr as usize), 3);
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 0);
     }
     #[test]
     fn concurrent() {
