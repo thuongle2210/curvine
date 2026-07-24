@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -89,6 +89,8 @@ pub struct QpairPool {
     notify: Condvar,
     /// Idle cache limit per controller (soft — excess freed on release).
     max_per_ctrlr: usize,
+    /// Set by `drain_all()` during shutdown; causes `acquire()` to fail fast.
+    shutdown: AtomicBool,
 }
 
 // SAFETY: exclusive ownership
@@ -107,6 +109,7 @@ impl QpairPool {
             ctrl_state: Mutex::new(HashMap::new()),
             notify: Condvar::new(),
             max_per_ctrlr: Self::DEFAULT_MAX_PER_CTRLR,
+            shutdown: AtomicBool::new(false),
         }
     }
 
@@ -247,6 +250,12 @@ impl QpairPool {
             }
 
             // At THIS controller's capacity — wait for a release
+            if self.shutdown.load(Ordering::Acquire) {
+                return err_box!(
+                    "QpairPool: shutdown in progress, acquire rejected for ctrlr {:p}",
+                    ctrlr,
+                );
+            }
             let now = Instant::now();
             if now >= deadline {
                 return err_box!(
@@ -328,6 +337,7 @@ impl QpairPool {
     /// Free all pooled qpairs. Only frees cached (idle) qpairs — active/in-flight
     /// qpairs are tracked by their owners and will be released normally.
     fn drain_all(&self) {
+        self.shutdown.store(true, Ordering::Release);
         let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut total = 0usize;
         for (_ctrlr_key, qpairs) in pool.drain() {
