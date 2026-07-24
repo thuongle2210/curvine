@@ -218,7 +218,6 @@ impl QpairPool {
         // - Qpair Pool Warm-Up at Init
         let deadline = Instant::now() + Self::ACQUIRE_TIMEOUT;
         let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let mut notified = true; // first iteration always checks pool
         loop {
             // Try to reserve a slot atomically (CAS — prevents active > limit race).
             // Must happen before pool check to ensure active count is incremented
@@ -230,19 +229,15 @@ impl QpairPool {
             }
 
             if reserved {
-                // Slot reserved — check pool for a cached qpair to reuse.
-                // Skip if no notification was received (spurious wakeup / timeout)
-                // to avoid a pointless HashMap lookup.
-                if notified {
-                    if let Some(stack) = pool.get_mut(&key) {
-                        if let Some(qpair) = stack.pop() {
-                            QPAIR_ACTIVE.inc();
-                            log::trace!(
-                                "QpairPool: reusing cached qpair for ctrlr {:p} after wait",
-                                ctrlr,
-                            );
-                            return Ok(qpair);
-                        }
+                // Slot reserved — check pool for a cached qpair to reuse
+                if let Some(stack) = pool.get_mut(&key) {
+                    if let Some(qpair) = stack.pop() {
+                        QPAIR_ACTIVE.inc();
+                        log::trace!(
+                            "QpairPool: reusing cached qpair for ctrlr {:p} after wait",
+                            ctrlr,
+                        );
+                        return Ok(qpair);
                     }
                 }
                 // No cached qpair — break out and allocate a new one via FFI
@@ -270,12 +265,11 @@ impl QpairPool {
             let wait_start = now;
             let remaining = deadline.duration_since(now);
             log::trace!("QpairPool: ctrlr {:p} at capacity, waiting...", ctrlr,);
-            let result = self
+            pool = self
                 .notify
                 .wait_timeout(pool, remaining)
-                .unwrap_or_else(|p| p.into_inner());
-            pool = result.0;
-            notified = result.1;
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
             let elapsed_us = wait_start.elapsed().as_micros() as f64;
             QPAIR_EXHAUSTION_WAIT_US.observe(elapsed_us);
         }
@@ -1595,6 +1589,25 @@ mod test {
         assert_eq!(active, 1);
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn acquire_rejects_after_shutdown() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 1);
+
+        // Fill capacity so acquire enters slow path
+        assert!(p.try_reserve(ctrlr as usize)); // active = 1
+
+        // Simulate shutdown
+        p.drain_all();
+
+        // acquire should fail immediately, not block for 30s
+        let result = p.acquire(ctrlr);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("shutdown"), "error should mention shutdown: {}", msg);
     }
 
     mod config_tests {
