@@ -28,7 +28,9 @@ mod worker_node_tree;
 pub use self::worker_node_tree::WorkerNodeTree;
 
 mod file_type;
-pub use self::file_type::FileType;
+pub use self::file_type::{
+    is_special_file_type, FileType, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
+};
 
 mod ttl_action;
 pub use self::ttl_action::TtlAction;
@@ -43,7 +45,7 @@ mod block_info;
 pub use self::block_info::*;
 
 mod file_status;
-pub use self::file_status::FileStatus;
+pub use self::file_status::{FileStatus, INTERNAL_CTIME_XATTR};
 
 mod master_info;
 pub use self::master_info::MasterInfo;

@@ -35,6 +35,10 @@ enum FileTypeProto {
     FILE_TYPE_PROTO_STREAM = 3;
     FILE_TYPE_PROTO_AGG = 4;
     FILE_TYPE_PROTO_OBJECT = 5;
+    FILE_TYPE_PROTO_FIFO = 6;
+    FILE_TYPE_PROTO_CHAR = 7;
+    FILE_TYPE_PROTO_BLOCK = 8;
+    FILE_TYPE_PROTO_SOCKET = 9;
 }
 
 enum StorageStateProto {
@@ -73,6 +77,7 @@ message FileStatusProto {
     required uint32 mode = 17;
     optional string target = 18;
     required uint32 nlink = 19;
+    optional int64 ctime = 20; // Metadata change time in milliseconds
 }
 
 // Describe the worker address information.

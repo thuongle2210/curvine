@@ -14,7 +14,7 @@
 
 #![allow(unused_variables)]
 
-use crate::fs::operator::{Create, MkDir};
+use crate::fs::operator::{Create, MkDir, MkNod};
 use crate::raw::fuse_abi::{fuse_attr, fuse_entry_out, fuse_setattr_in};
 use crate::*;
 use bytes::BytesMut;
@@ -23,12 +23,13 @@ use curvine_common::conf::FuseConf;
 use curvine_common::fs::Path;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
-    SetAttrOpts,
+    SetAttrOpts, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
 };
 use orpc::common::LocalTime;
 use orpc::io::IOResult;
 use orpc::sys;
 use orpc::sys::{FFIUtils, RawIO};
+use std::collections::HashMap;
 use std::process::Command;
 use std::slice;
 
@@ -112,16 +113,48 @@ impl FuseUtils {
     }
 
     pub fn get_mode(perm: u32, typ: FileType) -> u32 {
-        // Strip any file-type / stray high bits before OR-ing the correct type bit.
         let perm = perm & 0o7777;
         match typ {
             FileType::Dir => perm | (libc::S_IFDIR as u32),
-
             #[cfg(target_os = "linux")]
             FileType::Link => perm | (libc::S_IFLNK as u32),
-
+            #[cfg(target_os = "linux")]
+            FileType::Fifo => perm | (libc::S_IFIFO as u32),
+            #[cfg(target_os = "linux")]
+            FileType::Char => perm | (libc::S_IFCHR as u32),
+            #[cfg(target_os = "linux")]
+            FileType::Block => perm | (libc::S_IFBLK as u32),
+            #[cfg(target_os = "linux")]
+            FileType::Socket => perm | (libc::S_IFSOCK as u32),
             _ => perm | (libc::S_IFREG as u32),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn special_file_type_from_mode(mode: u32) -> Option<FileType> {
+        match mode & libc::S_IFMT as u32 {
+            t if t == libc::S_IFIFO as u32 => Some(FileType::Fifo),
+            t if t == libc::S_IFCHR as u32 => Some(FileType::Char),
+            t if t == libc::S_IFBLK as u32 => Some(FileType::Block),
+            t if t == libc::S_IFSOCK as u32 => Some(FileType::Socket),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn special_file_type_from_mode(_mode: u32) -> Option<FileType> {
+        None
+    }
+
+    pub fn rdev_from_status(status: &FileStatus) -> u32 {
+        status
+            .x_attr
+            .get(MKNOD_RDEV_XATTR)
+            .and_then(|bytes| {
+                let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+                Some(u32::from_le_bytes(arr))
+            })
+            .unwrap_or(0)
     }
 
     pub fn s_isreg(mode: u32) -> bool {
@@ -223,6 +256,7 @@ impl FuseUtils {
         let size = match status.file_type {
             FileType::Link => status.target.as_ref().map(|x| x.len()).unwrap_or(0) as u64,
             FileType::Dir => FUSE_DEFAULT_PAGE_SIZE as u64,
+            FileType::Fifo | FileType::Char | FileType::Block | FileType::Socket => 0,
             // Regular files (File / Stream / Agg / Object) take their size from
             // `status.len`. Defend the FUSE boundary against abnormal backend
             // data: a negative len would cast to a huge u64, so reject it.
@@ -255,14 +289,31 @@ impl FuseUtils {
             .build()
     }
 
+    /// When the parent directory has the setgid bit, new nodes inherit its group.
+    pub fn apply_setgid_parent_group(opts: &mut CreateFileOpts, parent: &FileStatus) {
+        if parent.mode & FUSE_S_ISGID != 0 {
+            opts.group.clone_from(&parent.group);
+        }
+    }
+
     pub fn check_xattr(name: &str, op: XattrOp) -> FuseResult<()> {
+        if name.contains('\0') {
+            return match op {
+                XattrOp::Get => err_fuse!(libc::ENODATA, "get_xattr {}", name),
+                XattrOp::Set => err_fuse!(libc::EOPNOTSUPP, "set_xattr {}", name),
+                XattrOp::Remove => err_fuse!(libc::EOPNOTSUPP, "remove_xattr {}", name),
+            };
+        }
+
         // Handle system extended attributes FIRST, before any path resolution
         // This avoids unnecessary operations and provides fastest response
         // Kernel may still query these even if FUSE_POSIX_ACL is disabled in init response
         // Kernel requested POSIX_ACL support (kernel_requested_POSIX_ACL: 1048576)
         // but we disabled it in our response, yet kernel still queries ACL attributes
         match name {
-            "security.capability"
+            MKNOD_RDEV_XATTR
+            | IFLAGS_XATTR
+            | "security.capability"
             | "security.selinux"
             | "system.posix_acl_access"
             | "system.posix_acl_default" => match op {
@@ -273,6 +324,96 @@ impl FuseUtils {
                 }
             },
             _ => Ok(()),
+        }
+    }
+
+    /// Linux `FS_IOC_GETFLAGS` on aarch64/x86_64.
+    pub const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+
+    /// Linux `FS_IOC_SETFLAGS` on aarch64/x86_64.
+    pub const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+
+    const FS_IOCTL_MUTABLE_FLAGS: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL;
+
+    pub fn user_xattr_supported(file_type: FileType) -> bool {
+        matches!(file_type, FileType::File | FileType::Dir | FileType::Link)
+    }
+
+    pub fn check_user_xattr_namespace(file_type: FileType, name: &str) -> FuseResult<()> {
+        if name.starts_with("user.") && !Self::user_xattr_supported(file_type) {
+            return err_fuse!(libc::EPERM, "user xattr not permitted on {:?}", file_type);
+        }
+        Ok(())
+    }
+
+    pub fn file_flags_from_status(status: &FileStatus) -> u32 {
+        status
+            .x_attr
+            .get(IFLAGS_XATTR)
+            .and_then(|bytes| {
+                let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+                Some(u32::from_le_bytes(arr))
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn file_has_immutable_or_append(status: &FileStatus) -> bool {
+        let flags = Self::file_flags_from_status(status);
+        flags & Self::FS_IOCTL_MUTABLE_FLAGS != 0
+    }
+
+    pub fn set_attr_for_file_flags(_status: &FileStatus, new_flags: u32) -> SetAttrOpts {
+        let mut add_x_attr = HashMap::new();
+        add_x_attr.insert(
+            IFLAGS_XATTR.to_string(),
+            Self::normalize_ioctl_file_flags(new_flags)
+                .to_le_bytes()
+                .to_vec(),
+        );
+        SetAttrOpts {
+            add_x_attr,
+            ..Default::default()
+        }
+    }
+
+    pub fn normalize_ioctl_file_flags(flags: u32) -> u32 {
+        flags & Self::FS_IOCTL_MUTABLE_FLAGS
+    }
+
+    pub fn ioctl_flag_bytes() -> usize {
+        std::mem::size_of::<libc::c_long>()
+    }
+
+    pub fn decode_ioctl_file_flags(data: &[u8]) -> FuseResult<u32> {
+        let nbytes = Self::ioctl_flag_bytes();
+        if data.len() < nbytes {
+            return err_fuse!(libc::EINVAL, "ioctl in buffer too small");
+        }
+        let value = match nbytes {
+            8 => i64::from_ne_bytes(data[..8].try_into().unwrap()) as u32,
+            4 => u32::from_ne_bytes(data[..4].try_into().unwrap()),
+            _ => {
+                return err_fuse!(
+                    libc::EINVAL,
+                    "unsupported ioctl flag transfer size {}",
+                    nbytes
+                );
+            }
+        };
+        Ok(value)
+    }
+
+    pub fn append_ioctl_file_flags(buf: &mut BytesMut, flags: u32, out_size: u32) {
+        if out_size == 0 {
+            return;
+        }
+        let nbytes = Self::ioctl_flag_bytes();
+        let want = out_size as usize;
+        let encoded = (flags as libc::c_long).to_ne_bytes();
+        let copy = want.min(nbytes).min(encoded.len());
+        buf.extend_from_slice(&encoded[..copy]);
+        if want > copy {
+            buf.resize(buf.len() + (want - copy), 0);
         }
     }
 
@@ -318,8 +459,11 @@ impl FuseUtils {
         let atime_sec = (status.atime.max(0) / 1000) as u64;
         let atime_nsec = ((status.atime.max(0) % 1000) * 1_000_000) as u32;
 
-        let ctime_sec = mtime_sec;
-        let ctime_nsec = mtime_nsec;
+        // Legacy/object-store statuses may not provide ctime yet. Falling back to mtime
+        // preserves the previous behavior without hiding a real independent ctime.
+        let ctime = status.ctime();
+        let ctime_sec = (ctime.max(0) / 1000) as u64;
+        let ctime_nsec = ((ctime.max(0) % 1000) * 1_000_000) as u32;
 
         let uid = if status.owner.is_empty() {
             conf.uid
@@ -345,6 +489,7 @@ impl FuseUtils {
 
         let perm = FuseUtils::effective_perm(status, conf.umask);
         let mode = FuseUtils::get_mode(perm, status.file_type);
+        let rdev = FuseUtils::rdev_from_status(status);
 
         // A regular file/dir has at least one link; some backends (UFS/object
         // store) do not populate nlink, leaving it 0. Report at least 1.
@@ -364,7 +509,7 @@ impl FuseUtils {
             nlink,
             uid,
             gid,
-            rdev: 0,
+            rdev,
             blksize: FUSE_BLOCK_SIZE as u32,
             padding: 0,
         })
@@ -376,6 +521,22 @@ impl FuseUtils {
                 op.header.uid,
                 op.header.gid,
                 op.arg.mode & 0o7777 & !op.arg.umask,
+            )
+            .build()
+    }
+
+    pub fn mknod_opts(
+        op: &MkNod<'_>,
+        fs: &UnifiedFileSystem,
+        file_type: FileType,
+    ) -> CreateFileOpts {
+        let mode = op.arg.mode & 0o7777 & !op.arg.umask;
+        CreateFileOptsBuilder::with_conf(&fs.conf().client)
+            .file_type(file_type)
+            .acl(op.header.uid, op.header.gid, mode)
+            .x_attr(
+                MKNOD_RDEV_XATTR.to_string(),
+                op.arg.rdev.to_le_bytes().to_vec(),
             )
             .build()
     }
@@ -394,6 +555,31 @@ impl FuseUtils {
 
     pub fn new_dot_status(name: &str) -> FileStatus {
         FileStatus::with_name(FUSE_UNKNOWN_INO as i64, name.to_string(), true)
+    }
+
+    /// Whether the caller's effective group matches `file_gid`.
+    ///
+    /// FUSE only exposes the requester's effective gid via `fuse_in_header.gid`;
+    /// supplementary groups are not available, so only the effective gid is compared.
+    pub fn caller_in_file_group(effective_gid: u32, file_gid: u32) -> bool {
+        effective_gid == file_gid
+    }
+
+    /// Apply Linux chmod/fchmod security rules for special mode bits.
+    ///
+    /// For non-root callers, setgid is cleared when the caller is not in the inode's
+    /// group (see chmod(2) and LTP chmod05/fchmod05). Setuid is preserved for the
+    /// file owner, matching Linux chmod(2).
+    pub fn normalize_chmod_mode(mode: u32, caller_uid: u32, in_file_group: bool) -> u32 {
+        let mut mode = mode & 0o7777;
+        if caller_uid == 0 {
+            return mode;
+        }
+
+        if !in_file_group {
+            mode &= !(libc::S_ISGID as u32);
+        }
+        mode
     }
 
     pub fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
@@ -504,6 +690,7 @@ impl FuseUtils {
 mod tests {
     use super::*;
     use crate::raw::fuse_abi::fuse_setattr_in;
+    use curvine_common::state::INTERNAL_CTIME_XATTR;
 
     #[test]
     fn protected_xattr_errors_match_operation() {
@@ -538,6 +725,46 @@ mod tests {
     fn user_xattr_is_allowed_for_every_operation() {
         for op in [XattrOp::Get, XattrOp::Set, XattrOp::Remove] {
             FuseUtils::check_xattr("user.curvine", op).unwrap();
+        }
+    }
+
+    #[test]
+    fn mknod_rdev_xattr_is_internal_only() {
+        assert_eq!(
+            FuseUtils::check_xattr(MKNOD_RDEV_XATTR, XattrOp::Get)
+                .unwrap_err()
+                .errno(),
+            libc::ENODATA
+        );
+        assert_eq!(
+            FuseUtils::check_xattr(MKNOD_RDEV_XATTR, XattrOp::Set)
+                .unwrap_err()
+                .errno(),
+            libc::EOPNOTSUPP
+        );
+        assert_eq!(
+            FuseUtils::check_xattr(MKNOD_RDEV_XATTR, XattrOp::Remove)
+                .unwrap_err()
+                .errno(),
+            libc::EOPNOTSUPP
+        );
+    }
+
+    #[test]
+    fn nul_xattr_names_are_internal_only() {
+        assert_eq!(
+            FuseUtils::check_xattr(INTERNAL_CTIME_XATTR, XattrOp::Get)
+                .unwrap_err()
+                .errno(),
+            libc::ENODATA
+        );
+        for op in [XattrOp::Set, XattrOp::Remove] {
+            assert_eq!(
+                FuseUtils::check_xattr(INTERNAL_CTIME_XATTR, op)
+                    .unwrap_err()
+                    .errno(),
+                libc::EOPNOTSUPP
+            );
         }
     }
 
@@ -598,6 +825,36 @@ mod tests {
             FuseUtils::dir_open_flags(&conf),
             FUSE_FOPEN_DIRECT_IO | FUSE_FOPEN_NONSEEKABLE | FUSE_FOPEN_CACHE_DIR
         );
+    }
+
+    #[test]
+    fn caller_in_file_group_matches_effective_gid_only() {
+        assert!(FuseUtils::caller_in_file_group(100, 100));
+        assert!(!FuseUtils::caller_in_file_group(100, 200));
+    }
+
+    #[test]
+    fn normalize_chmod_mode_strips_setgid_for_non_group_member() {
+        let mode = FuseUtils::normalize_chmod_mode(0o3777, 1000, false);
+        assert_eq!(mode, 0o1777);
+    }
+
+    #[test]
+    fn normalize_chmod_mode_preserves_setgid_for_group_member() {
+        let mode = FuseUtils::normalize_chmod_mode(0o3777, 1000, true);
+        assert_eq!(mode, 0o3777);
+    }
+
+    #[test]
+    fn normalize_chmod_mode_preserves_setuid_for_non_root() {
+        let mode = FuseUtils::normalize_chmod_mode(0o6777, 1000, true);
+        assert_eq!(mode, 0o6777);
+    }
+
+    #[test]
+    fn normalize_chmod_mode_allows_special_bits_for_root() {
+        let mode = FuseUtils::normalize_chmod_mode(0o4777, 0, false);
+        assert_eq!(mode, 0o4777);
     }
 
     #[test]
@@ -718,6 +975,21 @@ mod tests {
     }
 
     #[test]
+    fn status_to_attr_preserves_independent_ctime() {
+        let conf = FuseConf::default();
+        let mut status = file_status(FileType::File, 0, 0o644);
+        status.mtime = 1_000;
+        status.x_attr.insert(
+            INTERNAL_CTIME_XATTR.to_string(),
+            2_500_i64.to_le_bytes().to_vec(),
+        );
+
+        let attr = FuseUtils::status_to_attr(&conf, &status).unwrap();
+        assert_eq!((attr.mtime, attr.mtimensec), (1, 0));
+        assert_eq!((attr.ctime, attr.ctimensec), (2, 500_000_000));
+    }
+
+    #[test]
     fn blocks_derived_from_fuse_size() {
         let conf = FuseConf::default();
 
@@ -796,5 +1068,87 @@ mod tests {
         let mut three = file_status(FileType::File, 0, 0o644);
         three.nlink = 3;
         assert_eq!(FuseUtils::status_to_attr(&conf, &three).unwrap().nlink, 3);
+    }
+
+    #[test]
+    fn apply_setgid_parent_group_inherits_parent_group() {
+        let mut opts = CreateFileOpts::with_create(false);
+        opts.group = "nogroup".to_string();
+
+        let mut parent = file_status(FileType::Dir, 0, 0o2775);
+        parent.group = "project".to_string();
+
+        FuseUtils::apply_setgid_parent_group(&mut opts, &parent);
+        assert_eq!(opts.group, "project");
+
+        parent.mode = 0o755;
+        opts.group = "nogroup".to_string();
+        FuseUtils::apply_setgid_parent_group(&mut opts, &parent);
+        assert_eq!(opts.group, "nogroup");
+    }
+
+    #[test]
+    fn special_file_type_from_mode_maps_chr_blk_fifo_sock() {
+        assert_eq!(
+            FuseUtils::special_file_type_from_mode(0o20777),
+            Some(FileType::Char)
+        );
+        assert_eq!(
+            FuseUtils::special_file_type_from_mode(0o60777),
+            Some(FileType::Block)
+        );
+        assert_eq!(
+            FuseUtils::special_file_type_from_mode(0o10777),
+            Some(FileType::Fifo)
+        );
+        assert_eq!(
+            FuseUtils::special_file_type_from_mode(0o140777),
+            Some(FileType::Socket)
+        );
+        assert!(FuseUtils::special_file_type_from_mode(0o100644).is_none());
+    }
+
+    #[test]
+    fn user_xattr_namespace_rejects_special_nodes() {
+        let err = FuseUtils::check_user_xattr_namespace(FileType::Fifo, "user.test").unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
+        FuseUtils::check_user_xattr_namespace(FileType::File, "user.test").unwrap();
+    }
+
+    #[test]
+    fn ioctl_file_flags_round_trip_native_long() {
+        use bytes::BytesMut;
+
+        let flags = FS_IMMUTABLE_FL | FS_APPEND_FL;
+        let mut buf = BytesMut::new();
+        FuseUtils::append_ioctl_file_flags(&mut buf, flags, FuseUtils::ioctl_flag_bytes() as u32);
+        assert_eq!(buf.len(), FuseUtils::ioctl_flag_bytes());
+        assert_eq!(FuseUtils::decode_ioctl_file_flags(&buf).unwrap(), flags);
+    }
+
+    #[test]
+    fn file_flags_round_trip_through_internal_xattr() {
+        let mut status = file_status(FileType::File, 0, 0o644);
+        let opts = FuseUtils::set_attr_for_file_flags(&status, FS_IMMUTABLE_FL | FS_APPEND_FL);
+        status.x_attr.extend(opts.add_x_attr);
+        assert_eq!(
+            FuseUtils::file_flags_from_status(&status),
+            FS_IMMUTABLE_FL | FS_APPEND_FL
+        );
+        assert!(FuseUtils::file_has_immutable_or_append(&status));
+    }
+
+    #[test]
+    fn status_to_attr_reports_special_node_mode_and_rdev() {
+        let conf = FuseConf::default();
+        let mut chr = file_status(FileType::Char, 0, 0o777);
+        chr.x_attr
+            .insert(MKNOD_RDEV_XATTR.to_string(), 42u32.to_le_bytes().to_vec());
+
+        let attr = FuseUtils::status_to_attr(&conf, &chr).unwrap();
+        assert_eq!(attr.mode & libc::S_IFMT as u32, libc::S_IFCHR as u32);
+        assert_eq!(attr.mode & 0o7777, 0o777);
+        assert_eq!(attr.rdev, 42);
+        assert_eq!(attr.size, 0);
     }
 }

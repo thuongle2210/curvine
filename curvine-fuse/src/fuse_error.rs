@@ -186,7 +186,7 @@ impl From<std::io::Error> for FuseError {
 /// `FsError -> errno` mapping above). Any errno outside the table collapses to
 /// `"OTHER"`; if a new errno starts being produced, add it here and to the
 /// design doc's label table together.
-// Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
+// Enabling primitive: defined here, wired to call sites separately.
 #[allow(dead_code)]
 pub(crate) fn errno_label(errno: i32) -> &'static str {
     match errno {
@@ -230,6 +230,7 @@ pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
         libc::EINTR => "eintr",
         libc::EAGAIN => "eagain",
         libc::ENODEV => "enodev",
+        libc::ECONNABORTED => "econnaborted",
         _ => "other",
     }
 }
@@ -331,6 +332,7 @@ mod tests {
         assert_eq!(splice_errno_label(libc::EINTR), "eintr");
         assert_eq!(splice_errno_label(libc::EAGAIN), "eagain");
         assert_eq!(splice_errno_label(libc::ENODEV), "enodev");
+        assert_eq!(splice_errno_label(libc::ECONNABORTED), "econnaborted");
         // Anything else (incl. 0 / unknown) collapses to lowercase "other".
         assert_eq!(splice_errno_label(libc::EIO), "other");
         assert_eq!(splice_errno_label(0), "other");

@@ -216,7 +216,7 @@ impl NodeState {
         let cache_hit = record && dir.get_inode(parent, Some(name)).is_some();
         let before = dir.inode_lens();
         let attr = {
-            let inode = dir.lookup(parent, name, status.clone())?;
+            let inode = dir.lookup(parent, name, status.clone(), true)?;
             inode.to_attr(&self.conf)?
         };
         let after = dir.inode_lens();
@@ -588,7 +588,8 @@ impl NodeState {
         let close_result: FuseResult<()> = match handle.as_ref() {
             FileHandle::Backend(_) if handle.has_writer() => {
                 let cleanup_handle = handle.clone();
-                self.writers
+                let (_, cleanup_result) = self
+                    .writers
                     .release_with_cleanup(handle.ino(), move |last| async move {
                         if last {
                             cleanup_handle.complete(None).await
@@ -596,20 +597,18 @@ impl NodeState {
                             cleanup_handle.flush(None).await
                         }
                     })
-                    .await
-                    .map(|_| ())
+                    .await;
+                cleanup_result
             }
 
             _ => Ok(()),
         };
 
-        // A failed close keeps both the handle and its shared-writer reference
-        // so cleanup state is not silently discarded. FUSE normally sends
-        // RELEASE only once; automatic retry of retained state is tracked by
-        // #1221.
-        if close_result.is_ok() {
-            let _ = self.remove_handle(ino, fh);
-        }
+        // FUSE sends RELEASE once per open handle, and its error is not retried.
+        // Remove the handle regardless of the close result so open-handle and
+        // shared-writer accounting continue to reflect kernel ownership.
+        // Retriable backend cleanup must be tracked separately (#1221).
+        let _ = self.remove_handle(ino, fh);
 
         Ok((handle, close_result))
     }
@@ -851,6 +850,19 @@ impl NodeState {
     }
 
     pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
+        // NOTE: the `.`/`..` branches below are BROKEN wherever they resolve through
+        // the root, because root's `parent` is the `0` sentinel and inode 0 does not
+        // exist. Two cases both miss and return ENOENT:
+        //   - `LOOKUP(root, ".")` -> `(root.parent, ..)` = `(0, "/")`, and
+        //     `LOOKUP(root, "..")` -> `get_inode_check(root.parent=0)`.
+        //   - `LOOKUP(child_of_root, "..")` -> `get_inode_check(parent.parent)` where
+        //     `parent` is root, i.e. `get_inode_check(0)` — so ANY direct child of the
+        //     mount root fails too, not just the root inode.
+        // This is why `FUSE_EXPORT_SUPPORT` is kept out of `SUPPORTED_INIT_FLAGS` (see
+        // `crate::FUSE_EXPORT_SUPPORT`): advertising it is the only thing that makes
+        // the kernel send these `.`/`..` LOOKUPs (`fuse_get_parent` walks `..` for any
+        // direct child of the mount root). A follow-up that re-adds the capability must
+        // special-case `parent == root` (and root itself), not only `LOOKUP(root, .)`.
         let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
             let dir = self.dir_read();
             let inode = dir.get_inode_check(ino, None)?;
@@ -901,8 +913,10 @@ impl NodeState {
         if let Some(mtime) = self.get_writer_mtime(attr.ino).await {
             attr.mtime = (mtime.max(0) / 1000) as u64;
             attr.mtimensec = ((mtime.max(0) % 1000) * 1_000_000) as u32;
-            attr.ctime = attr.mtime;
-            attr.ctimensec = attr.mtimensec;
+            if (attr.mtime, attr.mtimensec) > (attr.ctime, attr.ctimensec) {
+                attr.ctime = attr.mtime;
+                attr.ctimensec = attr.mtimensec;
+            }
         }
     }
 
@@ -988,6 +1002,17 @@ impl NodeState {
         self.new_handle(Some(ino), &path, flags, opts).await
     }
 
+    pub async fn new_meta_handle(
+        &self,
+        ino: u64,
+        mut status: FileStatus,
+    ) -> FuseResult<Arc<FileHandle>> {
+        status.id = ino as i64;
+        Ok(self
+            .insert_handle_with_writer(ino, None, None, status)
+            .await)
+    }
+
     pub async fn fs_set_attr(&self, ino: u64, opts: SetAttrOpts) -> FuseResult<FileStatus> {
         let path = self.get_path_common(ino, None)?;
         let status = match self.fs.fuse_set_attr(&path, opts).await? {
@@ -1003,20 +1028,20 @@ impl NodeState {
         opts.validate()?;
 
         let path = self.get_path(ino)?;
+        // Keep fallocate/truncate ordered with the inode's active writer when
+        // one exists, regardless of which file handle the syscall supplied.
+        if let Some(writer) = self.find_writer(ino).await {
+            writer.resize(opts).await?;
+            return Ok(());
+        }
+
         if fh != 0 {
             let handle = self.find_handle(ino, fh)?;
             handle.resize(opts).await?;
-        } else if let Some(writer) = self.find_writer(ino).await {
-            // fh-less path resize (truncate(path), fallocate paths) must stay
-            // ordered with the inode's active writer; otherwise backend resize
-            // bypasses buffered writer state and open fds can observe stale
-            // metadata or EIO. This restores the PR #962 behavior after the
-            // dcache refactor moved resize handling into NodeState.
-            writer.resize(opts).await?;
-        } else {
-            self.fs.resize(&path, opts).await?;
+            return Ok(());
         }
 
+        self.fs.resize(&path, opts).await?;
         Ok(())
     }
 
@@ -1240,14 +1265,24 @@ impl NodeState {
 mod test {
     use crate::fs::state::file_handle::FileHandle;
     use crate::fs::state::{DirHandle, NodeState};
+    #[cfg(target_os = "linux")]
     use crate::fs::FuseWriter;
-    use crate::{FuseError, FUSE_ROOT_ID};
+    #[cfg(target_os = "linux")]
+    use crate::FuseError;
+    use crate::FUSE_ROOT_ID;
+
+    #[cfg(target_os = "linux")]
     use bytes::Bytes;
-    use curvine_client::unified::{UnifiedFileSystem, UnifiedWriter};
+    use curvine_client::unified::UnifiedFileSystem;
+    #[cfg(target_os = "linux")]
+    use curvine_client::unified::UnifiedWriter;
     use curvine_common::conf::ClusterConf;
     use curvine_common::error::FsError;
+    #[cfg(target_os = "linux")]
     use curvine_common::fs::local::LocalWriter;
-    use curvine_common::fs::{ListStream, Path, StateReader, StateWriter, Writer};
+    #[cfg(target_os = "linux")]
+    use curvine_common::fs::Writer;
+    use curvine_common::fs::{ListStream, Path, StateReader, StateWriter};
     use curvine_common::state::FileStatus;
     use orpc::common::{FastHashMap, Utils};
     use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -1482,7 +1517,10 @@ mod test {
         let ino = {
             let mut dir = state.dir_write();
             let status = FileStatus::with_name(123, "pending".to_string(), false);
-            let ino = dir.lookup(FUSE_ROOT_ID, "pending", status).unwrap().ino;
+            let ino = dir
+                .lookup(FUSE_ROOT_ID, "pending", status, true)
+                .unwrap()
+                .ino;
             dir.unlink(FUSE_ROOT_ID, "pending", true).unwrap();
             ino
         };
@@ -1501,7 +1539,7 @@ mod test {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn release_handle_failure_retains_handle_and_writer_for_retry() {
+    fn release_handle_failure_releases_handle_and_writer_reference() {
         let rt = Arc::new(AsyncRuntime::single());
         let task_rt = rt.clone();
 
@@ -1533,19 +1571,66 @@ mod test {
 
             let (_, first_result) = state.release_handle(1, handle.fh()).await.unwrap();
             assert!(first_result.is_err());
-            assert!(state.find_handle(1, handle.fh()).is_ok());
-            assert!(Arc::ptr_eq(
-                &state.find_writer(1).await.unwrap(),
-                &fuse_writer
-            ));
+            assert!(state.find_handle(1, handle.fh()).is_err());
+            assert!(!state.has_open_handles(1));
+            assert!(state.find_writer(1).await.is_none());
+        });
+    }
 
-            let (_, retry_result) = state.release_handle(1, handle.fh()).await.unwrap();
-            assert!(retry_result.is_err());
-            assert!(state.find_handle(1, handle.fh()).is_ok());
-            assert!(Arc::ptr_eq(
-                &state.find_writer(1).await.unwrap(),
-                &fuse_writer
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn release_handle_failure_decrements_shared_writer_reference() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let full_path = Path::from_str("/dev/full").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let status = local_writer.status().clone();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
             ));
+            state
+                .writers
+                .insert::<FuseError>(1, fuse_writer.clone())
+                .await
+                .unwrap();
+            let first_handle = state
+                .insert_handle_with_writer(1, None, Some(fuse_writer.clone()), status.clone())
+                .await;
+
+            let shared_writer = state
+                .writers
+                .get_or_create(1, async { Ok::<_, FuseError>(fuse_writer.clone()) })
+                .await
+                .unwrap();
+            let second_handle = state
+                .insert_handle_with_writer(1, None, Some(shared_writer), status)
+                .await;
+
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            let (_, first_result) = state.release_handle(1, first_handle.fh()).await.unwrap();
+            assert!(first_result.is_err());
+            assert!(state.find_handle(1, first_handle.fh()).is_err());
+            assert!(state.find_handle(1, second_handle.fh()).is_ok());
+            assert!(state.has_open_handles(1));
+            assert!(state.find_writer(1).await.is_some());
+
+            let (_, second_result) = state.release_handle(1, second_handle.fh()).await.unwrap();
+            assert!(second_result.is_err());
+            assert!(state.find_handle(1, second_handle.fh()).is_err());
+            assert!(!state.has_open_handles(1));
+            assert!(state.find_writer(1).await.is_none());
         });
     }
 }
