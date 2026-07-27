@@ -67,7 +67,7 @@ impl QpairPool {
         state.insert(ctrlr_ptr, CtrlQpairState::new(limit));
         if limit == 0 {
             warn!(
-                "QpairPool: ctrlr {:p} has 0 negotiated IO queues, qpair acquisition disabled",
+                "QpairPool: ctrlr {:p} registered with max_active=0 (0 negotiated IO queues)",
                 ctrlr_ptr as *const ()
             );
         } else {
