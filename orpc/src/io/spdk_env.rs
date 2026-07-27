@@ -14,7 +14,6 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Qpair pool - reuse NVMe qpairs across handles
