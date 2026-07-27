@@ -64,6 +64,11 @@ impl QpairPool {
     fn register_limit(&self, ctrlr_ptr: usize, actual_io_queues: u32) {
         let limit = actual_io_queues as usize;
         let mut state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !state.contains_key(&ctrlr_ptr),
+            "QpairPool: ctrlr {:p} already registered — register_limit is one-shot",
+            ctrlr_ptr as *const ()
+        );
         state.insert(ctrlr_ptr, CtrlQpairState::new(limit));
         if limit == 0 {
             warn!(
@@ -1230,18 +1235,13 @@ mod test {
     }
 
     #[test]
-    fn register_limit_overwrites() {
+    #[should_panic(expected = "already registered")]
+    fn register_limit_rejects_duplicate() {
         let p = QpairPool::new();
         let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_qpair;
 
         p.register_limit(ctrlr as usize, 64);
-        let (_, limit) = p.controller_stats(ctrlr as usize);
-        assert_eq!(limit, 64);
-
-        // Overwrite with different value
         p.register_limit(ctrlr as usize, 128);
-        let (_, limit) = p.controller_stats(ctrlr as usize);
-        assert_eq!(limit, 128);
     }
 
     #[test]
