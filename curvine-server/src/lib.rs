@@ -13,12 +13,18 @@
 // limitations under the License.
 
 pub mod common;
-pub mod master;
 pub mod test;
-pub mod worker;
+pub mod transfer;
 
-#[cfg(feature = "fault-injection")]
-pub(crate) use curvine_fault::fault_point;
+pub mod metadata {
+    pub use curvine_raft as raft;
+    pub use curvine_rocksdb as rocksdb;
+}
 
-#[cfg(not(feature = "fault-injection"))]
-pub(crate) use curvine_fault::__noop_fault_point as fault_point;
+pub mod storage {
+    pub use curvine_storage_local as local;
+}
+
+pub use curvine_data_transfer as data_transfer;
+pub use curvine_master::master;
+pub use curvine_worker as worker;

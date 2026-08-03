@@ -1,7 +1,7 @@
 use clap::Subcommand;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::CurvineURI;
-use orpc::CommonResult;
+use curvine_core_error::CommonResult;
+use curvine_fs_api::CurvineURI;
+use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Subcommand, Debug)]
 pub enum CountCommand {

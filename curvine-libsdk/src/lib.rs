@@ -12,31 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod core;
-
-mod lib_filesystem;
-pub use self::lib_filesystem::LibFilesystem;
-
-mod filesystem_conf;
-pub use self::filesystem_conf::FilesystemConf;
-
-mod lib_fs_writer;
-pub use self::lib_fs_writer::LibFsWriter;
-
-mod lib_fs_reader;
-pub use self::lib_fs_reader::LibFsReader;
+pub use curvine_sdk_core::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
 
 #[cfg(feature = "rust-sdk")]
-pub mod filesystem;
+pub use curvine_sdk_core::filesystem;
 #[cfg(feature = "rust-sdk")]
-pub mod job;
+pub use curvine_sdk_core::job;
 #[cfg(feature = "rust-sdk")]
-pub mod lib_curvine;
+pub use curvine_sdk_core::lib_curvine;
 #[cfg(feature = "rust-sdk")]
-pub mod master;
+pub use curvine_sdk_core::master;
 
 #[cfg(feature = "python-sdk")]
-pub mod python;
+pub use curvine_libsdk_python as python;
 
 #[cfg(feature = "java-sdk")]
-pub mod java;
+pub use curvine_libsdk_java as java;

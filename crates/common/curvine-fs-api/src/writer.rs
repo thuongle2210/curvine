@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::fs::Path;
-use crate::state::{FileAllocOpts, FileStatus};
+use crate::state::{FileAllocOpts, FileStatus, SetAttrOpts};
 use crate::FsResult;
 use bytes::{BufMut, BytesMut};
-use orpc::err_box;
-use orpc::runtime::RpcRuntime;
-use orpc::{runtime::Runtime, sys::DataSlice};
+use curvine_core_error::err_box;
+use curvine_io::DataSlice;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use std::future::Future;
 
 pub trait Writer {
@@ -103,6 +103,25 @@ pub trait Writer {
     fn flush(&mut self) -> impl Future<Output = FsResult<()>>;
 
     fn complete(&mut self) -> impl Future<Output = FsResult<()>>;
+
+    /// Completes the write operation and optionally applies file attributes.
+    ///
+    /// # Default Implementation
+    ///
+    /// The default implementation **ignores** `opts` and simply calls [`complete()`](Writer::complete).
+    /// Backends that support atomic attribute setting on complete should override this method.
+    ///
+    /// Callers should not assume attributes were applied unless the backend explicitly
+    /// supports this method.
+    fn complete_with_attr(
+        &mut self,
+        opts: Option<SetAttrOpts>,
+    ) -> impl Future<Output = FsResult<()>> {
+        async move {
+            drop(opts);
+            self.complete().await
+        }
+    }
 
     fn cancel(&mut self) -> impl Future<Output = FsResult<()>>;
 

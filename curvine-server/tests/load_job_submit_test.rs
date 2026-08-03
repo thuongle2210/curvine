@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::{ClientConf, ClusterConf, JournalConf, MasterConf};
+use curvine_common::conf::{ClientConf, ClusterConf, MasterConf};
 use curvine_common::state::{
     JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
     MountOptions, OpenFlags, StorageType, TtlAction, WorkerAddress, WorkerInfo, WriteType,
 };
 use curvine_common::utils::CommonUtils;
+use curvine_raft::conf::JournalConf;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::{JobContext, JobManager, JobStore, Master};
@@ -116,6 +117,8 @@ fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
         source_path: "file://source".to_string(),
         target_path: "/mnt/source".to_string(),
         create_time: 0,
+        source_read_plan_json: String::new(),
+        transfer_report: None,
     }
 }
 
@@ -655,15 +658,16 @@ fn stale_task_report_for_running_job_is_ignored() -> CommonResult<()> {
 }
 
 #[test]
-fn worker_cancel_marks_running_context_canceled() {
+fn worker_cancel_keeps_running_context_queryable_until_runner_exits() {
     let store = TaskStore::new();
     let context = store.insert(load_task("task-cancel", "job-cancel"));
 
     let canceled = store.cancel("job-cancel");
 
     assert_eq!(canceled.len(), 1);
-    assert_eq!(context.get_state(), JobTaskState::Canceled);
-    assert!(store.get("task-cancel").is_none());
+    assert!(context.is_cancel());
+    assert_ne!(context.get_state(), JobTaskState::Canceled);
+    assert!(store.get("task-cancel").is_some());
 }
 
 #[test]
@@ -675,4 +679,18 @@ fn canceled_worker_context_ignores_late_completion_progress() {
 
     assert_eq!(progress.state, JobTaskState::Canceled);
     assert_eq!(context.get_state(), JobTaskState::Canceled);
+}
+
+#[test]
+fn cancellation_request_prevents_late_state_updates() {
+    let context = TaskContext::new(load_task("task-cancel-race", "job-cancel-race"));
+    context.request_cancel("cancellation requested by Transfer");
+
+    context.update_state(JobTaskState::Loading, "Task started");
+
+    assert_eq!(context.get_state(), JobTaskState::Pending);
+    assert_eq!(
+        context.progress().message,
+        "cancellation requested by Transfer"
+    );
 }

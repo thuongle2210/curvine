@@ -13,7 +13,8 @@
 // limitations under the License.
 
 pub use curvine_config::{
-    CliConf, ClientConf, ClientConfCliOverrides, FuseConf, JobConf, UfsConf, UfsConfBuilder,
+    CliConf, ClientConf, ClientConfCliOverrides, FuseConf, JobConf, TransferConf,
+    TransferStoreType, UfsConf, UfsConfBuilder,
 };
 
 pub use curvine_fault::FaultHttpConfig;
@@ -27,8 +28,7 @@ pub use self::worker_conf::*;
 mod cluster_conf;
 pub use self::cluster_conf::*;
 
-mod journal_conf;
-pub use self::journal_conf::JournalConf;
+pub use curvine_raft::conf::JournalConf;
 
 mod spdk_conf;
 #[cfg(test)]

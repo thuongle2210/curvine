@@ -117,6 +117,7 @@ print_help() {
   echo "                          - all: all packages"
   echo
   echo "  -u, --ufs TYPE        UFS storage type (can be specified multiple times, default: opendal-s3)"
+  echo "                        SDK artifacts are minimal by default; --ufs enables only the requested SDK backend(s)"
   echo "                        Available types:"
   echo "                          - opendal-s3: OpenDAL S3"
   echo "                          - opendal-oss: OpenDAL OSS"
@@ -173,6 +174,7 @@ DIST_ZIP=curvine-${CURVINE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
 PROFILE="--release"
 declare -a PACKAGES=("all")  # Default to build all packages
 declare -a UFS_TYPES=("opendal-s3")  # Default UFS type
+declare -a SDK_UFS_TYPES=()  # SDK artifacts stay minimal unless --ufs is requested
 declare -a EXTRA_FEATURES=()  # From -f only; --alloc is merged into FEATURES later
 ALLOC=jemalloc
 CRATE_ZIP=""
@@ -224,11 +226,13 @@ while [ $# -gt 0 ]; do
     -u|--ufs)
       require_option_value "$1" "${2:-}"
       UFS_TYPES+=("$2")
+      SDK_UFS_TYPES+=("$2")
       shift 2
       ;;
     --ufs=*)
       require_option_value "--ufs" "${1#*=}"
       UFS_TYPES+=("${1#*=}")
+      SDK_UFS_TYPES+=("${1#*=}")
       shift
       ;;
     -f|--features)
@@ -434,7 +438,7 @@ if should_build_package "tests"; then
 fi
 
 declare -a FEATURES=()
-declare -a CLIENT_SKIPPED_NATIVE_UFS=()
+declare -a CLIENT_SKIPPED_SERVER_NATIVE_FEATURES=()
 
 validate_feature_name() {
   local feature="$1"
@@ -458,26 +462,44 @@ add_feature() {
   FEATURES+=("$feature")
 }
 
-remember_skipped_native_ufs() {
-  local ufs="$1"
+remember_skipped_server_native_feature() {
+  local feature="$1"
   local existing
-  for existing in "${CLIENT_SKIPPED_NATIVE_UFS[@]}"; do
-    if [ "$existing" = "$ufs" ]; then
+  for existing in "${CLIENT_SKIPPED_SERVER_NATIVE_FEATURES[@]}"; do
+    if [ "$existing" = "$feature" ]; then
       return 0
     fi
   done
-  CLIENT_SKIPPED_NATIVE_UFS+=("$ufs")
+  CLIENT_SKIPPED_SERVER_NATIVE_FEATURES+=("$feature")
 }
 
-is_client_native_ufs() {
+is_native_ufs_selection() {
   case "$1" in
-    oss-hdfs|opendal-hdfs|opendal-hdfs-native)
+    oss-hdfs|opendal-hdfs|opendal-hdfs-native|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native)
       return 0
       ;;
     *)
       return 1
       ;;
   esac
+}
+
+client_native_ufs_deps_allowed() {
+  local ufs
+  for ufs in "${UFS_TYPES[@]}"; do
+    if is_native_ufs_selection "$ufs"; then
+      return 0
+    fi
+  done
+
+  local feature
+  for feature in "${EXTRA_FEATURES[@]}"; do
+    if is_native_ufs_selection "$feature"; then
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 append_ufs_feature() {
@@ -491,28 +513,45 @@ append_ufs_feature() {
       ;;
   esac
 
-  if [ "$scope" = "client-safe" ] && is_client_native_ufs "$ufs"; then
-    remember_skipped_native_ufs "$ufs"
-    return 0
-  fi
-
   case "$ufs" in
     oss-hdfs)
-      add_feature "curvine-ufs/oss-hdfs"
-      add_feature "curvine-client/oss-hdfs"
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/oss-hdfs"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/oss-hdfs"
+      else
+        add_feature "curvine-client/oss-hdfs"
+      fi
       ;;
     opendal-hdfs)
-      add_feature "curvine-ufs/opendal-hdfs"
-      add_feature "curvine-client/opendal-hdfs"
-      add_feature "curvine-ufs/jni"
-      add_feature "curvine-server/jni"
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/opendal-hdfs"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/opendal-hdfs"
+      else
+        add_feature "curvine-client/opendal-hdfs"
+      fi
+      if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+        add_feature "curvine-server/jni"
+      fi
       ;;
     opendal-webhdfs)
-      add_feature "curvine-ufs/opendal-webhdfs"
-      add_feature "curvine-client/opendal-webhdfs"
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/opendal-webhdfs"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/opendal-webhdfs"
+      else
+        add_feature "curvine-client/opendal-webhdfs"
+      fi
       ;;
     *)
-      add_feature "curvine-client/$ufs"
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/$ufs"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/$ufs"
+      else
+        add_feature "curvine-client/$ufs"
+      fi
       ;;
   esac
 }
@@ -531,37 +570,47 @@ append_extra_features() {
   for feature in "${EXTRA_FEATURES[@]}"; do
     validate_feature_name "$feature" || exit 1
     case "$feature" in
-      oss-hdfs|opendal-hdfs|opendal-webhdfs|opendal-cos|opendal-hdfs-native)
+      oss-hdfs|opendal-s3|opendal-oss|opendal-gcs|opendal-azblob|opendal-cos|opendal-hdfs|opendal-webhdfs|opendal-hdfs-native)
         append_ufs_feature "$scope" "$feature"
         ;;
       jni|curvine-server/jni|curvine-ufs/jni)
         if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
-          add_feature "curvine-ufs/jni"
           add_feature "curvine-server/jni"
         else
-          remember_skipped_native_ufs "jni"
+          remember_skipped_server_native_feature "$feature"
         fi
         ;;
       spdk|curvine-server/spdk)
         if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
           add_feature "curvine-server/spdk"
+        else
+          remember_skipped_server_native_feature "$feature"
         fi
         ;;
       spdk-rdma|curvine-server/spdk-rdma)
         if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
           add_feature "curvine-server/spdk-rdma"
+        else
+          remember_skipped_server_native_feature "$feature"
         fi
         ;;
-      curvine-ufs/oss-hdfs|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-hdfs-native|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native)
-        if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
-          add_feature "$feature"
+      curvine-ufs/oss-hdfs|curvine-ufs/opendal-s3|curvine-ufs/opendal-oss|curvine-ufs/opendal-gcs|curvine-ufs/opendal-azblob|curvine-ufs/opendal-cos|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-webhdfs|curvine-ufs/opendal-hdfs-native)
+        echo "Error: ${feature} does not enable the corresponding client adapter; use --ufs instead" >&2
+        exit 1
+        ;;
+      curvine-client/oss-hdfs|curvine-client/opendal-s3|curvine-client/opendal-oss|curvine-client/opendal-gcs|curvine-client/opendal-azblob|curvine-client/opendal-cos|curvine-client/opendal-hdfs|curvine-client/opendal-webhdfs|curvine-client/opendal-hdfs-native)
+        if [ "$scope" = "cli-minimal" ]; then
+          echo "Error: ${feature} does not enable the corresponding CLI adapter; use --ufs instead" >&2
+          exit 1
         else
-          remember_skipped_native_ufs "$feature"
+          add_feature "$feature"
         fi
         ;;
       curvine-server/*)
         if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
           add_feature "$feature"
+        else
+          remember_skipped_server_native_feature "$feature"
         fi
         ;;
       *)
@@ -572,7 +621,22 @@ append_extra_features() {
 }
 
 append_alloc_feature() {
-  add_feature "curvine-common/${ALLOC}"
+  local scope="${1:-}"
+  case "$scope" in
+    cli-minimal)
+      add_feature "curvine-cli/${ALLOC}"
+      return 0
+      ;;
+    client-safe)
+      if [[ " ${CLIENT_RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]]; then
+        add_feature "curvine-common/${ALLOC}"
+      fi
+      return 0
+      ;;
+    *)
+      add_feature "curvine-common/${ALLOC}"
+      ;;
+  esac
 }
 
 feature_list() {
@@ -656,31 +720,43 @@ check_minimal_artifact_deps() {
 
   local needed
   needed="$(artifact_dynamic_entries "$inspector" "$artifact")"
-  if grep -E 'libibverbs\.so|librdmacm\.so|libspdk|librte_|libjindosdk|libhdfs|libjvm|libjli' <<<"$needed" >/dev/null; then
-    echo "Error: ${label} contains native server/storage runtime dependencies forbidden for minimal client artifacts:" >&2
+  local server_native_pattern='libibverbs\.so|librdmacm\.so|libspdk|librte_'
+  if grep -E "$server_native_pattern" <<<"$needed" >/dev/null; then
+    echo "Error: ${label} contains server-native RDMA/SPDK runtime dependencies forbidden for client artifacts:" >&2
+    echo "$needed" >&2
+    exit 1
+  fi
+
+  local native_storage_pattern='librocksdb'
+  if grep -E "$native_storage_pattern" <<<"$needed" >/dev/null; then
+    echo "Error: ${label} contains native storage runtime dependencies forbidden for client artifacts:" >&2
+    echo "$needed" >&2
+    exit 1
+  fi
+
+  local native_ufs_pattern='libjindosdk|libhdfs|libjvm|libjli'
+  if ! client_native_ufs_deps_allowed && grep -E "$native_ufs_pattern" <<<"$needed" >/dev/null; then
+    echo "Error: ${label} contains native UFS runtime dependencies but no native --ufs/feature was requested:" >&2
     echo "$needed" >&2
     exit 1
   fi
   echo "OK runtime deps: ${label}"
 }
 
-# Join libsdk SDK feature + UFS passthrough features (forwarded to curvine-client).
+# Join libsdk SDK feature + explicitly requested UFS passthrough features.
+# SDK artifacts are minimal by default even though the broader distribution
+# still keeps opendal-s3 as the default UFS type for server/client builds.
 libsdk_features() {
   local sdk_feature="$1"
-  local alloc_feature="$2"
-  local features="${alloc_feature},${sdk_feature}"
+  local features="${sdk_feature}"
   local ufs
-  for ufs in "${UFS_TYPES[@]}"; do
+  for ufs in "${SDK_UFS_TYPES[@]}"; do
     case "$ufs" in
       *[!a-zA-Z0-9_-]*|"")
         echo "Error: invalid --ufs value: ${ufs}" >&2
         return 1
         ;;
     esac
-    if is_client_native_ufs "$ufs"; then
-      remember_skipped_native_ufs "$ufs"
-      continue
-    fi
     features="${features},${ufs}"
   done
   echo "$features"
@@ -689,7 +765,7 @@ libsdk_features() {
 build_curvine_libsdk() {
   local sdk_feature="$1"
   local features
-  features="$(libsdk_features "$sdk_feature" "curvine-common/system")" || exit 1
+  features="$(libsdk_features "$sdk_feature")" || exit 1
   # Invoke cargo via argv (no eval) so --ufs values cannot inject shell metacharacters.
   local -a sdk_cmd=(cargo build)
   if [ -n "$PROFILE" ]; then
@@ -711,7 +787,7 @@ fi
 FEATURES=()
 append_ufs_features "server-native"
 append_extra_features "server-native"
-append_alloc_feature
+append_alloc_feature "server-native"
 if [ $ENABLE_SPDK -eq 1 ]; then
   add_feature "curvine-server/spdk"
   echo "Enabling SPDK NVMe-oF initiator support (TCP transport)"
@@ -730,18 +806,19 @@ if [ ${#CLIENT_RUST_BUILD_ARGS[@]} -gt 0 ]; then
   append_ufs_features "client-safe"
 fi
 append_extra_features "client-safe"
-append_alloc_feature
+append_alloc_feature "client-safe"
 CLIENT_FEATURES=("${FEATURES[@]}")
 
 FEATURES=()
+append_ufs_features "cli-minimal"
 append_extra_features "cli-minimal"
-append_alloc_feature
+append_alloc_feature "cli-minimal"
 CLI_FEATURES=("${FEATURES[@]}")
 
 FEATURES=()
 append_ufs_features "tests"
 append_extra_features "tests"
-append_alloc_feature
+append_alloc_feature "tests"
 if [ $ENABLE_SPDK -eq 1 ]; then
   add_feature "curvine-server/spdk"
 fi
@@ -750,8 +827,8 @@ if [ $ENABLE_SPDK_RDMA -eq 1 ]; then
 fi
 TEST_FEATURES=("${FEATURES[@]}")
 
-if [ ${#CLIENT_SKIPPED_NATIVE_UFS[@]} -gt 0 ]; then
-  echo "Client-safe/minimal artifacts skip native server/storage features: ${CLIENT_SKIPPED_NATIVE_UFS[*]}"
+if [ ${#CLIENT_SKIPPED_SERVER_NATIVE_FEATURES[@]} -gt 0 ]; then
+  echo "Client artifacts skip server-native features: ${CLIENT_SKIPPED_SERVER_NATIVE_FEATURES[*]}"
 fi
 
 # Set SPDK_DIR environment variable for build.rs
@@ -857,7 +934,8 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
   protoc -I"$PROTO_DIR" --python_out="$PROTO_PKG" "$PROTO_DIR"/*.proto
   for f in "$PROTO_PKG"/*_pb2.py; do
     if [ -f "$f" ]; then
-      sed -i -E 's/^import ([A-Za-z0-9_]+_pb2)( as .*)$/from . import \1\2/' "$f"
+      sed -i.bak -E 's/^import ([A-Za-z0-9_]+_pb2)( as .*)$/from . import \1\2/' "$f"
+      rm -f "$f.bak"
     fi
   done
 
@@ -874,8 +952,8 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
   MATURIN_AUDIT="${CURVINE_MATURIN_AUDITWHEEL:-skip}"
 
   echo "Building Python wheel (maturin) into ${DIST_DIR}/lib ..."
-  cd "$FS_HOME/curvine-libsdk"
-  PY_SDK_FEATURES="$(libsdk_features "python-sdk" "curvine-common/${ALLOC}")" || exit 1
+  cd "$FS_HOME/crates/sdk/curvine-libsdk-python"
+  PY_SDK_FEATURES="$(libsdk_features "extension-module")" || exit 1
   echo "maturin features: ${PY_SDK_FEATURES}"
   "${MATURIN_CMD[@]}" build --no-default-features \
     --features "${PY_SDK_FEATURES}" \
@@ -891,15 +969,15 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
 
   # Optional legacy native artifacts (same binary as inside the wheel).
   mkdir -p "$FS_HOME"/curvine-libsdk/python/native
-  if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" ]; then
-    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" \
+  if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk_python.dll" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk_python.dll" \
       "$FS_HOME/curvine-libsdk/python/native/curvine_libsdk_python.dll"
-    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" \
+    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk_python.dll" \
       "$DIST_DIR/lib/curvine_libsdk_python.dll"
-  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
-    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" \
+  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk_python.so" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk_python.so" \
       "$FS_HOME/curvine-libsdk/python/native/libcurvine_libsdk_python_${OS_VERSION}_$ARCH_NAME.so"
-    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" \
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk_python.so" \
       "$DIST_DIR/lib/libcurvine_libsdk_python_${OS_VERSION}_$ARCH_NAME.so"
   fi
 fi

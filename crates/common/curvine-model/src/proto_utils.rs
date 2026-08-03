@@ -14,7 +14,8 @@
 
 use crate::proto::*;
 use crate::state::*;
-use orpc::{try_err, CommonResult};
+use crate::worker_info::TransferWorkerCapabilities;
+use curvine_core_error::{try_err, CommonResult};
 use prost::bytes::BytesMut;
 use prost::Message;
 use std::fmt::Debug;
@@ -346,6 +347,14 @@ impl ProtoUtils {
             last_update: src.last_update,
             reserved_bytes: src.reserved_bytes,
             weight: Some(src.weight),
+            worker_session_id: Some(src.worker_session_id),
+            transfer_task_submit: Some(src.transfer_capabilities.task_submit),
+            transfer_report_target: Some(src.transfer_capabilities.report_target),
+            transfer_query_task: Some(src.transfer_capabilities.query_task),
+            transfer_attempt_safe_output: Some(src.transfer_capabilities.attempt_safe_output),
+            transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
+            software_version: Some(src.software_version),
+            startup_time_ms: Some(src.startup_time_ms),
             storage_map: Default::default(),
         };
 
@@ -387,6 +396,16 @@ impl ProtoUtils {
                 non_fs_used: info.non_fs_used,
                 reserved_bytes: info.reserved_bytes,
                 weight: info.weight.unwrap_or_else(WorkerInfo::default_weight),
+                worker_session_id: info.worker_session_id.unwrap_or_default(),
+                transfer_capabilities: TransferWorkerCapabilities {
+                    task_submit: info.transfer_task_submit.unwrap_or(false),
+                    report_target: info.transfer_report_target.unwrap_or(false),
+                    query_task: info.transfer_query_task.unwrap_or(false),
+                    attempt_safe_output: info.transfer_attempt_safe_output.unwrap_or(false),
+                    source_read_plan: info.transfer_source_read_plan.unwrap_or(false),
+                },
+                software_version: info.software_version.unwrap_or_default(),
+                startup_time_ms: info.startup_time_ms.unwrap_or_default(),
                 ..Default::default()
             };
             for (k, v) in info.storage_map {

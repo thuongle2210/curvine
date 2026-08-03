@@ -14,15 +14,13 @@
 
 use crate::util::*;
 use clap::Parser;
-use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
-use curvine_common::error::{ErrorKind, FsError};
-use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{
-    AccessMode, MountOptions, Provider, StorageType, TtlAction, WriteType,
-};
-use curvine_common::utils::ProtoUtils;
-use orpc::common::{ByteUnit, DurationUnit};
-use orpc::{err_box, CommonResult};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_error::{ErrorKind, FsError};
+use curvine_fs_api::{FileSystem, Path};
+use curvine_model::ProtoUtils;
+use curvine_model::{AccessMode, MountOptions, Provider, StorageType, TtlAction, WriteType};
+use curvine_runtime::common::{ByteUnit, DurationUnit};
+use curvine_unified_fs::{UfsFileSystem, UnifiedFileSystem};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -289,7 +287,7 @@ impl MountCommand {
         if !configs.is_empty() {
             println!("Configuration:");
             for (key, value) in &configs {
-                println!("  {} = {}", key, value);
+                println!("  {} = {}", key, display_config_value(key, value));
             }
             println!("\n");
         }
@@ -299,7 +297,7 @@ impl MountCommand {
 
         if !self.update && self.check_path_consist && ufs_path.authority_path() != cv_path.path() {
             return err_box!(
-                "with --check-path, ufs path and cv path must be consistent. ufs: {}, cv: {}",
+                "with --check-path-consist, UFS and Curvine paths must match. UFS: {}, Curvine: {}",
                 ufs_path.authority_path(),
                 cv_path.path()
             );
@@ -314,11 +312,21 @@ impl MountCommand {
             &ufs_path,
             mnt_opts.add_properties.clone(),
             mnt_opts.provider,
-        )?;
-        if let Err(e) = ufs.list_status(&ufs_path).await {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+        )
+        .map_err(|err| {
+            FsError::common(format!(
+                "Unable to initialize UFS {}: {}. Verify the URI, mount configuration, and credentials.",
+                ufs_path.full_path(),
+                err
+            ))
+        })?;
+        ufs.list_status(&ufs_path).await.map_err(|err| {
+            FsError::common(format!(
+                "Unable to access UFS {}: {}. Verify the endpoint, credentials, and network connectivity.",
+                ufs_path.full_path(),
+                err
+            ))
+        })?;
 
         handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
         println!("│ ✅️ mount success.");
@@ -559,4 +567,24 @@ impl MountCommand {
 
         Ok(opts.build())
     }
+}
+
+fn display_config_value<'a>(key: &str, value: &'a str) -> &'a str {
+    if is_sensitive_config_key(key) {
+        "******"
+    } else {
+        value
+    }
+}
+
+fn is_sensitive_config_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("credential")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("password")
+        || key.contains("access_key")
+        || key.ends_with(".access")
+        || key.ends_with(".ak")
+        || key.ends_with(".sk")
 }

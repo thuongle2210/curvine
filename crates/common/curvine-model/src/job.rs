@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::state::{MountInfo, StorageType, TtlAction, WorkerAddress};
+use curvine_runtime::common::ByteUnit;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::common::ByteUnit;
 use serde::{Deserialize, Serialize};
 
 #[derive(
@@ -235,6 +235,22 @@ pub struct LoadTaskInfo {
     pub source_path: String,
     pub target_path: String,
     pub create_time: i64,
+    #[serde(default)]
+    pub source_read_plan_json: String,
+    #[serde(default)]
+    pub transfer_report: Option<TransferTaskReportInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferTaskReportInfo {
+    pub run_id: u64,
+    pub attempt_id: u64,
+    pub worker_id: u32,
+    pub worker_session_id: String,
+    #[serde(default)]
+    pub report_target: String,
+    #[serde(default)]
+    pub report_endpoints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,7 +329,7 @@ impl JobTaskProgress {
 #[cfg(test)]
 mod tests {
     use super::JobTaskProgress;
-    use orpc::common::ByteUnit;
+    use curvine_runtime::common::ByteUnit;
 
     #[test]
     fn progress_string_caps_loaded_bytes_at_total() {

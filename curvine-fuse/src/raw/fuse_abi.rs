@@ -54,6 +54,14 @@ pub struct fuse_init_in {
     pub flags: u32,
 }
 
+/// Tail of the extended 64-byte `fuse_init_in` sent by kernels using ABI 7.36+.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_init_in_ext_tail {
+    pub flags2: u32,
+    pub unused: [u32; 11],
+}
+
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct fuse_init_out {
@@ -190,6 +198,14 @@ pub struct fuse_write_in {
 pub struct fuse_write_out {
     pub size: u32,
     pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_getattr_in {
+    pub getattr_flags: u32,
+    pub dummy: u32,
+    pub fh: u64,
 }
 
 #[repr(C)]
@@ -351,6 +367,11 @@ pub struct fuse_lseek_in {
     pub padding: u64,
 }
 
+/// Request flag: ioctl is not restricted to `_IOC_*` size transfers; retry allowed.
+pub const FUSE_IOCTL_UNRESTRICTED: u32 = 1 << 1;
+/// Reply flag: kernel should retry the ioctl with the provided iovecs.
+pub const FUSE_IOCTL_RETRY: u32 = 1 << 2;
+
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct fuse_ioctl_in {
@@ -360,6 +381,13 @@ pub struct fuse_ioctl_in {
     pub arg: u64,
     pub in_size: u32,
     pub out_size: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_ioctl_iovec {
+    pub base: u64,
+    pub len: u64,
 }
 
 #[repr(C)]

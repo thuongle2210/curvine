@@ -17,6 +17,7 @@
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=ru">Русский</a>
 </p>
 
+[![CNCF Landscape](https://img.shields.io/badge/CNCF%20Landscape-5699C6)](https://landscape.cncf.io/?item=runtime--cloud-native-storage--curvine)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)](https://www.rust-lang.org)
 

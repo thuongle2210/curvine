@@ -1,12 +1,17 @@
 [package]
 name = "curvine-tests"
 version = "0.1.0"
+description = "Curvine integration and regression test harness"
 edition = "2021"
+publish = false
+
+# This package is an opt-in test harness, not a production crate. Its normal
+# dependencies may include server/client/FUSE paths used by integration tests.
 
 [features]
 # Enable OSS-HDFS backend specific tests / code paths (Jindo-based).
 # This is used by `#[cfg(feature = "oss-hdfs")]` in integration tests.
-oss-hdfs = ["curvine-ufs/oss-hdfs"]
+oss-hdfs = ["curvine-client/oss-hdfs"]
 lancedb = [
     "dep:curvine-lancedb",
     "dep:lance-io",
@@ -25,9 +30,9 @@ required-features = ["lancedb"]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-server = { workspace = true }
-curvine-client = { workspace = true }
+curvine-client = { workspace = true, features = ["job-client", "unified", "opendal-s3"] }
 curvine-lancedb = { workspace = true, optional = true }
-curvine-ufs = { workspace = true }
+curvine-ufs-api = { workspace = true }
 tokio  = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

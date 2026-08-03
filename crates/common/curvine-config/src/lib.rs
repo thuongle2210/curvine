@@ -17,6 +17,9 @@ pub use curvine_error::{FsError, FsResult};
 pub const DEFAULT_HOSTNAME: &str = "localhost";
 pub const DEFAULT_FUSE_WEB_PORT: u16 = 9002;
 
+mod cluster_conf;
+pub use self::cluster_conf::{ClusterConf, JournalConf, JournalPeer, MasterConf};
+
 mod cli_conf;
 pub use self::cli_conf::CliConf;
 
@@ -28,6 +31,9 @@ pub use self::fuse_conf::FuseConf;
 
 mod job_conf;
 pub use self::job_conf::JobConf;
+
+mod transfer_conf;
+pub use self::transfer_conf::*;
 
 mod ufs_conf;
 pub use self::ufs_conf::{UfsConf, UfsConfBuilder};

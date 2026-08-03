@@ -14,14 +14,14 @@
 
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::CurvineURI;
-use curvine_common::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
-use curvine_common::raft::storage::{AppStorage, ApplyMsg};
-use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::state::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
     RenameFlags, WorkerInfo, WriteType,
 };
 use curvine_common::utils::SerdeUtils;
+use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
+use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+use curvine_raft::raft::{NodeId, RaftPeer};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
     JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,
@@ -277,6 +277,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
         vec![commit],
         &address.client_name,
         false,
+        None,
     )?;
 
     // File renaming
@@ -298,7 +299,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
         block_len: 10,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
     };
-    fs_leader.complete_file(path, None, 10, vec![commit], "", false)?;
+    fs_leader.complete_file(path, None, 10, vec![commit], "", false, None)?;
 
     let commit = CommitBlock {
         block_id: block.block.id,
@@ -310,7 +311,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
         CreateFileOpts::with_create(true),
         OpenFlags::new_create(),
     )?;
-    fs_leader.complete_file(path, None, 13, vec![commit], "", false)?;
+    fs_leader.complete_file(path, None, 13, vec![commit], "", false, None)?;
 
     Ok(())
 }

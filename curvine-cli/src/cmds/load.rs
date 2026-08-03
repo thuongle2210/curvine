@@ -15,9 +15,11 @@
 use crate::cmds::LoadStatusCommand;
 use crate::util::*;
 use clap::Parser;
-use curvine_client::rpc::JobMasterClient;
-use curvine_common::state::LoadJobCommand;
-use orpc::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_fs_api::Path;
+use curvine_job_client::{JobMasterClient, TransferClient};
+use curvine_model::{LoadJobCommand, TransferCommand, TransferKind, TransferState};
+use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Parser, Debug)]
 pub struct LoadCommand {
@@ -30,10 +32,21 @@ pub struct LoadCommand {
     /// Watch load job status after submission
     #[arg(long, short = 'w')]
     watch: bool,
+
+    /// Do not overwrite an existing target file
+    #[arg(long = "no-overwrite", default_value_t = true, action = clap::ArgAction::SetFalse)]
+    overwrite: bool,
+
+    /// Start a new incremental load when the matching transfer has already finished
+    #[arg(long)]
+    force: bool,
 }
 
 impl LoadCommand {
-    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
+    pub async fn execute_legacy(&self, client: JobMasterClient) -> CommonResult<()> {
+        if self.force {
+            return err_box!("load --force requires transfer.enabled=true");
+        }
         if self.source_path.trim().is_empty() {
             eprintln!("Error: Path cannot be empty");
             std::process::exit(1);
@@ -47,13 +60,13 @@ impl LoadCommand {
             std::process::exit(1);
         }
 
-        println!("\n Loading file to Curvine");
+        println!("\nLoading file to Curvine");
         println!("Source path: {}", self.source_path);
         if let Some(target_path) = &self.target_path {
             println!("Target path: {}", target_path);
         }
 
-        let command_builder = LoadJobCommand::builder(&self.source_path);
+        let command_builder = LoadJobCommand::builder(&self.source_path).overwrite(self.overwrite);
         let command = if let Some(target_path) = &self.target_path {
             command_builder.target_path(target_path).build()
         } else {
@@ -65,8 +78,86 @@ impl LoadCommand {
         if self.watch {
             let status_command =
                 LoadStatusCommand::new(rep.job_id.clone(), false, "1s".to_string());
-
             status_command.execute(client).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn execute_transfer(
+        &self,
+        fs: UnifiedFileSystem,
+        transfer_client: TransferClient,
+    ) -> CommonResult<()> {
+        if self.source_path.trim().is_empty() {
+            eprintln!("Error: Path cannot be empty");
+            std::process::exit(1);
+        }
+        if self
+            .target_path
+            .as_ref()
+            .is_some_and(|target_path| target_path.trim().is_empty())
+        {
+            eprintln!("Error: Target path cannot be empty");
+            std::process::exit(1);
+        }
+
+        println!("\nLoading file to Curvine");
+        println!("Source path: {}", self.source_path);
+        if let Some(target_path) = &self.target_path {
+            println!("Target path: {}", target_path);
+        }
+
+        let input = Path::from_str(&self.source_path)?;
+        let (source, target) = if let Some(target_path) = &self.target_path {
+            (input, Path::from_str(target_path)?)
+        } else {
+            let peer = match fs.toggle_path(&input, true).await? {
+                Some(peer) => peer,
+                None => return err_box!("{} is not mounted", self.source_path),
+            };
+            if input.is_cv() {
+                (peer, input)
+            } else {
+                (input, peer)
+            }
+        };
+        if source.is_cv() || !target.is_cv() {
+            return err_box!(
+                "load requires a UFS source and Curvine target: {} -> {}",
+                source.full_path(),
+                target.full_path()
+            );
+        }
+        let mut command = TransferCommand {
+            kind: TransferKind::Load,
+            source_path: source.clone_uri(),
+            target_path: target.clone_uri(),
+            client_request_id: TransferCommand::default_client_request_id_with_overwrite(
+                TransferKind::Load,
+                source.clone_uri(),
+                target.clone_uri(),
+                self.overwrite,
+            ),
+            submitter: "curvine-cli".to_string(),
+            tenant: String::new(),
+            options: Default::default(),
+        };
+        command.set_overwrite(self.overwrite);
+        let mut rep = handle_rpc_result(transfer_client.submit(command)).await;
+        if self.force && TransferState::from(rep.state).is_terminal() {
+            rep = handle_rpc_result(transfer_client.retry(&rep.job_id)).await;
+        }
+        println!("Job ID: {}", rep.job_id);
+        println!("Target path: {}", target.full_path());
+        println!("State: {}", rep.state);
+
+        if self.watch {
+            let status_command = LoadStatusCommand::new(rep.job_id, false, "1s".to_string());
+
+            status_command
+                .execute_transfer_only(transfer_client)
+                .await?;
         }
 
         Ok(())
@@ -86,5 +177,13 @@ mod tests {
         assert_eq!(cmd.source_path, "s3://flink/user");
         assert_eq!(cmd.target_path.as_deref(), Some("/flink/user"));
         assert!(cmd.watch);
+    }
+
+    #[test]
+    fn parses_force() {
+        let cmd = LoadCommand::try_parse_from(["load", "s3://flink/user", "--force"])
+            .expect("load command should accept --force");
+
+        assert!(cmd.force);
     }
 }

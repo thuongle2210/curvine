@@ -1,6 +1,6 @@
 use clap::Subcommand;
-use curvine_client::unified::UnifiedFileSystem;
-use orpc::CommonResult;
+use curvine_core_error::CommonResult;
+use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Subcommand, Debug)]
 pub enum DfCommand {

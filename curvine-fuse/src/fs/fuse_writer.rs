@@ -20,7 +20,7 @@ use curvine_client::unified::UnifiedWriter;
 use curvine_common::conf::FuseConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileAllocOpts, FileStatus};
+use curvine_common::state::{FileAllocOpts, FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
 use log::{error, warn};
 use orpc::common::LocalTime;
@@ -33,7 +33,11 @@ use std::sync::Arc;
 enum WriteTask {
     Write(i64, Bytes, Option<FuseResponse>),
     Flush(CallSender<FsResult<()>>, Option<FuseResponse>),
-    Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
+    Complete(
+        CallSender<FsResult<()>>,
+        Option<FuseResponse>,
+        Option<SetAttrOpts>,
+    ),
     Resize(CallSender<FsResult<()>>, FileAllocOpts),
 }
 
@@ -51,6 +55,14 @@ pub struct FuseWriter {
     len: Arc<AtomicLong>,
     mtime: Arc<AtomicLong>,
     write_ver: AtomicCounter,
+    /// Serializes write/resize enqueue with dirty-read snapshot flush.
+    ///
+    /// On a bounded stream channel, `send_queued_task` may wait for capacity.
+    /// Holding this gate across that wait ensures a dirty-read Flush cannot be
+    /// queued ahead of a Write that has already started enqueueing, without
+    /// requiring a global zero-inflight instant (which can starve under
+    /// continuous concurrent writers).
+    enqueue_gate: tokio::sync::Mutex<()>,
     metrics_enabled: bool,
 }
 
@@ -99,6 +111,7 @@ impl FuseWriter {
             len,
             mtime,
             write_ver,
+            enqueue_gate: tokio::sync::Mutex::new(()),
             metrics_enabled,
         }
     }
@@ -122,6 +135,12 @@ impl FuseWriter {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
+    fn checked_write_end(off: i64, len: usize) -> FsResult<i64> {
+        let len = i64::try_from(len).map_err(|_| FsError::file_too_large(i64::MAX))?;
+        off.checked_add(len)
+            .ok_or_else(|| FsError::file_too_large(i64::MAX))
+    }
+
     async fn send_queued_task(&self, task: WriteTask) -> Result<(), FsError> {
         if self.sender.is_bounded() {
             // Reserve before creating the guard to avoid cancellation leaks.
@@ -139,11 +158,19 @@ impl FuseWriter {
     }
 
     pub async fn write(&self, off: i64, data: Bytes, reply: Option<FuseResponse>) -> FsResult<()> {
-        // Keep write_ver increment before enqueue; read-after-write depends on it.
-        self.write_ver.incr();
-        self.send_queued_task(WriteTask::Write(off, data, reply))
+        Self::checked_write_end(off, data.len())?;
+
+        // Bump write_ver only after the Write is queued. Hold enqueue_gate across
+        // the send so dirty-read flush cannot overtake a mid-reserve Write.
+        let _gate = self.enqueue_gate.lock().await;
+        let result = self
+            .send_queued_task(WriteTask::Write(off, data, reply))
             .await
-            .map_err(|e| self.check_error(e))
+            .map_err(|e| self.check_error(e));
+        if result.is_ok() {
+            self.write_ver.incr();
+        }
+        result
     }
 
     pub async fn flush(&self, reply: Option<FuseResponse>) -> FsResult<()> {
@@ -157,10 +184,44 @@ impl FuseWriter {
         fun.await.map_err(|e| self.check_error(e))
     }
 
-    pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
+    /// Flush a dirty-read snapshot covering every write queued at capture time.
+    ///
+    /// Acquires `enqueue_gate` so the Flush is ordered after in-flight enqueues
+    /// without waiting for a global zero-inflight instant. Continuous writers may
+    /// keep advancing `write_ver` after this returns; the caller pins `read_ver`
+    /// to the returned snapshot and republishes on a later read if needed.
+    ///
+    /// Returns `Ok(None)` when `read_ver` already matches the gated `write_ver`.
+    pub async fn publish_dirty_read_snapshot(&self, read_ver: u64) -> FsResult<Option<u64>> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
-            self.send_queued_task(WriteTask::Complete(rx, reply))
+            let target_ver;
+            {
+                let _gate = self.enqueue_gate.lock().await;
+                target_ver = self.write_ver.get();
+                if target_ver == read_ver {
+                    return Ok(None);
+                }
+                self.send_queued_task(WriteTask::Flush(rx, None)).await?;
+            }
+            tx.receive().await??;
+            Ok(Some(target_ver))
+        };
+        fun.await.map_err(|e| self.check_error(e))
+    }
+
+    pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
+        self.complete_with_attr(reply, None).await
+    }
+
+    pub async fn complete_with_attr(
+        &self,
+        reply: Option<FuseResponse>,
+        set_attr_opts: Option<SetAttrOpts>,
+    ) -> FsResult<()> {
+        let fun = async {
+            let (rx, tx) = CallChannel::channel();
+            self.send_queued_task(WriteTask::Complete(rx, reply, set_attr_opts))
                 .await?;
             // Double `?`: the outer unwraps the channel receive, the inner
             // propagates the real backend complete result.
@@ -174,15 +235,19 @@ impl FuseWriter {
         let len = opts.len;
         let fun = async {
             let (rx, tx) = CallChannel::channel();
-            self.send_queued_task(WriteTask::Resize(rx, opts)).await?;
+            {
+                let _gate = self.enqueue_gate.lock().await;
+                let send = self.send_queued_task(WriteTask::Resize(rx, opts)).await;
+                if send.is_ok() {
+                    self.write_ver.incr();
+                }
+                send?;
+            }
             // Double `?`: unwrap the channel receive, then propagate the real
             // backend resize result.
             tx.receive().await??;
             Ok::<(), FsError>(())
         };
-        // `write_ver.incr()` stays at its existing position (after building `fun`,
-        // before awaiting it) — unchanged consistency timing.
-        self.write_ver.incr();
         fun.await.map_err(|e| self.check_error(e))?;
         self.len.set(len);
         Ok(())
@@ -229,7 +294,7 @@ impl FuseWriter {
 
         // Abort only before any durability boundary may have published the data.
         let cleanup_result = if preserve_on_exit {
-            writer.complete().await
+            writer.complete_with_attr(None).await
         } else {
             writer.cancel().await
         };
@@ -268,6 +333,7 @@ impl FuseWriter {
                     // New writes invalidate prior complete state before backend IO starts.
                     *completed = false;
                     let len = data.len();
+                    let write_end = Self::checked_write_end(off, len)?;
                     let io_start = if metrics_enabled {
                         Some(mono_now())
                     } else {
@@ -299,7 +365,7 @@ impl FuseWriter {
 
                     if res.is_ok() {
                         let cur_len = file_len.get();
-                        file_len.set(cur_len.max(off + len as i64));
+                        file_len.set(cur_len.max(write_end));
                         file_mtime.set(LocalTime::mills() as i64);
                     }
 
@@ -322,9 +388,9 @@ impl FuseWriter {
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
 
-                WriteTask::Complete(tx, reply) => {
+                WriteTask::Complete(tx, reply, opts) => {
                     *preserve_on_exit = true;
-                    let res = writer.complete().await;
+                    let res = writer.complete_with_attr(opts).await;
                     *completed = res.is_ok();
                     crate::fs::deliver_stream_result(res, tx, reply).await?;
                 }
@@ -352,7 +418,7 @@ mod tests {
     use curvine_common::fs::{Path, Writer};
     use curvine_common::state::FileStatus;
     use curvine_common::FsResult;
-    use orpc::common::Metrics as m;
+    use curvine_metrics::Metrics as m;
     use orpc::sync::channel::{AsyncChannel, CallChannel};
     use orpc::sync::AtomicLong;
     use orpc::sys::DataSlice;
@@ -442,6 +508,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn checked_write_end_accepts_maximum_endpoint() {
+        assert_eq!(
+            FuseWriter::checked_write_end(i64::MAX, 0).unwrap(),
+            i64::MAX
+        );
+        assert_eq!(
+            FuseWriter::checked_write_end(i64::MAX - 1, 1).unwrap(),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn checked_write_end_rejects_overflowing_endpoint() {
+        for (off, len) in [(i64::MAX, 1_usize), (i64::MAX - 1, 2_usize)] {
+            let err = FuseWriter::checked_write_end(off, len)
+                .expect_err("overflowing write endpoint must be rejected");
+            assert_eq!(crate::fuse_error::errno_of(&err), libc::EFBIG);
+            assert!(matches!(err, FsError::InvalidFileSize(_)));
+        }
+    }
+
     #[tokio::test]
     async fn abnormal_channel_close_cancels_backend_writer_once() {
         let cancel_count = Arc::new(AtomicUsize::new(0));
@@ -474,7 +562,7 @@ mod tests {
         let (result_tx, result_rx) = CallChannel::channel::<FsResult<()>>();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Complete(result_tx, None),
+                task: WriteTask::Complete(result_tx, None, None),
                 queue_guard: None,
             })
             .await
@@ -609,7 +697,7 @@ mod tests {
         assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
     }
 
-    fn queued_task(gauge: &orpc::common::Gauge) -> QueuedWriteTask {
+    fn queued_task(gauge: &curvine_metrics::Gauge) -> QueuedWriteTask {
         let (rx, _tx) = CallChannel::channel::<FsResult<()>>();
         QueuedWriteTask {
             task: WriteTask::Flush(rx, None),
@@ -698,8 +786,9 @@ mod tests {
         use bytes::Bytes;
         use curvine_client::unified::UnifiedWriter;
         use curvine_common::conf::FuseConf;
+        use curvine_common::error::FsError;
         use curvine_common::fs::local::LocalWriter;
-        use orpc::common::Metrics as m;
+        use curvine_metrics::Metrics as m;
         use orpc::runtime::{AsyncRuntime, RpcRuntime};
         use orpc::sync::channel::AsyncChannel;
         use std::sync::Arc;
@@ -772,6 +861,48 @@ mod tests {
                     .expect("writer survives a flush reply-send failure");
 
                 assert_eq!(std::fs::read(&path_buf).unwrap(), b"firstsecond");
+                let _ = std::fs::remove_file(&path_buf);
+            });
+        }
+
+        #[test]
+        fn overflowing_write_endpoint_is_rejected_before_enqueue() {
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let path_buf = std::env::temp_dir().join(format!(
+                    "fw_overflow_reject_{}_{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+                let conf = FuseConf {
+                    metrics_enabled: false,
+                    ..Default::default()
+                };
+                let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
+                let rt2 = Arc::new(AsyncRuntime::single());
+                let fuse_writer = FuseWriter::new(&conf, rt2.clone(), writer);
+                std::mem::forget(rt2);
+
+                assert_eq!(fuse_writer.write_ver(), 0);
+                assert_eq!(fuse_writer.len(), 0);
+
+                let err = fuse_writer
+                    .write(i64::MAX, Bytes::from_static(b"x"), None)
+                    .await
+                    .expect_err("overflowing write endpoint must be rejected");
+                assert_eq!(crate::fuse_error::errno_of(&err), libc::EFBIG);
+                assert!(matches!(err, FsError::InvalidFileSize(_)));
+
+                assert_eq!(fuse_writer.write_ver(), 0);
+                assert_eq!(
+                    fuse_writer.len(),
+                    0,
+                    "rejected writes must not change cached file length"
+                );
+
+                fuse_writer.complete(None).await.unwrap();
                 let _ = std::fs::remove_file(&path_buf);
             });
         }
@@ -885,6 +1016,75 @@ mod tests {
 
                 let _ = std::fs::remove_file(&path_buf);
             });
+        }
+
+        /// Continuous writers on a capacity-1 stream channel must not starve
+        /// dirty-read snapshot publication (former global zero-inflight wait).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dirty_read_snapshot_completes_under_continuous_bounded_writers() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::time::Duration;
+
+            let path_buf = std::env::temp_dir().join(format!(
+                "fw_dirty_read_stress_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let path = curvine_common::fs::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+
+            let conf = FuseConf {
+                stream_channel_size: 1,
+                metrics_enabled: false,
+                ..Default::default()
+            };
+            let writer = UnifiedWriter::Local(LocalWriter::new(&path, 4096).unwrap());
+            let rt2 = Arc::new(AsyncRuntime::single());
+            let fuse_writer = Arc::new(FuseWriter::new(&conf, rt2.clone(), writer));
+            std::mem::forget(rt2);
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut writer_tasks = Vec::new();
+            for i in 0..4 {
+                let w = fuse_writer.clone();
+                let stop = stop.clone();
+                writer_tasks.push(tokio::spawn(async move {
+                    let mut off = (i as i64) * 1_000_000;
+                    while !stop.load(Ordering::Relaxed) {
+                        // Ignore individual write errors once complete() races shutdown.
+                        let _ = w.write(off, Bytes::from_static(b"x"), None).await;
+                        off += 1;
+                    }
+                }));
+            }
+
+            // Let writers fill the bounded queue and contend on enqueue_gate.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let published = tokio::time::timeout(
+                Duration::from_secs(5),
+                fuse_writer.publish_dirty_read_snapshot(0),
+            )
+            .await
+            .expect("dirty-read snapshot must complete under continuous bounded writers")
+            .expect("dirty-read snapshot flush must succeed");
+            let ver = published.expect("expected a snapshot while writers are active");
+            assert!(ver > 0, "expected a non-zero snapshot, got {ver}");
+
+            // Re-check must also complete under load (may flush a newer snapshot).
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fuse_writer.publish_dirty_read_snapshot(ver),
+            )
+            .await
+            .expect("dirty-read re-publish must complete under continuous writers")
+            .expect("dirty-read re-publish flush must succeed");
+
+            stop.store(true, Ordering::Relaxed);
+            for task in writer_tasks {
+                let _ = task.await;
+            }
+            let _ = fuse_writer.complete(None).await;
+            let _ = std::fs::remove_file(&path_buf);
         }
     }
 }

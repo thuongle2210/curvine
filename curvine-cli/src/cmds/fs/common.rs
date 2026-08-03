@@ -1,7 +1,7 @@
 use super::content_summary::ContentSummary;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::{CurvineURI, FileSystem};
-use orpc::CommonResult;
+use curvine_core_error::CommonResult;
+use curvine_fs_api::{CurvineURI, FileSystem};
+use curvine_unified_fs::UnifiedFileSystem;
 
 /// Calculates content summary (directory size, file count, directory count) on the client side
 pub async fn calculate_content_summary(

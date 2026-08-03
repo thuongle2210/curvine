@@ -8,51 +8,55 @@ license.workspace = true
 
 [features]
 default = []
-jni = ["curvine-ufs/jni"]
-spdk = ["dep:curvine-storage-spdk", "curvine-storage-spdk/spdk"]
-spdk-rdma = ["spdk", "curvine-storage-spdk/spdk-rdma"]
+jni = ["curvine-data-transfer/opendal-hdfs"]
+spdk = [
+    "curvine-worker/spdk",
+    "curvine-storage-local/spdk",
+]
+spdk-rdma = [
+    "spdk",
+    "curvine-worker/spdk-rdma",
+    "curvine-storage-local/spdk-rdma",
+]
 fault-injection = [
     "curvine-fault/http-server",
+    "curvine-master/fault-injection",
+    "curvine-worker/fault-injection",
 ]
 
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
+curvine-master = { workspace = true }
+curvine-worker = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-fault = { workspace = true }
-curvine-storage-spdk = { workspace = true, optional = true }
-curvine-client = { workspace = true }
-curvine-ufs = { workspace = true }
+curvine-client-core = { workspace = true }
+curvine-data-transfer = { workspace = true, features = ["opendal-s3", "transfer-server"] }
+curvine-storage-local = { workspace = true }
+curvine-rocksdb = { workspace = true }
+curvine-raft = { workspace = true }
+curvine-job-client = { workspace = true }
+curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }
-bincode = { workspace = true }
 serde = { workspace = true }
-rocksdb = { workspace = true }
 log = { workspace = true }
-raft = { workspace = true }
 once_cell = { workspace = true }
 tokio = { workspace = true }
-glob = { workspace = true }
 futures = { workspace = true }
-toml = { workspace = true }
-num_enum = { workspace = true }
-indexmap = { workspace = true }
 clap = { workspace = true }
-mini-moka = { workspace = true }
-regex = { workspace = true }
-linked-hash-map = { workspace = true }
+crossbeam = { workspace = true }
+rusqlite = { workspace = true }
+mysql = { workspace = true }
 dashmap = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
-rand = { workspace = true }
-url = { workspace = true }
 parking_lot = { workspace = true }
-lru = { workspace = true }
-byteorder = { workspace = true }
 
 [dev-dependencies]
 curvine-fault = { workspace = true, features = ["http-client"] }
+raft = { workspace = true }

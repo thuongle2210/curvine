@@ -1,8 +1,8 @@
 use clap::Subcommand;
-use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::fs::{CurvineURI, FileSystem};
-use curvine_common::state::SetAttrOpts;
-use orpc::CommonResult;
+use curvine_core_error::CommonResult;
+use curvine_fs_api::{CurvineURI, FileSystem};
+use curvine_model::SetAttrOpts;
+use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Subcommand, Debug)]
 pub enum ChownCommand {

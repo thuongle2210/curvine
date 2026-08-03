@@ -27,12 +27,14 @@ use crate::{
     FUSE_ROOT_ID, STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
+use curvine_common::conf::{ClientConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
 use curvine_common::state::{
-    CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, RenameFlags,
+    SetAttrOpts,
 };
+use curvine_config::ClusterConf;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use orpc::common::FastHashMap;
@@ -778,12 +780,12 @@ impl NodeState {
         });
     }
 
-    fn inc_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+    fn inc_gauges_lockstep(legacy: &curvine_metrics::Gauge, alias: &curvine_metrics::Gauge) {
         legacy.inc();
         alias.inc();
     }
 
-    fn dec_gauges_lockstep(legacy: &orpc::common::Gauge, alias: &orpc::common::Gauge) {
+    fn dec_gauges_lockstep(legacy: &curvine_metrics::Gauge, alias: &curvine_metrics::Gauge) {
         legacy.dec();
         alias.dec();
     }
@@ -1046,10 +1048,18 @@ impl NodeState {
         old_name: &str,
         new_id: u64,
         new_name: &str,
+        flags: RenameFlags,
     ) -> FuseResult<()> {
         let (old_path, new_path) = self.get_path2(old_id, old_name, new_id, new_name)?;
-        self.fs.rename(&old_path, &new_path).await?;
-        self.rename(old_id, old_name, new_id, new_name)
+        self.fs
+            .rename_with_flags(&old_path, &new_path, flags)
+            .await?;
+        if flags.exchange_mode() {
+            self.dir_write()
+                .exchange(old_id, old_name, new_id, new_name)
+        } else {
+            self.rename(old_id, old_name, new_id, new_name)
+        }
     }
 
     pub async fn fs_fsync(&self, parent: u64, name: Option<&str>) -> FuseResult<()> {
@@ -1146,6 +1156,10 @@ impl NodeState {
         Ok(ListStream::new(dots.chain(inner)))
     }
 
+    fn restored_dir_handle_path(&self, handle: &DirHandle) -> FuseResult<Path> {
+        self.get_path(handle.ino)
+    }
+
     pub async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
         let metrics_enabled = self.conf.metrics_enabled;
 
@@ -1223,9 +1237,11 @@ impl NodeState {
                 let dir_handles_count = reader.read_len()?;
                 for _ in 0..dir_handles_count {
                     let mut handle = reader.read_struct::<DirHandle>()?;
-                    let path = Path::from_str(&handle.path)?;
+                    // DirHandle.path may be the original open-time path. The
+                    // restored dcache is authoritative after a rename.
+                    let path = self.restored_dir_handle_path(&handle)?;
                     let stream = self.list_stream(&path).await?;
-                    handle.set_stream(stream);
+                    handle.set_stream(&path, stream);
 
                     self.dir_handles
                         .write()
@@ -1398,6 +1414,41 @@ mod test {
     }
 
     #[test]
+    fn invalidating_parent_status_drops_stale_nlink() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = true;
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        state.cache_resolved_status(
+            FUSE_ROOT_ID,
+            None,
+            &FileStatus {
+                is_dir: true,
+                nlink: 3,
+                mode: 0o755,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state
+                .get_cached_status(FUSE_ROOT_ID, None, false)
+                .unwrap()
+                .unwrap()
+                .nlink,
+            3
+        );
+
+        state.invalid_cache(FUSE_ROOT_ID, None, crate::fuse_metrics::INVAL_REASON_RMDIR);
+        assert!(state
+            .get_cached_status(FUSE_ROOT_ID, None, false)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn handle_chokepoints_inc_dec_their_own_gauge_only() {
         crate::FuseMetrics::ensure_init().unwrap();
         let mx = crate::FuseMetrics::get();
@@ -1429,12 +1480,12 @@ mod test {
 
     #[test]
     fn inc_dec_gauges_lockstep_move_both_together() {
-        let legacy = orpc::common::Metrics::new_gauge(
+        let legacy = curvine_metrics::Metrics::new_gauge(
             "test_lockstep_legacy_gauge_unique",
             "isolated legacy gauge",
         )
         .unwrap();
-        let alias = orpc::common::Metrics::new_gauge(
+        let alias = curvine_metrics::Metrics::new_gauge(
             "test_lockstep_alias_gauge_unique",
             "isolated alias gauge",
         )
@@ -1488,6 +1539,89 @@ mod test {
                 result.is_err(),
                 "a corrupt file-handle record must fail the whole state restore"
             );
+        });
+    }
+
+    #[test]
+    fn persisted_dir_handle_resolves_path_after_ancestor_rename() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt).unwrap();
+            let persisted_state = NodeState::new(fs.clone()).unwrap();
+            let restored_state = NodeState::new(fs).unwrap();
+
+            let dir_ino = {
+                let mut tree = persisted_state.dir_write();
+                let parent_ino = tree
+                    .lookup(
+                        FUSE_ROOT_ID,
+                        "old",
+                        FileStatus::with_name(10, "old".to_string(), true),
+                        false,
+                    )
+                    .unwrap()
+                    .ino;
+                tree.lookup(
+                    parent_ino,
+                    "d",
+                    FileStatus::with_name(11, "d".to_string(), true),
+                    false,
+                )
+                .unwrap()
+                .ino
+            };
+
+            let old_path = persisted_state.get_path(dir_ino).unwrap();
+            let handle = Arc::new(DirHandle::new(
+                dir_ino,
+                77,
+                &old_path,
+                16,
+                ListStream::new(futures::stream::empty()),
+            ));
+            persisted_state
+                .dir_handles
+                .write()
+                .entry(dir_ino)
+                .or_default()
+                .insert(handle.fh, handle);
+
+            persisted_state
+                .rename(FUSE_ROOT_ID, "old", FUSE_ROOT_ID, "new")
+                .unwrap();
+            assert_eq!(
+                persisted_state.get_path(dir_ino).unwrap().full_path(),
+                "/new/d"
+            );
+
+            let state_path = Utils::temp_file();
+            let _ = std::fs::remove_file(&state_path);
+            let mut writer = StateWriter::new(&state_path).unwrap();
+            persisted_state.persist(&mut writer).await.unwrap();
+            writer.flush().unwrap();
+            drop(writer);
+
+            let mut reader = StateReader::new(&state_path).unwrap();
+            let mut magic = [0u8; 4];
+            reader.read_exact(&mut magic).unwrap();
+            assert_eq!(&magic, crate::STATE_FILE_MAGIC);
+            assert_eq!(reader.read_len().unwrap(), crate::STATE_FILE_VERSION);
+            restored_state.dir_write().restore(&mut reader).unwrap();
+
+            assert_eq!(reader.read_len().unwrap(), 0, "no file handles persisted");
+            assert_eq!(reader.read_len().unwrap(), 1, "one dir handle persisted");
+            let persisted_handle = reader.read_struct::<DirHandle>().unwrap();
+            assert_eq!(persisted_handle.path, "/old/d");
+
+            let restored_path = restored_state
+                .restored_dir_handle_path(&persisted_handle)
+                .unwrap();
+            assert_eq!(restored_path.full_path(), "/new/d");
+            drop(reader);
+            let _ = std::fs::remove_file(&state_path);
         });
     }
 

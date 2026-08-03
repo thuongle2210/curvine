@@ -12,28 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod client;
-pub mod common;
-pub mod error {
-    pub use orpc_error::*;
+pub mod client {
+    pub use curvine_rpc::client::*;
 }
-pub mod handler;
+pub mod error {
+    pub use curvine_core_error::*;
+}
+pub mod handler {
+    pub use curvine_rpc::handler::*;
+}
 pub mod io;
 pub mod macros;
-pub mod message;
-pub mod runtime;
+pub mod message {
+    pub use curvine_rpc::message::*;
+}
 pub mod server;
-pub mod sync;
-pub mod sys;
+pub mod sys {
+    pub use curvine_io::{CacheManager, DataSlice, ReadAheadTask};
+    pub use curvine_sys::*;
+}
 pub mod test;
 
-pub use orpc_error::{CommonError, CommonResult, CommonResultExt};
-
-// Kept in `orpc` (not next to `CommonErrorExt` in `orpc-error`): orphan rules
-// require a local uncovered type argument (`IOError`) to implement `From` for
-// the foreign `CommonErrorExt` type after the crate split.
-impl From<crate::io::IOError> for crate::error::CommonErrorExt {
-    fn from(value: crate::io::IOError) -> Self {
-        Self::from(CommonError::from(value))
-    }
+pub use curvine_core_error::{CommonError, CommonResult, CommonResultExt};
+pub mod common {
+    pub use curvine_metrics::*;
+    pub use curvine_runtime::common::*;
 }
+pub use curvine_runtime::{runtime, sync};

@@ -12,19 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod net;
-pub mod retry;
+pub use curvine_io::{
+    BdevInfo, BlockDevice, BlockIO, CacheManager, DataSlice, IOError, IOResult, LocalFile,
+    NvmeTarget, ReadAheadTask, SpdkConf,
+};
 
-mod local_file;
-pub use self::local_file::LocalFile;
+// `io_error` and `block_io` were public module paths before the `curvine-io`
+// extraction, so they stay reachable here even though `curvine-io` only
+// re-exports the items.
+pub mod io_error {
+    pub use curvine_io::IOError;
+}
 
-pub mod io_error;
-pub use self::io_error::IOError;
+pub mod block_io {
+    pub use curvine_io::{BlockDevice, BlockIO};
+}
 
-pub type IOResult<T> = Result<T, IOError>;
+pub mod spdk_conf {
+    pub use curvine_io::{BdevInfo, NvmeTarget, SpdkConf};
+}
 
-pub mod block_io;
-pub use self::block_io::{BlockDevice, BlockIO};
+pub mod net {
+    pub use curvine_net::net::*;
+}
 
-pub mod spdk_conf;
-pub use self::spdk_conf::{BdevInfo, NvmeTarget, SpdkConf};
+pub mod retry {
+    pub use curvine_net::retry::*;
+}

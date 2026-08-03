@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_ufs::S3Conf;
-use orpc::{err_box, CommonResult};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_ufs_api::S3Conf;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
@@ -38,7 +38,7 @@ pub fn validate_path_and_configs(
     match scheme.as_deref() {
         Some("s3") => {
             validate_s3_path(path)?;
-            S3Conf::with_map(configs.clone())?;
+            S3Conf::validate(configs)?;
             Ok(())
         }
         Some(_) => Ok(()), // No special validation for other schemes
