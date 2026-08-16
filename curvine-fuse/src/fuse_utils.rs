@@ -21,16 +21,16 @@ use crate::raw::fuse_abi::{
 use crate::*;
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::FuseConf;
-use curvine_common::fs::Path;
-use curvine_common::state::{
+use curvine_config::FuseConf;
+use curvine_fs_api::Path;
+use curvine_io::IOResult;
+use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileStatus, FileType, MkdirOpts, MkdirOptsBuilder,
     SetAttrOpts, FS_APPEND_FL, FS_IMMUTABLE_FL, IFLAGS_XATTR, MKNOD_RDEV_XATTR,
 };
-use orpc::common::LocalTime;
-use orpc::io::IOResult;
-use orpc::sys;
-use orpc::sys::{FFIUtils, RawIO};
+use curvine_runtime::common::LocalTime;
+use curvine_sys as sys;
+use curvine_sys::{FFIUtils, RawIO};
 use std::collections::HashMap;
 use std::process::Command;
 use std::slice;
@@ -44,7 +44,25 @@ pub enum XattrOp {
 
 pub struct FuseUtils;
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CallerProcessStatus {
+    supplementary_groups: Vec<u32>,
+    effective_capabilities: u64,
+}
+
+impl CallerProcessStatus {
+    pub(crate) fn in_group(&self, effective_gid: u32, file_gid: u32) -> bool {
+        effective_gid == file_gid || self.supplementary_groups.contains(&file_gid)
+    }
+
+    pub(crate) fn has_effective_capability(&self, capability: u32) -> bool {
+        capability < u64::BITS && self.effective_capabilities & (1_u64 << capability) != 0
+    }
+}
+
 impl FuseUtils {
+    const CAP_FSETID: u32 = 4;
+
     /// Reinterpret a value as its raw bytes for writing to the FUSE device.
     ///
     /// SAFETY / usage contract: `T` MUST be a FUSE C-ABI (`#[repr(C)]`) struct.
@@ -259,21 +277,10 @@ impl FuseUtils {
         name == FUSE_PARENT_DIR || name == FUSE_CURRENT_DIR
     }
 
-    pub fn create_opts(op: &Create<'_>, fs: &UnifiedFileSystem) -> CreateFileOpts {
+    pub fn create_opts(op: &Create<'_>, fs: &UnifiedFileSystem, mode: u32) -> CreateFileOpts {
         CreateFileOptsBuilder::with_conf(&fs.conf().client)
-            .acl(
-                op.header.uid,
-                op.header.gid,
-                op.arg.mode & 0o7777 & !op.arg.umask,
-            )
+            .acl(op.header.uid, op.header.gid, mode)
             .build()
-    }
-
-    /// When the parent directory has the setgid bit, new nodes inherit its group.
-    pub fn apply_setgid_parent_group(opts: &mut CreateFileOpts, parent: &FileStatus) {
-        if parent.mode & FUSE_S_ISGID != 0 {
-            opts.group.clone_from(&parent.group);
-        }
     }
 
     /// Sticky-directory hard-link rule: caller must own the source file or the
@@ -469,22 +476,29 @@ impl FuseUtils {
         CreateFileOptsBuilder::with_conf(&fs.conf().client).build()
     }
 
+    pub(crate) fn millis_to_fuse_timestamp(millis: i64) -> (u64, u32) {
+        // FUSE carries seconds as u64. Negative Unix seconds use their two's
+        // complement representation, while nanoseconds must remain non-negative.
+        let seconds = millis.div_euclid(1000);
+        let nanoseconds = millis.rem_euclid(1000) * 1_000_000;
+        (seconds as u64, nanoseconds as u32)
+    }
+
+    pub(crate) fn fuse_timestamp_is_later(left: (u64, u32), right: (u64, u32)) -> bool {
+        (left.0 as i64, left.1) > (right.0 as i64, right.1)
+    }
+
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
         // Derive blocks from reported size so size and blocks stay consistent.
         let size = FuseUtils::fuse_st_size(status)?;
         let blocks = size.div_ceil(512);
 
-        let mtime_sec = (status.mtime.max(0) / 1000) as u64;
-        let mtime_nsec = ((status.mtime.max(0) % 1000) * 1_000_000) as u32;
-
-        let atime_sec = (status.atime.max(0) / 1000) as u64;
-        let atime_nsec = ((status.atime.max(0) % 1000) * 1_000_000) as u32;
+        let (mtime_sec, mtime_nsec) = Self::millis_to_fuse_timestamp(status.mtime);
+        let (atime_sec, atime_nsec) = Self::millis_to_fuse_timestamp(status.atime);
 
         // Legacy/object-store statuses may not provide ctime yet. Falling back to mtime
         // preserves the previous behavior without hiding a real independent ctime.
-        let ctime = status.ctime();
-        let ctime_sec = (ctime.max(0) / 1000) as u64;
-        let ctime_nsec = ((ctime.max(0) % 1000) * 1_000_000) as u32;
+        let (ctime_sec, ctime_nsec) = Self::millis_to_fuse_timestamp(status.ctime());
 
         let uid = if status.owner.is_empty() {
             conf.uid
@@ -550,8 +564,8 @@ impl FuseUtils {
         op: &MkNod<'_>,
         fs: &UnifiedFileSystem,
         file_type: FileType,
+        mode: u32,
     ) -> CreateFileOpts {
-        let mode = op.arg.mode & 0o7777 & !op.arg.umask;
         CreateFileOptsBuilder::with_conf(&fs.conf().client)
             .file_type(file_type)
             .acl(op.header.uid, op.header.gid, mode)
@@ -564,21 +578,23 @@ impl FuseUtils {
 
     /// Kernel dentry/attribute cache lifetimes for FUSE replies.
     ///
-    /// When userspace permission checks are enabled, timeouts must be zero so the
-    /// kernel revalidates after parent mode changes (e.g. chmod removing search).
-    /// Otherwise cached LOOKUP/GETATTR can skip path-prefix X_OK and report success
-    /// where POSIX requires EACCES (LTP lstat02/stat03/readlink03).
+    /// Returns the configured `entry_ttl`/`attr_ttl` regardless of
+    /// `check_permission`, trading cache freshness for performance: inside the
+    /// TTL the kernel reuses cached dentries/attrs, so a parent mode change
+    /// (e.g. chmod removing search) is invisible until the cache expires, and
+    /// path traversal may skip the userspace X_OK check where POSIX requires
+    /// EACCES (LTP lstat02/stat03/readlink03).
+    ///
+    /// For strict/POSIX semantics (full LTP compliance), mount with
+    /// `entry_timeout_ms = 0` and `attr_timeout_ms = 0` so every lookup/getattr
+    /// revalidates against the metadata service.
     pub fn kernel_cache_timeouts(conf: &FuseConf) -> (u64, u32, u64, u32) {
-        if conf.check_permission {
-            (0, 0, 0, 0)
-        } else {
-            (
-                conf.entry_ttl.as_secs(),
-                conf.entry_ttl.subsec_nanos(),
-                conf.attr_ttl.as_secs(),
-                conf.attr_ttl.subsec_nanos(),
-            )
-        }
+        (
+            conf.entry_ttl.as_secs(),
+            conf.entry_ttl.subsec_nanos(),
+            conf.attr_ttl.as_secs(),
+            conf.attr_ttl.subsec_nanos(),
+        )
     }
 
     pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
@@ -634,6 +650,67 @@ impl FuseUtils {
         Self::caller_supplementary_groups(pid).contains(&file_gid)
     }
 
+    fn parse_caller_process_status(content: &str) -> CallerProcessStatus {
+        let mut status = CallerProcessStatus::default();
+        for line in content.lines() {
+            if let Some(groups) = line.strip_prefix("Groups:") {
+                status.supplementary_groups = groups
+                    .split_whitespace()
+                    .filter_map(|gid| gid.parse::<u32>().ok())
+                    .collect();
+            } else if let Some(capabilities) = line.strip_prefix("CapEff:") {
+                status.effective_capabilities =
+                    u64::from_str_radix(capabilities.trim(), 16).unwrap_or_default();
+            }
+        }
+        status
+    }
+
+    /// Read all process credentials needed by create authorization without blocking
+    /// an async FUSE executor thread. Missing or malformed fields fail closed.
+    pub(crate) async fn caller_process_status(pid: u32) -> CallerProcessStatus {
+        if pid == 0 {
+            return CallerProcessStatus::default();
+        }
+
+        let status_path = format!("/proc/{pid}/status");
+        match tokio::fs::read_to_string(status_path).await {
+            Ok(content) => Self::parse_caller_process_status(&content),
+            Err(_) => CallerProcessStatus::default(),
+        }
+    }
+
+    /// Resolve a stored numeric GID or group name without a configuration fallback.
+    pub fn resolve_group_gid(group: &str) -> Option<u32> {
+        group
+            .parse::<u32>()
+            .ok()
+            .or_else(|| sys::get_gid_by_name(group))
+    }
+
+    /// Apply Linux file-creation ordering: decide whether setgid is authorized from
+    /// the requested mode, then apply the request umask to the persisted mode.
+    pub fn normalize_create_mode(
+        requested_mode: u32,
+        umask: u32,
+        caller_in_created_group: bool,
+        has_cap_fsetid: bool,
+    ) -> u32 {
+        let requested_mode = requested_mode & 0o7777;
+        let mut mode = requested_mode & !umask;
+        let requested_setgid_exec = requested_mode & (libc::S_ISGID as u32 | libc::S_IXGRP as u32)
+            == (libc::S_ISGID as u32 | libc::S_IXGRP as u32);
+
+        if requested_setgid_exec && !caller_in_created_group && !has_cap_fsetid {
+            mode &= !(libc::S_ISGID as u32);
+        }
+        mode
+    }
+
+    pub(crate) fn caller_has_cap_fsetid(status: &CallerProcessStatus) -> bool {
+        status.has_effective_capability(Self::CAP_FSETID)
+    }
+
     /// Apply Linux chmod/fchmod security rules for special mode bits. For non-root
     /// callers, setgid is cleared when the caller is not in the inode's group
     /// (see chmod(2) and LTP chmod05/fchmod05).
@@ -650,10 +727,16 @@ impl FuseUtils {
     }
 
     pub fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
-        // FATTR_SIZE is intentionally handled by CurvineFileSystem::set_attr because resizing
-        // requires the file handle and cache invalidation managed by the caller.
+        // FATTR_SIZE is intentionally handled by CurvineFileSystem::set_attr because
+        // resizing requires the file handle and cache invalidation managed by the caller.
 
-        let owner = if (setattr.valid & FATTR_UID) != 0 {
+        // POSIX chown(2) uses (uid_t)-1 as a "keep current" sentinel. libc and the
+        // kernel still set FATTR_UID/FATTR_GID in that case, so translate the sentinel
+        // back to "attribute not present" here — otherwise the numeric fallback below
+        // would persist "4294967295" as the literal owner/group, and
+        // CurvineFileSystem::set_attr would trigger the chown suid/sgid clearing side
+        // effect on a no-op update.
+        let owner = if (setattr.valid & FATTR_UID) != 0 && setattr.uid != u32::MAX {
             match sys::get_username_by_uid(setattr.uid) {
                 Some(username) => Some(username),
                 None => Some(setattr.uid.to_string()),
@@ -662,7 +745,7 @@ impl FuseUtils {
             None
         };
 
-        let group = if (setattr.valid & FATTR_GID) != 0 {
+        let group = if (setattr.valid & FATTR_GID) != 0 && setattr.gid != u32::MAX {
             match sys::get_groupname_by_gid(setattr.gid) {
                 Some(groupname) => Some(groupname),
                 None => Some(setattr.gid.to_string()),
@@ -722,15 +805,11 @@ impl FuseUtils {
         }
 
         // FUSE represents seconds as u64, including negative Unix timestamps encoded in two's
-        // complement. Reinterpret it as i64 before doing checked arithmetic.
-        let seconds = seconds as i64;
-        match seconds
-            .checked_mul(1000)
-            .and_then(|millis| millis.checked_add(i64::from(nanoseconds / 1_000_000)))
-        {
-            Some(millis) => Ok(millis),
-            None => err_fuse!(libc::EINVAL, "{} timestamp out of range", field),
-        }
+        // complement. Clamp values beyond Curvine's signed millisecond range like a filesystem
+        // timestamp limit instead of rejecting dates that the VFS can parse.
+        let seconds = i128::from(seconds as i64);
+        let millis = seconds * 1000 + i128::from(nanoseconds / 1_000_000);
+        Ok(millis.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
     }
 
     pub fn file_opts_to_status(path: &Path, opts: &CreateFileOpts) -> FileStatus {
@@ -757,7 +836,7 @@ mod tests {
     use crate::raw::fuse_abi::{
         fuse_ioctl_iovec, fuse_ioctl_out, fuse_setattr_in, FUSE_IOCTL_RETRY,
     };
-    use curvine_common::state::INTERNAL_CTIME_XATTR;
+    use curvine_model::INTERNAL_CTIME_XATTR;
 
     #[test]
     fn protected_xattr_errors_match_operation() {
@@ -836,6 +915,22 @@ mod tests {
     }
 
     #[test]
+    fn kernel_cache_timeouts_ignore_check_permission() {
+        let conf = FuseConf::default();
+        assert!(conf.check_permission);
+
+        assert_eq!(
+            FuseUtils::kernel_cache_timeouts(&conf),
+            (
+                conf.entry_ttl.as_secs(),
+                conf.entry_ttl.subsec_nanos(),
+                conf.attr_ttl.as_secs(),
+                conf.attr_ttl.subsec_nanos(),
+            )
+        );
+    }
+
+    #[test]
     fn file_open_flags_are_built_only_from_response_flags() {
         let mut conf = FuseConf::default();
 
@@ -910,6 +1005,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_caller_process_status_reads_groups_and_capabilities_once() {
+        let status = FuseUtils::parse_caller_process_status(
+            "Name:\ttest\nGroups:\t10 20 30\nCapEff:\t0000000000000010\n",
+        );
+
+        assert!(status.in_group(1, 20));
+        assert!(!status.in_group(1, 40));
+        assert!(FuseUtils::caller_has_cap_fsetid(&status));
+    }
+
+    #[test]
+    fn parse_caller_process_status_fails_closed_for_missing_fields() {
+        let status = FuseUtils::parse_caller_process_status("Name:\ttest\n");
+
+        assert!(!status.in_group(1, 20));
+        assert!(!FuseUtils::caller_has_cap_fsetid(&status));
+    }
+
+    #[test]
+    fn resolve_group_gid_has_no_configuration_fallback() {
+        assert_eq!(FuseUtils::resolve_group_gid("12345"), Some(12345));
+        assert_eq!(
+            FuseUtils::resolve_group_gid("curvine-review-group-that-does-not-exist"),
+            None
+        );
+    }
+
+    #[test]
     fn normalize_chmod_mode_strips_setgid_for_non_group_member() {
         let mode = FuseUtils::normalize_chmod_mode(0o3777, 1000, false);
         assert_eq!(mode, 0o1777);
@@ -931,6 +1054,42 @@ mod tests {
     fn normalize_chmod_mode_allows_special_bits_for_root() {
         let mode = FuseUtils::normalize_chmod_mode(0o4777, 0, false);
         assert_eq!(mode, 0o4777);
+    }
+
+    #[test]
+    fn normalize_create_mode_strips_setgid_for_unprivileged_non_member() {
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2010, 0, false, false),
+            0o0010
+        );
+    }
+
+    #[test]
+    fn normalize_create_mode_checks_group_exec_before_applying_umask() {
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2010, 0o0010, false, false),
+            0o0000
+        );
+    }
+
+    #[test]
+    fn normalize_create_mode_preserves_setgid_for_group_member_or_capability() {
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2010, 0, true, false),
+            0o2010
+        );
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2010, 0, false, true),
+            0o2010
+        );
+    }
+
+    #[test]
+    fn normalize_create_mode_preserves_non_executable_setgid() {
+        assert_eq!(
+            FuseUtils::normalize_create_mode(0o2000, 0, false, false),
+            0o2000
+        );
     }
 
     #[test]
@@ -968,6 +1127,18 @@ mod tests {
 
             assert_eq!(err.errno(), libc::EINVAL);
         }
+    }
+
+    #[test]
+    fn setattr_clamps_seconds_outside_millisecond_range() {
+        assert_eq!(
+            FuseUtils::timestamp_to_millis("mtime", i64::MAX as u64, 999_999_999).unwrap(),
+            i64::MAX
+        );
+        assert_eq!(
+            FuseUtils::timestamp_to_millis("mtime", i64::MIN as u64, 0).unwrap(),
+            i64::MIN
+        );
     }
 
     #[test]
@@ -1055,6 +1226,51 @@ mod tests {
     }
 
     #[test]
+    fn status_to_attr_preserves_negative_timestamps() {
+        let conf = FuseConf::default();
+        let mut status = file_status(FileType::File, 0, 0o644);
+        status.atime = -315_593_940_000;
+        status.mtime = -1;
+        status.x_attr.insert(
+            INTERNAL_CTIME_XATTR.to_string(),
+            (-1_001_i64).to_le_bytes().to_vec(),
+        );
+
+        let attr = FuseUtils::status_to_attr(&conf, &status).unwrap();
+        assert_eq!((attr.atime as i64, attr.atimensec), (-315_593_940, 0));
+        assert_eq!((attr.mtime as i64, attr.mtimensec), (-1, 999_000_000));
+        assert_eq!((attr.ctime as i64, attr.ctimensec), (-2, 999_000_000));
+
+        assert_eq!(
+            FuseUtils::timestamp_to_millis("mtime", attr.mtime, attr.mtimensec).unwrap(),
+            status.mtime
+        );
+        assert_eq!(
+            FuseUtils::timestamp_to_millis("ctime", attr.ctime, attr.ctimensec).unwrap(),
+            status.ctime()
+        );
+        assert!(!FuseUtils::fuse_timestamp_is_later(
+            (attr.mtime, attr.mtimensec),
+            (1, 0)
+        ));
+        assert!(FuseUtils::fuse_timestamp_is_later(
+            (1, 0),
+            (attr.mtime, attr.mtimensec)
+        ));
+    }
+
+    #[test]
+    fn timestamp_conversion_round_trips_i64_boundaries() {
+        for millis in [i64::MIN, -1_001, -1, 0, 1, 1_001, i64::MAX] {
+            let (seconds, nanoseconds) = FuseUtils::millis_to_fuse_timestamp(millis);
+            assert_eq!(
+                FuseUtils::timestamp_to_millis("timestamp", seconds, nanoseconds).unwrap(),
+                millis
+            );
+        }
+    }
+
+    #[test]
     fn blocks_derived_from_fuse_size() {
         let conf = FuseConf::default();
 
@@ -1133,23 +1349,6 @@ mod tests {
         let mut three = file_status(FileType::File, 0, 0o644);
         three.nlink = 3;
         assert_eq!(FuseUtils::status_to_attr(&conf, &three).unwrap().nlink, 3);
-    }
-
-    #[test]
-    fn apply_setgid_parent_group_inherits_parent_group() {
-        let mut opts = CreateFileOpts::with_create(false);
-        opts.group = "nogroup".to_string();
-
-        let mut parent = file_status(FileType::Dir, 0, 0o2775);
-        parent.group = "project".to_string();
-
-        FuseUtils::apply_setgid_parent_group(&mut opts, &parent);
-        assert_eq!(opts.group, "project");
-
-        parent.mode = 0o755;
-        opts.group = "nogroup".to_string();
-        FuseUtils::apply_setgid_parent_group(&mut opts, &parent);
-        assert_eq!(opts.group, "nogroup");
     }
 
     #[test]
@@ -1270,5 +1469,95 @@ mod tests {
         assert_eq!(attr.mode & 0o7777, 0o777);
         assert_eq!(attr.rdev, 42);
         assert_eq!(attr.size, 0);
+    }
+
+    /// chown(2)'s (uid_t)-1 sentinel must not be persisted as a literal owner. The kernel
+    /// still sets FATTR_UID when uid=u32::MAX; the conversion must drop the field so
+    /// SetAttrOpts.owner is None (i.e. "do not change") rather than "4294967295".
+    #[test]
+    fn setattr_uid_minus_one_sentinel_is_dropped() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_UID,
+            uid: u32::MAX,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(
+            opts.owner.is_none(),
+            "uid=-1 sentinel must be dropped, got owner={:?}",
+            opts.owner
+        );
+        assert!(opts.group.is_none());
+    }
+
+    /// Same guarantee for chown's second parameter (gid_t)-1.
+    #[test]
+    fn setattr_gid_minus_one_sentinel_is_dropped() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_GID,
+            gid: u32::MAX,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(
+            opts.group.is_none(),
+            "gid=-1 sentinel must be dropped, got group={:?}",
+            opts.group
+        );
+        assert!(opts.owner.is_none());
+    }
+
+    /// Sentinels must be dropped independently: `chown(f, real_uid, -1)` should still
+    /// update the owner but leave the group unchanged.
+    #[test]
+    fn setattr_mixed_uid_change_and_gid_sentinel() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_UID | FATTR_GID,
+            uid: 1000,
+            gid: u32::MAX,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(
+            opts.owner.is_some(),
+            "real uid=1000 must map to Some(owner)"
+        );
+        assert!(
+            opts.group.is_none(),
+            "gid=-1 must drop group, got {:?}",
+            opts.group
+        );
+    }
+
+    /// uid=0 (root) is a valid owner, not a sentinel. Regression guard against
+    /// misreading "no username entry for 0" as "drop the attribute".
+    #[test]
+    fn setattr_uid_zero_is_valid_owner() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_UID,
+            uid: 0,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(
+            opts.owner.is_some(),
+            "uid=0 must be treated as a real owner"
+        );
+    }
+
+    /// FATTR_UID/GID bits absent → nothing to persist.
+    #[test]
+    fn setattr_without_uid_gid_flags_leaves_owner_group_none() {
+        let setattr = fuse_setattr_in {
+            valid: FATTR_MODE,
+            mode: 0o644,
+            uid: 12345, // These values must be ignored because the FATTR bits are unset.
+            gid: 67890,
+            ..Default::default()
+        };
+        let opts = FuseUtils::fuse_setattr_to_opts(&setattr).unwrap();
+        assert!(opts.owner.is_none());
+        assert!(opts.group.is_none());
+        assert_eq!(opts.mode, Some(0o644));
     }
 }

@@ -15,15 +15,21 @@
 #![allow(unused)]
 
 use crate::raw::fuse_abi::fuse_args;
+// `fuse_mount_pure` / `fuse_umount_pure` live in the Linux-only `raw::fuse_pure`
+// module (gated in `raw/mod.rs`). Import and use them only on Linux so this
+// caller shares the same platform contract instead of failing to resolve the
+// symbols off Linux.
+#[cfg(target_os = "linux")]
 use crate::raw::fuse_mount_pure;
+#[cfg(target_os = "linux")]
 use crate::raw::fuse_umount_pure;
 use crate::{FuseUtils, FUSE_CLONE_FD_MIN_VERSION, UNIX_KERNEL_VERSION};
-use curvine_common::conf::FuseConf;
+use curvine_config::FuseConf;
+use curvine_io::{IOError, IOResult};
+use curvine_sys as sys;
+use curvine_sys::pipe::{AsyncFd, BorrowedFd, OwnedFd};
+use curvine_sys::{CString, RawIO};
 use log::{debug, error, info};
-use orpc::io::IOResult;
-use orpc::sys;
-use orpc::sys::pipe::{AsyncFd, BorrowedFd, OwnedFd};
-use orpc::sys::{CString, RawIO};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -50,7 +56,9 @@ impl FuseMnt {
             clone_fds: Mutex::new(vec![]),
             auto_unmount: true,
         };
-        sys::set_pipe_blocking(mnt.fd, false)?;
+        sys::set_pipe_blocking(mnt.fd, false).map_err(|error| {
+            describe_fuse_fd_error("set mounted FUSE fd nonblocking", mnt.fd, error.into())
+        })?;
         info!("fuse mount success, path {:?}, fd {}", mnt.path, mnt.fd);
         Ok(mnt)
     }
@@ -70,15 +78,25 @@ impl FuseMnt {
                      source fd {}, cause: {}",
                         kernel_version.0, kernel_version.1, self.fd, e
                     );
-                    sys::dup(self.fd)?
+                    sys::dup(self.fd).map_err(|error| {
+                        describe_fuse_fd_error(
+                            "duplicate FUSE fd after clone fallback",
+                            self.fd,
+                            error.into(),
+                        )
+                    })?
                 }
             }
         } else {
-            sys::dup(self.fd)?
+            sys::dup(self.fd).map_err(|error| {
+                describe_fuse_fd_error("duplicate FUSE fd", self.fd, error.into())
+            })?
         };
 
         let new_fd = OwnedFd::new(clone_fd);
-        new_fd.set_blocking(false)?;
+        new_fd.set_blocking(false).map_err(|error| {
+            describe_fuse_fd_error("set task FUSE fd nonblocking", clone_fd, error.into())
+        })?;
 
         let borrowed = new_fd.as_borrowed();
         // fd is recycled by FuseMnt and saved here.
@@ -90,7 +108,14 @@ impl FuseMnt {
     // Get an async fd for reading and writing data.
     pub fn create_async_task_fd(&self, clone: bool) -> IOResult<Arc<AsyncFd>> {
         let fd = self.create_task_fd(clone)?;
-        let fd = Arc::new(AsyncFd::new(fd)?);
+        let raw_fd = fd.fd();
+        let fd = Arc::new(AsyncFd::new(fd).map_err(|error| {
+            describe_fuse_fd_error(
+                "register task FUSE fd for asynchronous I/O",
+                raw_fd,
+                error.into(),
+            )
+        })?);
         Ok(fd)
     }
 
@@ -99,19 +124,46 @@ impl FuseMnt {
     }
 }
 
+pub(super) fn describe_fuse_fd_error(stage: &str, fd: RawIO, error: IOError) -> IOError {
+    let raw_error = error.into_raw();
+    let remediation = match raw_error.raw_os_error() {
+        Some(libc::EBADF) => "The FUSE fd is invalid or closed; check for an interrupted mount or stale restore state.",
+        Some(libc::EMFILE) | Some(libc::ENFILE) => {
+            "The process or system file-descriptor limit is exhausted; raise the relevant nofile limit."
+        }
+        Some(libc::EPERM) | Some(libc::EACCES) => {
+            "The runtime lacks permission for this FUSE fd operation; check container security policy and device access."
+        }
+        Some(libc::EINVAL) => {
+            "The kernel rejected this FUSE fd operation; verify kernel FUSE support and the mounted connection state."
+        }
+        _ => "Inspect the FUSE fd state and the kernel log for the underlying failure.",
+    };
+    IOError::with_ctx(
+        raw_error,
+        format!("FUSE {stage} failed for fd={fd}. {remediation}"),
+    )
+}
+
 impl Drop for FuseMnt {
     fn drop(&mut self) {
         if self.auto_unmount {
-            fuse_umount_pure(self.path.as_path());
-            info!("unmount path={:?}, fd={}", self.path, self.fd);
+            #[cfg(target_os = "linux")]
+            match fuse_umount_pure(self.path.as_path()) {
+                Ok(()) => info!("unmount path={:?}, fd={}", self.path, self.fd),
+                Err(e) => error!(
+                    "unmount failed path={:?}, fd={}, err={:?}",
+                    self.path, self.fd, e
+                ),
+            }
         }
     }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::FuseMnt;
-    use curvine_common::conf::FuseConf;
+    use super::{describe_fuse_fd_error, FuseMnt};
+    use curvine_config::FuseConf;
     use std::path::PathBuf;
 
     fn missing_path(label: &str) -> PathBuf {
@@ -143,5 +195,17 @@ mod tests {
             FuseMnt::from_fd(missing_path("fd"), &conf, -1).is_err(),
             "an invalid FUSE fd must return an error instead of panicking"
         );
+    }
+
+    #[test]
+    fn fuse_fd_error_preserves_errno_and_identifies_stage() {
+        let error = curvine_io::IOError::from(std::io::Error::from_raw_os_error(libc::EBADF));
+        let error = describe_fuse_fd_error("create nonblocking task fd", 42, error);
+
+        assert_eq!(error.raw_error().raw_os_error(), Some(libc::EBADF));
+        let message = error.to_string();
+        assert!(message.contains("create nonblocking task fd"));
+        assert!(message.contains("fd=42"));
+        assert!(message.contains("invalid or closed"));
     }
 }

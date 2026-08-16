@@ -15,15 +15,16 @@
 use crate::master::fs::policy::{ChooseContext, WorkerPolicyAdapter};
 use crate::master::fs::state::{BlockMap, WorkerMap};
 use crate::master::fs::DeleteResult;
-use curvine_common::conf::ClusterConf;
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_error::FsResult;
+use curvine_model::{
     BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, StorageType,
     TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
 };
-use curvine_common::FsResult;
+use curvine_proto::ComponentInfoProto;
+use curvine_runtime::common::ByteUnit;
 use log::{info, warn};
-use orpc::common::ByteUnit;
-use orpc::{err_box, CommonResult};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 
@@ -60,6 +61,7 @@ impl WorkerManager {
         software_version: String,
         startup_time_ms: u64,
         storages: Vec<StorageInfo>,
+        component_info: Option<ComponentInfoProto>,
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
         if cluster_id != self.cluster_id {
@@ -106,6 +108,7 @@ impl WorkerManager {
             software_version,
             startup_time_ms,
             storages,
+            component_info,
         )?;
         Ok(cmds)
     }

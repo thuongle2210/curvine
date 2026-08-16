@@ -68,8 +68,8 @@ pub use self::block_info::*;
 mod file_status;
 pub use self::file_status::{FileStatus, INTERNAL_CTIME_XATTR};
 
-mod master_info;
-pub use self::master_info::MasterInfo;
+mod filesystem_info;
+pub use self::filesystem_info::FilesystemInfo;
 
 mod worker_command;
 pub use self::worker_command::*;
@@ -115,6 +115,11 @@ pub use self::result::*;
 
 mod proto_utils;
 pub use self::proto_utils::ProtoUtils;
+
+mod compatibility;
+pub use self::compatibility::{
+    feature_enabled, CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict,
+};
 
 mod display;
 

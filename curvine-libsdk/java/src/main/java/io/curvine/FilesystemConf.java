@@ -91,6 +91,12 @@ public class FilesystemConf {
 
     public int sync_check_log_tick = 3;
 
+    // Transfer service routing. Endpoints are comma-separated host:port values.
+    public boolean transfer_enabled = false;
+    public String transfer_endpoints = "";
+    public int transfer_client_pending_queue_size = 1024;
+    public int transfer_client_submit_concurrency = 64;
+
     public boolean enable_block_conn_pool = true;
     public int block_conn_idle_size = 128;
     public long block_conn_idle_time_ms = 60 * 1000;
@@ -130,6 +136,9 @@ public class FilesystemConf {
         }
 
         for(Field field : getClass().getDeclaredFields())  {
+            if (isTransferField(field)) {
+                continue;
+            }
             String key = String.format("%s.%s", PREFIX, field.getName());
             String value = conf.get(key);
 
@@ -156,13 +165,32 @@ public class FilesystemConf {
                     throw new RuntimeException("Unsupported Type: " + fieldType);
             }
         }
+
+        String transferEnabled = conf.get(PREFIX + ".transfer.enabled");
+        if (transferEnabled != null) {
+            transfer_enabled = Boolean.parseBoolean(transferEnabled);
+        }
+        String transferEndpoints = conf.get(PREFIX + ".transfer.endpoints");
+        if (transferEndpoints != null) {
+            transfer_endpoints = transferEndpoints;
+        }
+        String transferClientPendingQueueSize =
+                conf.get(PREFIX + ".transfer.client_pending_queue_size");
+        if (transferClientPendingQueueSize != null) {
+            transfer_client_pending_queue_size = Integer.parseInt(transferClientPendingQueueSize);
+        }
+        String transferClientSubmitConcurrency =
+                conf.get(PREFIX + ".transfer.client_submit_concurrency");
+        if (transferClientSubmitConcurrency != null) {
+            transfer_client_submit_concurrency = Integer.parseInt(transferClientSubmitConcurrency);
+        }
     }
 
     public String toToml() throws IllegalAccessException {
         StringBuilder builder = new StringBuilder();
         for(Field field : getClass().getDeclaredFields()) {
             field.setAccessible(true);
-            if (Modifier.isStatic(field.getModifiers())) {
+            if (Modifier.isStatic(field.getModifiers()) || isTransferField(field)) {
                 continue;
             }
 
@@ -185,7 +213,45 @@ public class FilesystemConf {
             builder.append(String.format("%s = %s\n", field.getName(), value));
         }
 
+        builder.append("\n[transfer]\n");
+        builder.append("enabled = ").append(transfer_enabled).append("\n");
+        builder.append("endpoints = [");
+        boolean first = true;
+        for (String endpoint : transfer_endpoints.split(",")) {
+            String trimmed = endpoint.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (!first) {
+                builder.append(", ");
+            }
+            builder.append('"').append(escapeTomlString(trimmed)).append('"');
+            first = false;
+        }
+        builder.append("]\n");
+        builder.append("client_pending_queue_size = ")
+                .append(transfer_client_pending_queue_size)
+                .append("\n");
+        builder.append("client_submit_concurrency = ")
+                .append(transfer_client_submit_concurrency)
+                .append("\n");
+
         return builder.toString();
+    }
+
+    private static boolean isTransferField(Field field) {
+        return "transfer_enabled".equals(field.getName())
+                || "transfer_endpoints".equals(field.getName())
+                || "transfer_client_pending_queue_size".equals(field.getName())
+                || "transfer_client_submit_concurrency".equals(field.getName());
+    }
+
+    private static String escapeTomlString(String value) {
+        return value.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t");
     }
 
     private String getClientHostname() {
@@ -252,6 +318,8 @@ public class FilesystemConf {
                 ", sync_check_interval_max_ms=" + sync_check_interval_max_ms +
                 ", max_sync_wait_timeout_ms=" + max_sync_wait_timeout_ms +
                 ", sync_check_log_tick=" + sync_check_log_tick +
+                ", transfer_enabled=" + transfer_enabled +
+                ", transfer_endpoints='" + transfer_endpoints + '\'' +
                 ", enable_block_conn_pool=" + enable_block_conn_pool +
                 ", block_conn_idle_size=" + block_conn_idle_size +
                 ", block_conn_idle_time_ms=" + block_conn_idle_time_ms +

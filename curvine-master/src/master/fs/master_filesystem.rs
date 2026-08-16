@@ -16,21 +16,21 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::FsDir;
+use crate::master::meta::{CacheInvalidationResult, FsDir};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
-use curvine_common::conf::{ClusterConf, MasterConf};
-use curvine_common::error::FsError;
-use curvine_common::state::*;
-use curvine_common::FsResult;
+use curvine_config::{ClusterConf, MasterConf};
+use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::*;
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::runtime::GroupExecutor;
+use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
-use orpc::common::LocalTime;
-use orpc::runtime::GroupExecutor;
-use orpc::sync::ArcRwLock;
-use orpc::{err_box, err_ext, try_option, CommonResult};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -78,6 +78,12 @@ pub struct MasterFilesystem {
 
 pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
+}
+
+#[derive(Default)]
+pub struct LostWorkerLocationCleanup {
+    pub removed_block_ids: Vec<i64>,
+    pub replication_block_ids: Vec<i64>,
 }
 
 pub(crate) enum BlockInodeState {
@@ -128,6 +134,8 @@ const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 impl MasterFilesystem {
     // Max block-report location updates applied under a single fs_dir write lock.
     const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
+    // Max lost-worker block ids inspected under a single fs_dir write lock.
+    const LOST_WORKER_INVALIDATION_CHUNK: usize = Self::BLOCK_REPORT_WRITE_CHUNK;
 
     fn validate_alloc_capacity(
         current_len: i64,
@@ -254,16 +262,21 @@ impl MasterFilesystem {
         self.mkdir_with_opts(path, opts)
     }
 
-    pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
+    pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<DeleteResult> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
-        let delete_result = fs_dir.delete(&inp, recursive)?;
+        let mut delete_res = fs_dir.delete(&inp, recursive)?;
+        drop(fs_dir);
 
         let mut worker_manager = self.worker_manager.write();
-        worker_manager.remove_blocks(&delete_result);
+        worker_manager.remove_blocks(&DeleteResult {
+            inodes: 0,
+            bytes: 0,
+            blocks: std::mem::take(&mut delete_res.blocks),
+        });
 
-        Ok(true)
+        Ok(delete_res)
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
@@ -276,6 +289,7 @@ impl MasterFilesystem {
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
             inodes: 0,
+            bytes: 0,
             blocks: std::mem::take(&mut free_res.blocks),
         });
 
@@ -604,14 +618,14 @@ impl MasterFilesystem {
         match inode_id {
             Some(v) if v > 0 => match fs_dir.store.get_inode(v, None)? {
                 Some(view) => Ok(InodePtr::from_owned(view)),
-                None => err_box!("File inode {} not exists", v),
+                None => err_ext!(FsError::file_not_found(path).ctx(format!("inode_id={}", v))),
             },
 
             _ => {
                 let inp = Self::resolve_path(fs_dir, path)?;
                 match inp.task_last() {
                     Some(ptr) => Ok(ptr),
-                    None => err_box!("File {} not exists", path),
+                    None => err_ext!(FsError::file_not_found(path)),
                 }
             }
         }
@@ -1092,9 +1106,9 @@ impl MasterFilesystem {
         Ok(inode.clone())
     }
 
-    pub fn master_info(&self) -> FsResult<MasterInfo> {
+    pub fn filesystem_info(&self) -> FsResult<FilesystemInfo> {
         let metrics = Master::get_metrics()?;
-        let mut info = MasterInfo {
+        let mut info = FilesystemInfo {
             inode_dir_num: metrics.inode_dir_num.get(),
             inode_file_num: metrics.inode_file_num.get(),
             ..Default::default()
@@ -1557,9 +1571,46 @@ impl MasterFilesystem {
             .unwrap_or(false)
     }
 
-    pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
-        let fs_dir = self.fs_dir.write();
-        fs_dir.delete_locations(worker_id)
+    pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
+        let removed_block_ids = {
+            let fs_dir = self.fs_dir.write();
+            fs_dir.delete_locations(worker_id)?
+        };
+        let mut invalidated = CacheInvalidationResult::default();
+
+        for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
+            let result = {
+                let mut fs_dir = self.fs_dir.write();
+                fs_dir.invalidate_lost_cache_files(chunk)
+            };
+            match result {
+                Ok(result) => invalidated.extend(result),
+                Err(e) => warn!(
+                    "failed to invalidate lost cache files for worker {} ({} block ids); \\
+                     continuing with normal replica recovery: {}",
+                    worker_id,
+                    chunk.len(),
+                    e
+                ),
+            }
+        }
+
+        let replication_block_ids = removed_block_ids
+            .iter()
+            .copied()
+            .filter(|block_id| !invalidated.invalidated_block_ids.contains(block_id))
+            .collect();
+
+        if !invalidated.delete_result.blocks.is_empty() {
+            self.worker_manager
+                .write()
+                .remove_blocks(&invalidated.delete_result);
+        }
+
+        Ok(LostWorkerLocationCleanup {
+            removed_block_ids,
+            replication_block_ids,
+        })
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
@@ -1688,6 +1739,46 @@ impl MasterFilesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curvine_core_error::ErrorExt;
+    use curvine_error::ErrorKind;
+    use curvine_runtime::common::Utils;
+
+    fn test_fs(name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-resolve-test/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-resolve-test/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    fn assert_file_not_found_roundtrip(err: &FsError) {
+        assert!(
+            matches!(err.kind(), ErrorKind::FileNotFound),
+            "expected FileNotFound, got {:?}",
+            err.kind()
+        );
+        let decoded = FsError::decode(err.encode());
+        assert!(
+            matches!(decoded.kind(), ErrorKind::FileNotFound),
+            "expected FileNotFound after encode/decode, got {:?}",
+            decoded.kind()
+        );
+        assert!(
+            matches!(decoded, FsError::FileNotFound(_)),
+            "decoded error collapsed away from FileNotFound: {}",
+            decoded
+        );
+    }
 
     #[test]
     fn fallocate_rejects_growth_larger_than_available_capacity() {
@@ -1706,5 +1797,39 @@ mod tests {
     fn truncate_growth_does_not_require_physical_capacity() {
         let opts = FileAllocOpts::with_truncate(200);
         assert!(MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 0).is_ok());
+    }
+
+    #[test]
+    fn resolve_file_inode_missing_inode_id_returns_file_not_found() {
+        let fs = test_fs("missing-inode-id");
+        let sync_fs_dir = fs.fs_dir();
+        let fs_dir = sync_fs_dir.read();
+        let missing_id = 9_999_999_i64;
+        let err = MasterFilesystem::resolve_file_inode(&fs_dir, "/missing", Some(missing_id))
+            .unwrap_err();
+
+        assert_file_not_found_roundtrip(&err);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("inode_id={}", missing_id)),
+            "expected inode_id in error context, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn resolve_file_inode_unresolved_path_returns_file_not_found() {
+        let fs = test_fs("unresolved-path");
+        let sync_fs_dir = fs.fs_dir();
+        let fs_dir = sync_fs_dir.read();
+        let path = "/does/not/exist";
+        let err = MasterFilesystem::resolve_file_inode(&fs_dir, path, None).unwrap_err();
+
+        assert_file_not_found_roundtrip(&err);
+        assert!(
+            err.to_string().contains(path),
+            "expected path in error, got: {}",
+            err
+        );
     }
 }

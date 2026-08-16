@@ -17,16 +17,16 @@ use crate::master::replication::master_replication_manager::MasterReplicationMan
 use crate::master::Master;
 use crate::worker::Worker;
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::FsResult;
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_error::FsResult;
+use curvine_net::net::{InetAddr, NetUtils};
 use curvine_raft::raft::{NodeId, RaftPeer};
+use curvine_rpc::client::RpcClient;
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::DashMap;
 use log::info;
-use orpc::client::RpcClient;
-use orpc::common::LocalTime;
-use orpc::io::net::{InetAddr, NetUtils};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::{err_box, CommonResult};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -217,7 +217,7 @@ impl MiniCluster {
 
         while LocalTime::mills() <= wait_time {
             retry_count += 1;
-            let info = match fs.get_master_info().await {
+            let info = match fs.get_filesystem_info().await {
                 Ok(info) => info,
                 Err(e) => {
                     return Err(e);

@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{
+use curvine_core_error::err_box;
+use curvine_error::FsResult;
+use curvine_model::{
     StorageInfo, TransferWorkerCapabilities, WorkerAddress, WorkerInfo, WorkerStatus,
 };
-use curvine_common::FsResult;
+use curvine_proto::ComponentInfoProto;
 use indexmap::IndexMap;
 use log::{error, info, warn};
-use orpc::err_box;
 
 // Store all worker information.
 pub struct WorkerMap {
@@ -92,6 +93,7 @@ impl WorkerMap {
         software_version: String,
         startup_time_ms: u64,
         storages: Vec<StorageInfo>,
+        component_info: Option<ComponentInfoProto>,
     ) -> FsResult<()> {
         self.ensure_worker_id_addr(&addr)?;
         for stale in self.remove_same_endpoint(&addr) {
@@ -109,6 +111,7 @@ impl WorkerMap {
         info.transfer_capabilities = transfer_capabilities;
         info.software_version = software_version;
         info.startup_time_ms = startup_time_ms;
+        info.component_info = component_info;
         let worker_id = info.worker_id();
         for item in storages {
             info.add_storage(item);

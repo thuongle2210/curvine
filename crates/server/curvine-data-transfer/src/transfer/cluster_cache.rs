@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_common::error::FsError;
-use curvine_common::fs::Path;
-use curvine_common::state::{MountInfo, TransferKind, WorkerInfo};
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_fs_api::Path;
+use curvine_model::{MountInfo, TransferKind, WorkerInfo};
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::runtime::RpcRuntime;
 use log::warn;
-use orpc::common::LocalTime;
-use orpc::runtime::RpcRuntime;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,8 +118,8 @@ impl ClusterMetadataCache {
 
     async fn refresh_inner(&self) -> FsResult<()> {
         let mounts = self.fs.get_mount_table().await?;
-        let master = self.fs.get_master_info().await?;
-        let mut workers = master.live_workers;
+        let fs_info = self.fs.get_filesystem_info().await?;
+        let mut workers = fs_info.live_workers;
         {
             let mut rejected = self.rejected_worker_sessions.write();
             rejected.retain(|(worker_id, worker_session_id)| {

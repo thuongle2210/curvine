@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_alloc as _;
 pub mod common;
 #[cfg(feature = "transfer")]
 pub mod transfer;
@@ -19,6 +20,12 @@ pub mod worker;
 
 mod job_worker_client;
 pub use self::job_worker_client::JobWorkerClient;
+
+#[cfg(feature = "fault-injection")]
+pub(crate) use curvine_fault::fault_point;
+
+#[cfg(not(feature = "fault-injection"))]
+pub(crate) use curvine_fault::__noop_fault_point as fault_point;
 
 mod rpc_context;
 pub use self::rpc_context::RpcContext;

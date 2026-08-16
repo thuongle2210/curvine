@@ -16,18 +16,18 @@ use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
 use crate::worker::storage::BlockWriteContext;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
+use curvine_core_error::err_box;
+use curvine_core_error::CommonResult;
+use curvine_error::FsResult;
+use curvine_fs_api::RpcCode;
+use curvine_io::DataSlice;
+use curvine_model::ProtoUtils;
+use curvine_proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
     BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto, FilesBatchWriteRequest,
     FilesBatchWriteResponse,
 };
-use curvine_common::utils::ProtoUtils;
-use curvine_common::FsResult;
-use orpc::err_box;
-use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::DataSlice;
-use orpc::CommonResult;
+use curvine_rpc::message::{Builder, Message, RequestStatus};
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
@@ -81,8 +81,12 @@ impl BatchWriteHandler {
 
         for (i, block_proto) in header.blocks.iter().cloned().enumerate() {
             let unique_req_id = msg.req_id() + i as i64;
-            // Create a single BlockWriteRequest from the block
-            let header = BlockWriteRequest {
+            // Create a single BlockWriteRequest from the block; propagate the
+            // client's component_info so the per-block open carries the same
+            // peer metadata as the outer batch frame. Named `block_header` (not
+            // `header`) so it cannot be confused with the outer
+            // BlocksBatchWriteRequest.
+            let block_header = BlockWriteRequest {
                 block: block_proto,
                 off: header.off,
                 block_size: header.block_size,
@@ -90,6 +94,7 @@ impl BatchWriteHandler {
                 client_name: header.client_name.clone(),
                 chunk_size: header.chunk_size,
                 pipeline_stream: Vec::new(),
+                component_info: header.component_info.clone(),
             };
 
             // Create single request message for each block
@@ -98,7 +103,7 @@ impl BatchWriteHandler {
                 .request(RequestStatus::Open)
                 .req_id(unique_req_id)
                 .seq_id(msg.seq_id())
-                .proto_header(header)
+                .proto_header(block_header)
                 .build();
 
             let response = match self.write_handler.open(&single_msg_req) {

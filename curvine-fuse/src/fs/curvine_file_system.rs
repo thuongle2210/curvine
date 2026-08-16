@@ -14,7 +14,9 @@
 
 use crate::fs::dcache::{CleanerTask, Inode};
 use crate::fs::operator::*;
-use crate::fs::plock_wait_registry::{LockOwner, PlockWaitGuard, PlockWaitRegistry};
+use crate::fs::plock_wait_registry::{
+    LockOwner, LockWaitInfo, PlockWaitDecision, PlockWaitGuard, PlockWaitRegistry,
+};
 use crate::fs::state::{FileHandle, NodeState};
 use crate::fuse_metrics::{
     ReaddirTimer, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_MKDIR, INVAL_REASON_RELEASE,
@@ -27,22 +29,26 @@ use crate::*;
 use crate::{err_fuse, FuseResult, FuseUtils};
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClusterConf, FuseConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, RpcCode, StateReader, StateWriter};
-use curvine_common::state::{
+use curvine_config::{ClusterConf, FuseConf};
+use curvine_core_error::try_option;
+use curvine_error::FsError;
+use curvine_error::MAX_FILE_SIZE;
+use curvine_fs_api::{FileSystem, Path, RpcCode};
+use curvine_fs_api::{StateReader, StateWriter};
+use curvine_model::{
     is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
     LockType, OpenFlags, RenameFlags, SetAttrOpts,
 };
-use curvine_common::MAX_FILE_SIZE;
+use curvine_runtime::common::{ByteUnit, TimeSpent};
+use curvine_runtime::runtime::Runtime;
+use curvine_sys as sys;
+use curvine_sys::FFIUtils;
 use log::{debug, info, warn};
-use orpc::common::{ByteUnit, TimeSpent};
-use orpc::runtime::Runtime;
-use orpc::sys::FFIUtils;
-use orpc::{sys, try_option};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
+
+const FUSE_TIME_GRANULARITY_NS: u32 = 1_000_000;
 
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
@@ -52,6 +58,41 @@ pub struct CurvineFileSystem {
 }
 
 impl CurvineFileSystem {
+    async fn normalize_file_creation_mode(
+        &self,
+        header: &fuse_in_header,
+        requested_mode: u32,
+        umask: u32,
+    ) -> FuseResult<u32> {
+        let requested_setgid_exec = requested_mode & (libc::S_ISGID as u32 | libc::S_IXGRP as u32)
+            == (libc::S_ISGID as u32 | libc::S_IXGRP as u32);
+        if !requested_setgid_exec {
+            return Ok(requested_mode & 0o7777 & !umask);
+        }
+
+        let parent = self.state.fs_stat(header.nodeid, None).await?;
+        let created_gid = if parent.mode & libc::S_ISGID as u32 != 0 {
+            FuseUtils::resolve_group_gid(&parent.group)
+        } else {
+            Some(header.gid)
+        };
+        let caller_status = FuseUtils::caller_process_status(header.pid).await;
+        let caller_in_created_group =
+            created_gid.is_some_and(|gid| caller_status.in_group(header.gid, gid));
+
+        Ok(FuseUtils::normalize_create_mode(
+            requested_mode,
+            umask,
+            caller_in_created_group,
+            FuseUtils::caller_has_cap_fsetid(&caller_status),
+        ))
+    }
+
+    fn is_ofd_lock_pid(pid: u32) -> bool {
+        // FUSE kernels have used both 0 and -1 for the pid of an OFD lock.
+        pid == 0 || pid == u32::MAX
+    }
+
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
         FuseMetrics::ensure_init()?;
 
@@ -274,15 +315,11 @@ impl CurvineFileSystem {
         Ok(RenameFlags::from_bits(flags).unwrap_or(RenameFlags::empty()))
     }
 
-    fn to_file_lock(&self, arg: &fuse_lk_in, header_pid: u32) -> FileLock {
+    fn to_file_lock(&self, arg: &fuse_lk_in, _header_pid: u32) -> FileLock {
         let client_id = self.fs.cv().fs_context().clone_client_name();
-        // Prefer the flock pid from the kernel request; fall back to the FUSE
-        // header pid when the kernel leaves lk.pid unset (common on some paths).
-        let pid = if arg.lk.pid != 0 {
-            arg.lk.pid
-        } else {
-            header_pid
-        };
+        // Keep the kernel pid intact. OFD locks use either 0 or -1 depending on
+        // the kernel and are owned by the open file description, not a process.
+        let pid = arg.lk.pid;
         FileLock {
             client_id,
             owner_id: arg.owner,
@@ -360,6 +397,18 @@ impl CurvineFileSystem {
         }
 
         Ok(())
+    }
+
+    /// Serialize one Master lock-state operation with close-time lock cleanup.
+    /// Blocking SETLKW retries acquire this guard per attempt, never while waiting.
+    async fn get_lock_ordered(&self, path: &Path, lock: FileLock) -> FuseResult<Option<FileLock>> {
+        let _guard = self.state.lock_path(path).await;
+        Ok(self.fs.get_lock(path, lock).await?)
+    }
+
+    async fn set_lock_ordered(&self, path: &Path, lock: FileLock) -> FuseResult<Option<FileLock>> {
+        let _guard = self.state.lock_path(path).await;
+        Ok(self.fs.set_lock(path, lock).await?)
     }
 
     fn record_negative_entry(&self) {
@@ -780,43 +829,87 @@ impl CurvineFileSystem {
         Self::permission_mask_allows(permission_bits, mask)
     }
 
+    /// True when a normalized chown target actually changes uid and/or gid.
+    /// Kept for unit tests documenting value-inequality vs FATTR presence (#1547 leftover).
+    #[cfg(test)]
+    fn chown_effectively_changes(
+        target_uid: Option<u32>,
+        target_gid: Option<u32>,
+        file_uid: u32,
+        file_gid: u32,
+    ) -> bool {
+        target_uid.is_some_and(|u| u != file_uid) || target_gid.is_some_and(|g| g != file_gid)
+    }
+
+    /// Whether chown/fchown/lchown should clear setuid/setgid on a regular file.
+    ///
+    /// Per Linux `chown(2)`, any chown clears SUID (and SGID when group-executable),
+    /// including same-id (LTP chown02) and `-1` sentinels. Gate on raw FUSE `valid` bits.
+    ///
+    /// `valid == 0` covers `chown(-1,-1)` under `FUSE_HANDLE_KILLPRIV`: kernel strips
+    /// ATTR_KILL_* without setting FATTR_UID/GID, so userspace sees empty valid.
+    ///
+    /// SGID without group-exec (mandatory lock) is preserved by the caller.
+    fn chown_should_clear_setid_bits(valid: u32) -> bool {
+        (valid & (FATTR_UID | FATTR_GID)) != 0 || valid == 0
+    }
+
+    /// POSIX permission model for SETATTR issued by a non-root caller.
+    ///
+    /// `target_uid`/`target_gid` are the *normalized* chown targets: the caller is expected
+    /// to have already dropped the `(uid_t)-1` / `(gid_t)-1` "keep current" sentinels to
+    /// `None` (see `CurvineFileSystem::set_attr`). Therefore a `Some(_)` here means the FATTR
+    /// bit is set and the value is not the (uid_t/gid_t)-1 sentinel; it may still equal the
+    /// current id and be a no-op ownership change (see `chown_effectively_changes`).
+    /// Setuid/setgid clearing uses `chown_should_clear_setid_bits` on raw `valid`.
     fn check_setattr_permission(
         check_permission: bool,
-        caller_uid: u32,
-        caller_gid: u32,
-        caller_pid: u32,
+        header: &fuse_in_header,
         file_uid: u32,
+        file_gid: u32,
         valid: u32,
+        target_uid: Option<u32>,
         target_gid: Option<u32>,
     ) -> FuseResult<()> {
+        let caller_uid = header.uid;
+        let caller_gid = header.gid;
+        let caller_pid = header.pid;
         if !check_permission || caller_uid == 0 {
             return Ok(());
         }
 
-        if (valid & FATTR_UID) != 0 {
-            return err_fuse!(
-                libc::EPERM,
-                "setattr uid change requires privilege for uid {}",
-                caller_uid
-            );
-        }
-
-        if (valid & FATTR_GID) != 0 {
-            if caller_uid != file_uid {
+        // Changing the owner uid is privileged: non-root may only "change" it to the
+        // current value (a no-op), which after normalization is simply Some(file_uid).
+        if let Some(uid) = target_uid {
+            if uid != file_uid || caller_uid != file_uid {
                 return err_fuse!(
                     libc::EPERM,
-                    "setattr gid change denied for non-owner uid {}",
+                    "setattr uid change requires privilege for uid {}",
                     caller_uid
                 );
             }
-            if let Some(gid) = target_gid {
-                if !FuseUtils::caller_in_file_group(caller_gid, gid, caller_pid) {
-                    return err_fuse!(
-                        libc::EPERM,
-                        "setattr gid change denied for gid {} not in caller groups",
-                        gid
-                    );
-                }
+        }
+
+        // Changing the group is also privileged for non-root: caller must own the
+        // file *and* belong to the target group (POSIX chown). Membership alone is
+        // not sufficient — #1500 dropped the owner gate and allowed non-owners who
+        // share the target group to chgrp (ACL bypass / setuid strip).
+        // See CurvineIO/curvine#1548 (originally gongxun0928/curvine#18).
+        if let Some(gid) = target_gid {
+            if gid != file_gid && caller_uid != file_uid {
+                return err_fuse!(
+                    libc::EPERM,
+                    "setattr gid change denied: caller uid {} is not file owner (uid {})",
+                    caller_uid,
+                    file_uid
+                );
+            }
+            if gid != file_gid && !FuseUtils::caller_in_file_group(caller_gid, gid, caller_pid) {
+                return err_fuse!(
+                    libc::EPERM,
+                    "setattr gid change denied for gid {} not in caller groups",
+                    gid
+                );
             }
         }
 
@@ -916,17 +1009,17 @@ impl CurvineFileSystem {
     }
 
     /// Linux utime(2): owner/root may always set times; NULL/`*_NOW` also allow W_OK.
-    #[allow(clippy::too_many_arguments)]
     fn check_utime_setattr_permission(
         check_permission: bool,
         valid: u32,
-        caller_uid: u32,
-        caller_gid: u32,
-        caller_pid: u32,
+        header: &fuse_in_header,
         file_uid: u32,
         file_gid: u32,
         mode: u32,
     ) -> FuseResult<()> {
+        let caller_uid = header.uid;
+        let caller_gid = header.gid;
+        let caller_pid = header.pid;
         if !check_permission || caller_uid == 0 || caller_uid == file_uid {
             return Ok(());
         }
@@ -960,13 +1053,17 @@ impl CurvineFileSystem {
     ///    `FUSE_WRITEBACK_CACHE` (when `write_back_cache`) and `FUSE_SPLICE_*` (when
     ///    `enable_splice` — splice drives the fuse fd directly, so it is advertised
     ///    on config alone).
-    fn negotiate_out_flags(kernel_flags: u32, write_back_cache: bool, enable_splice: bool) -> u32 {
+    fn negotiate_out_flags(kernel_flags: u32, conf: &FuseConf) -> u32 {
         let mut out = SUPPORTED_INIT_FLAGS & kernel_flags;
-        if write_back_cache {
+        if conf.write_back_cache {
             out |= FUSE_WRITEBACK_CACHE;
+        } else {
+            out &= !FUSE_WRITEBACK_CACHE;
         }
-        if enable_splice {
+        if conf.enable_splice {
             out |= FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        } else {
+            out &= !(FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ);
         }
         out
     }
@@ -974,6 +1071,15 @@ impl CurvineFileSystem {
     /// Whether the kernel's advertised FUSE ABI version is at least the daemon's minimum.
     fn abi_supported(major: u32, minor: u32) -> bool {
         (major, minor) >= FUSE_MIN_ABI
+    }
+
+    fn unsupported_abi_message(major: u32, minor: u32) -> String {
+        format!(
+            "The kernel FUSE protocol ABI {major}.{minor} is unsupported; Curvine requires >= {FUSE_KERNEL_VERSION}.{FUSE_KERNEL_MINOR_VERSION}. \
+             This ABI is supplied by the running kernel, not the userspace fuse/fuse3 package. \
+             Use a host kernel that reports FUSE ABI >= {FUSE_KERNEL_VERSION}.{FUSE_KERNEL_MINOR_VERSION}, \
+             or use the Curvine CLI/SDK without FUSE."
+        )
     }
 
     /// The INIT reply for a kernel whose major ABI is newer than the daemon's: advertise only the
@@ -990,14 +1096,8 @@ impl CurvineFileSystem {
 impl fs::FileSystem for CurvineFileSystem {
     async fn init(&self, op: Init<'_>) -> FuseResult<fuse_init_out> {
         if !Self::abi_supported(op.arg.major, op.arg.minor) {
-            return err_fuse!(
-                libc::EPROTO,
-                "unsupported FUSE ABI {}.{}: curvine requires >= {}.{}",
-                op.arg.major,
-                op.arg.minor,
-                FUSE_KERNEL_VERSION,
-                FUSE_KERNEL_MINOR_VERSION
-            );
+            let message = Self::unsupported_abi_message(op.arg.major, op.arg.minor);
+            return err_fuse!(libc::EPROTO, "{}", message);
         }
 
         // Newer kernel major: reply with our version only and negotiate no flags.
@@ -1015,11 +1115,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         // Negotiate only daemon-supported, kernel-offered, config-gated caps.
-        let out_flags = Self::negotiate_out_flags(
-            op.arg.flags,
-            self.conf.write_back_cache,
-            self.conf.enable_splice,
-        );
+        let out_flags = Self::negotiate_out_flags(op.arg.flags, &self.conf);
 
         let max_write = FuseUtils::get_fuse_buf_size() - FUSE_BUFFER_HEADER_SIZE;
         let page_size = sys::get_pagesize()?;
@@ -1046,7 +1142,7 @@ impl fs::FileSystem for CurvineFileSystem {
             congestion_threshold: self.conf.congestion_threshold,
             max_write: max_write as u32,
             #[cfg(feature = "fuse3")]
-            time_gran: 1,
+            time_gran: FUSE_TIME_GRANULARITY_NS,
             #[cfg(feature = "fuse3")]
             max_pages: max_pages as u16,
             #[cfg(feature = "fuse3")]
@@ -1323,7 +1419,15 @@ impl fs::FileSystem for CurvineFileSystem {
         let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
         let file_uid = self.resolve_file_uid(&cur_status.owner);
         let file_gid = self.resolve_file_gid(&cur_status.group);
-        let target_gid = if (op.arg.valid & FATTR_GID) != 0 {
+        // Normalize the (uid_t)-1 sentinel from chown(2)/fchown/lchown here so downstream
+        // permission checks and SetAttrOpts persistence both see "attribute not present"
+        // rather than the literal 4294967295.
+        let target_uid = if (op.arg.valid & FATTR_UID) != 0 && op.arg.uid != u32::MAX {
+            Some(op.arg.uid)
+        } else {
+            None
+        };
+        let target_gid = if (op.arg.valid & FATTR_GID) != 0 && op.arg.gid != u32::MAX {
             Some(op.arg.gid)
         } else {
             None
@@ -1344,9 +1448,7 @@ impl fs::FileSystem for CurvineFileSystem {
             Self::check_utime_setattr_permission(
                 self.conf.check_permission,
                 op.arg.valid,
-                op.header.uid,
-                op.header.gid,
-                op.header.pid,
+                op.header,
                 file_uid,
                 file_gid,
                 cur_status.mode,
@@ -1354,11 +1456,11 @@ impl fs::FileSystem for CurvineFileSystem {
         } else {
             Self::check_setattr_permission(
                 self.conf.check_permission,
-                op.header.uid,
-                op.header.gid,
-                op.header.pid,
+                op.header,
                 file_uid,
+                file_gid,
                 op.arg.valid,
+                target_uid,
                 target_gid,
             )?;
         }
@@ -1383,9 +1485,9 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        // Apply chown suid/sgid rules when owner or group changes on regular files.
-        // If kernel didn't provide FATTR_MODE, we still need to clear bits accordingly.
-        if (op.arg.valid & (FATTR_UID | FATTR_GID)) != 0 && cur_status.file_type == FileType::File {
+        // Clear setuid/setgid on chown (FATTR_UID/GID, or valid==0 for chown(-1,-1)).
+        let chown_effective = Self::chown_should_clear_setid_bits(op.arg.valid);
+        if chown_effective && cur_status.file_type == FileType::File {
             let mut new_mode = if let Some(mode) = opts.mode {
                 mode
             } else {
@@ -1407,10 +1509,10 @@ impl fs::FileSystem for CurvineFileSystem {
             let writer_len = self.state.get_writer_len(op.header.nodeid).await;
             if Self::setattr_size_needs_resize(op.arg.size, status.len, writer_len) {
                 let resize_opts = FileAllocOpts::with_truncate(expect_len);
-                self.state
+                status = self
+                    .state
                     .fs_resize(op.header.nodeid, op.arg.fh, resize_opts)
                     .await?;
-                status.len = expect_len;
                 self.state
                     .invalid_cache(op.header.nodeid, None, INVAL_REASON_RESIZE);
             }
@@ -1469,7 +1571,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // Get file system profile information.
     async fn stat_fs(&self, _: StatFs<'_>) -> FuseResult<fuse_kstatfs> {
-        let info = self.fs.get_master_info().await?;
+        let info = self.fs.get_filesystem_info().await?;
 
         let block_size = 4 * ByteUnit::KB as u32;
         let total_blocks = (info.capacity / block_size as i64) as u64;
@@ -1627,10 +1729,10 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&path, RpcCode::CreateFile)
             .await?;
 
-        let mut opts = FuseUtils::create_opts(&op, &self.fs);
-        let parent_status = self.state.fs_stat(ino, None).await?;
-        FuseUtils::apply_setgid_parent_group(&mut opts, &parent_status);
-
+        let mode = self
+            .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
+            .await?;
+        let opts = FuseUtils::create_opts(&op, &self.fs, mode);
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
         let attr = FuseUtils::status_to_attr(&self.conf, &handle.status())?;
 
@@ -1687,6 +1789,14 @@ impl fs::FileSystem for CurvineFileSystem {
         // lock_owner on almost every FUSE_FLUSH/close; unconditional unlock
         // caused a Master SetLock+journal storm for Spark local-dirs (#1227).
         if op.arg.lock_owner != 0 && handle.take_plock_if_owner(op.arg.lock_owner).is_some() {
+            let path = match Path::from_str(&handle.status().path) {
+                Ok(path) => path,
+                Err(e) => {
+                    handle.add_lock(LockFlags::Plock, op.arg.lock_owner);
+                    return Err(e.into());
+                }
+            };
+            let _guard = self.state.lock_path(&path).await;
             if let Err(e) = self
                 .fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
                 .await
@@ -2056,9 +2166,10 @@ impl fs::FileSystem for CurvineFileSystem {
             let path = self.state.get_path_name(op.header.nodeid, name)?;
             self.ensure_writable_path(&path, RpcCode::CreateFile)
                 .await?;
-            let mut opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
-            let parent_status = self.state.fs_stat(op.header.nodeid, None).await?;
-            FuseUtils::apply_setgid_parent_group(&mut opts, &parent_status);
+            let mode = self
+                .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
+                .await?;
+            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type, mode);
             self.fs.create_special_node(&path, opts).await?;
             let attr = self.state.lookup_common(op.header.nodeid, name).await?;
             Ok(FuseUtils::create_entry_out(&self.conf, attr))
@@ -2073,7 +2184,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
-        let conflict = self.fs.get_lock(&path, lock).await?;
+        let conflict = self.get_lock_ordered(&path, lock).await?;
         let lk = match conflict {
             Some(lk) => fuse_file_lock {
                 start: lk.start,
@@ -2107,7 +2218,7 @@ impl fs::FileSystem for CurvineFileSystem {
             lock.end = u64::MAX;
         }
 
-        let conflict = self.fs.set_lock(&path, lock).await?;
+        let conflict = self.set_lock_ordered(&path, lock).await?;
         if conflict.is_none() {
             if is_unlock {
                 // Full-range unlock drops this owner from handle bookkeeping so a
@@ -2118,6 +2229,7 @@ impl fs::FileSystem for CurvineFileSystem {
             } else {
                 handle.add_lock(flag, owner_id);
             }
+            self.plock_waits.notify_waiters();
             Ok(())
         } else {
             err_fuse!(libc::EAGAIN)
@@ -2139,6 +2251,9 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut ticks: u64 = 0;
         let time = TimeSpent::new();
 
+        // Linux reports OFD locks with lk.pid == 0 or -1 and does not perform
+        // deadlock detection for F_OFD_SETLKW; keep them out of the POSIX wait graph.
+        let detect_deadlock = !Self::is_ofd_lock_pid(op.arg.lk.pid);
         let mut lock = self.to_file_lock(op.arg, op.header.pid);
         let is_unlock = lock.lock_type == LockType::UnLock;
         let full_range_unlock = Self::is_full_range_unlock(&lock);
@@ -2148,9 +2263,17 @@ impl fs::FileSystem for CurvineFileSystem {
         let wait_guard = PlockWaitGuard::new(
             self.plock_waits.clone(),
             LockOwner::new(lock.client_id.clone(), lock.owner_id),
+            LockWaitInfo::new(
+                op.header.unique,
+                lock.pid,
+                op.header.nodeid,
+                path.to_string(),
+                lock.start,
+                lock.end,
+            ),
         );
         loop {
-            let conflict = self.fs.set_lock(&path, lock.clone()).await?;
+            let conflict = self.set_lock_ordered(&path, lock.clone()).await?;
             if conflict.is_none() {
                 wait_guard.clear_blocked_by();
                 if is_unlock {
@@ -2160,19 +2283,47 @@ impl fs::FileSystem for CurvineFileSystem {
                 } else {
                     handle.add_lock(lock.lock_flags, lock.owner_id);
                 }
+                self.plock_waits.notify_waiters();
                 return Ok(());
             }
 
             let blocker = conflict.as_ref().expect("conflict lock");
-            if wait_guard
-                .register_blocked_by(LockOwner::new(blocker.client_id.clone(), blocker.owner_id))
+            // An OFD blocker (pid == 0) does not represent a process wait edge,
+            // so a POSIX waiter blocked by it cannot close a POSIX deadlock cycle.
+            let decision = if detect_deadlock && !Self::is_ofd_lock_pid(blocker.pid) {
+                Some(wait_guard.register_blocked_by(LockOwner::new(
+                    blocker.client_id.clone(),
+                    blocker.owner_id,
+                )))
+            } else {
+                wait_guard.clear_blocked_by();
+                None
+            };
+            debug!(
+                "plock SETLKW wait decision unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] blocker_pid={} blocker_owner_id={} blocker_range=[{},{}] decision={:?}",
+                op.header.unique,
+                lock.pid,
+                lock.owner_id,
+                op.header.nodeid,
+                path,
+                lock.start,
+                lock.end,
+                blocker.pid,
+                blocker.owner_id,
+                blocker.start,
+                blocker.end,
+                decision
+            );
+            if decision
+                .as_ref()
+                .is_some_and(PlockWaitDecision::is_process_deadlock)
             {
                 // Cycle in the local wait graph. Re-sample Master once while
                 // keeping our edge published so a peer in a true multi-resource
                 // deadlock (LTP fcntl17) still observes the cycle. If the lock
                 // is free now (OFD unlock/re-lock race, LTP fcntl34), acquire
                 // instead of returning a false EDEADLK.
-                let conflict2 = self.fs.set_lock(&path, lock.clone()).await?;
+                let conflict2 = self.set_lock_ordered(&path, lock.clone()).await?;
                 if conflict2.is_none() {
                     wait_guard.clear_blocked_by();
                     if is_unlock {
@@ -2182,20 +2333,57 @@ impl fs::FileSystem for CurvineFileSystem {
                     } else {
                         handle.add_lock(lock.lock_flags, lock.owner_id);
                     }
+                    self.plock_waits.notify_waiters();
                     return Ok(());
                 }
                 let blocker2 = conflict2.as_ref().expect("conflict lock");
-                if wait_guard.register_blocked_by(LockOwner::new(
-                    blocker2.client_id.clone(),
+                let decision2 = if !Self::is_ofd_lock_pid(blocker2.pid) {
+                    Some(wait_guard.register_blocked_by(LockOwner::new(
+                        blocker2.client_id.clone(),
+                        blocker2.owner_id,
+                    )))
+                } else {
+                    wait_guard.clear_blocked_by();
+                    None
+                };
+                debug!(
+                    "plock SETLKW deadlock recheck unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] blocker_pid={} blocker_owner_id={} blocker_range=[{},{}] decision={:?}",
+                    op.header.unique,
+                    lock.pid,
+                    lock.owner_id,
+                    op.header.nodeid,
+                    path,
+                    lock.start,
+                    lock.end,
+                    blocker2.pid,
                     blocker2.owner_id,
-                )) {
-                    return err_fuse!(libc::EDEADLK);
+                    blocker2.start,
+                    blocker2.end,
+                    decision2
+                );
+                if let Some(PlockWaitDecision::Deadlock { cycle, .. }) = decision2 {
+                    if cycle.spans_multiple_processes() {
+                        debug!(
+                            "plock SETLKW returning EDEADLK unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] cycle={:?}",
+                            op.header.unique,
+                            lock.pid,
+                            lock.owner_id,
+                            op.header.nodeid,
+                            path,
+                            lock.start,
+                            lock.end,
+                            cycle
+                        );
+                        return err_fuse!(libc::EDEADLK);
+                    }
                 }
             }
 
             ticks += 1;
             let sleep_ms = check_interval_max_ms.min(check_interval_min_ms.saturating_mul(ticks));
-            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            self.plock_waits
+                .wait_for_change(std::time::Duration::from_millis(sleep_ms))
+                .await;
 
             if ticks.is_multiple_of(log_ticks as u64) {
                 info!("waiting lock for {}, elapsed: {} ms", path, time.used_ms());
@@ -2215,16 +2403,33 @@ impl fs::FileSystem for CurvineFileSystem {
 #[cfg(test)]
 mod tests {
     use crate::fs::dcache::Inode;
+    use crate::raw::fuse_abi::fuse_in_header;
     use crate::{
         FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID,
         FUSE_INIT_EXT,
     };
-    use curvine_common::state::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
+    use curvine_config::FuseConf;
+    use curvine_model::{FileAllocMode, FileStatus, FileType, INTERNAL_CTIME_XATTR};
+
+    /// Build a minimal `fuse_in_header` for permission-check tests. Only uid/gid/pid
+    /// matter for the checks under test; other fields are zeroed.
+    fn hdr(uid: u32, gid: u32, pid: u32) -> fuse_in_header {
+        fuse_in_header {
+            len: 0,
+            opcode: 0,
+            unique: 0,
+            nodeid: 0,
+            uid,
+            gid,
+            pid,
+            padding: 0,
+        }
+    }
 
     #[test]
     fn full_range_unlock_accepts_kernel_offset_max_and_u64_max() {
         use super::CurvineFileSystem;
-        use curvine_common::state::{FileLock, LockType};
+        use curvine_model::{FileLock, LockType};
 
         assert!(CurvineFileSystem::is_lock_to_eof(u64::MAX));
         assert!(CurvineFileSystem::is_lock_to_eof(i64::MAX as u64));
@@ -2355,7 +2560,7 @@ mod tests {
     #[test]
     fn root_access_checks_any_execute_bit_not_owner_class() {
         use super::CurvineFileSystem;
-        use curvine_common::state::{FileStatus, FileType};
+        use curvine_model::{FileStatus, FileType};
 
         let mut readonly = FileStatus::with_name(1, "readonly".to_string(), false);
         readonly.file_type = FileType::File;
@@ -2484,8 +2689,15 @@ mod tests {
 
     #[test]
     fn setattr_permission_denies_non_owner_chown() {
+        // caller uid=1000 attempts to change owner to uid=2000 on a root-owned file.
         let err = super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 0, 0, FATTR_UID, None,
+            true,
+            &hdr(1000, 1000, 0),
+            0,
+            0,
+            FATTR_UID,
+            Some(2000),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.errno(), libc::EPERM);
@@ -2493,8 +2705,15 @@ mod tests {
 
     #[test]
     fn setattr_permission_denies_owner_uid_change() {
+        // Owner (uid=1000) tries to hand ownership over to uid=2000 → EPERM.
         let err = super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 0, 1000, FATTR_UID, None,
+            true,
+            &hdr(1000, 1000, 0),
+            1000,
+            0,
+            FATTR_UID,
+            Some(2000),
+            None,
         )
         .unwrap_err();
         assert_eq!(err.errno(), libc::EPERM);
@@ -2502,14 +2721,28 @@ mod tests {
 
     #[test]
     fn setattr_permission_allows_root_chown() {
-        super::CurvineFileSystem::check_setattr_permission(true, 0, 0, 0, 1000, FATTR_UID, None)
-            .unwrap();
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(0, 0, 0),
+            1000,
+            0,
+            FATTR_UID,
+            Some(2000),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
     fn setattr_permission_allows_owner_mode_change() {
         super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 0, 1000, FATTR_MODE, None,
+            true,
+            &hdr(1000, 1000, 0),
+            1000,
+            0,
+            FATTR_MODE,
+            None,
+            None,
         )
         .unwrap();
     }
@@ -2518,11 +2751,11 @@ mod tests {
     fn setattr_permission_denies_owner_gid_to_foreign_group() {
         let err = super::CurvineFileSystem::check_setattr_permission(
             true,
+            &hdr(1000, 100, 0),
             1000,
             100,
-            0,
-            1000,
             FATTR_GID,
+            None,
             Some(200),
         )
         .unwrap_err();
@@ -2533,28 +2766,172 @@ mod tests {
     fn setattr_permission_allows_owner_gid_to_own_group() {
         super::CurvineFileSystem::check_setattr_permission(
             true,
+            &hdr(1000, 100, 0),
             1000,
-            100,
-            0,
-            1000,
+            50,
             FATTR_GID,
+            None,
             Some(100),
         )
         .unwrap();
+    }
+
+    /// Issue #18 / gongxun0928#18: non-owner who is a member of the *target* group must
+    /// still get EPERM (owner gate ∧ group membership).
+    #[test]
+    fn setattr_permission_denies_non_owner_gid_change_even_if_in_target_group() {
+        let err = super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(2000, 3000, 0),
+            1000, // file owned by another user
+            100,  // current file gid
+            FATTR_GID,
+            None,
+            Some(3000), // caller primary gid — membership OK, ownership not
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
     }
 
     #[test]
     fn setattr_permission_ignores_mtime_only_changes() {
         super::CurvineFileSystem::check_setattr_permission(
             true,
-            1000,
-            1000,
+            &hdr(1000, 1000, 0),
             0,
             0,
             FATTR_MTIME,
             None,
+            None,
         )
         .unwrap();
+    }
+
+    /// Same-id chown targets must not count as an ownership change.
+    #[test]
+    fn chown_effectively_changes_ignores_same_uid_gid_and_absent_targets() {
+        use super::CurvineFileSystem as CFS;
+        assert!(!CFS::chown_effectively_changes(None, None, 1000, 100));
+        assert!(!CFS::chown_effectively_changes(Some(1000), None, 1000, 100));
+        assert!(!CFS::chown_effectively_changes(None, Some(100), 1000, 100));
+        assert!(!CFS::chown_effectively_changes(
+            Some(1000),
+            Some(100),
+            1000,
+            100
+        ));
+        assert!(CFS::chown_effectively_changes(Some(2000), None, 1000, 100));
+        assert!(CFS::chown_effectively_changes(None, Some(200), 1000, 100));
+        assert!(CFS::chown_effectively_changes(
+            Some(1000),
+            Some(200),
+            1000,
+            100
+        ));
+    }
+
+    /// LTP chown02 / #1567: dual-target same-owner still presents both FATTR bits.
+    #[test]
+    fn chown_should_clear_setid_bits_for_explicit_same_owner_chown02() {
+        use super::CurvineFileSystem as CFS;
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID | FATTR_GID));
+    }
+
+    /// Linux matrix under HANDLE_KILLPRIV: UID/GID FATTR clear; empty valid is chown(-1,-1).
+    #[test]
+    fn chown_should_clear_setid_bits_on_any_fattr_uid_or_gid() {
+        use super::CurvineFileSystem as CFS;
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_GID));
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID));
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID | FATTR_GID));
+        // chown(-1,-1) under killpriv → valid==0
+        assert!(CFS::chown_should_clear_setid_bits(0));
+        // mode-only / time-only setattr is not a chown
+        assert!(!CFS::chown_should_clear_setid_bits(FATTR_MODE));
+        assert!(!CFS::chown_should_clear_setid_bits(FATTR_MTIME));
+    }
+
+    /// pjdfstest chown/00.t regression: owner may keep uid unchanged and move gid to a
+    /// supplementary group in the same setattr call. Historically curvine returned EPERM
+    /// because FATTR_UID was rejected unconditionally.
+    #[test]
+    fn setattr_permission_allows_owner_uid_noop_with_gid_change_to_own_group() {
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(65534, 65532, 0),
+            65534,
+            65532,
+            FATTR_UID | FATTR_GID,
+            Some(65534),
+            Some(65532),
+        )
+        .unwrap();
+    }
+
+    /// Owner passing FATTR_UID with an unchanged uid must not fail even without FATTR_GID.
+    #[test]
+    fn setattr_permission_allows_owner_uid_noop() {
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(1000, 1000, 0),
+            1000,
+            1000,
+            FATTR_UID,
+            Some(1000),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// Owner keeping the current gid must be allowed even if the gid is not in the
+    /// caller's supplementary group set (common when chown wraps chown(f, -1, -1)).
+    #[test]
+    fn setattr_permission_allows_owner_gid_noop_outside_supplementary() {
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(1000, 100, 0),
+            1000,
+            200,
+            FATTR_GID,
+            None,
+            Some(200),
+        )
+        .unwrap();
+    }
+
+    /// After upstream normalization in `set_attr`, `(uid_t)-1` / `(gid_t)-1` sentinels are
+    /// dropped to `None` before reaching this function, so a "keep current" chown looks
+    /// like a plain no-op with no ownership targets. Verify that shape is accepted.
+    #[test]
+    fn setattr_permission_accepts_normalized_keep_current_chown() {
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(1000, 100, 0),
+            1000,
+            100,
+            FATTR_MODE,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    /// Defense-in-depth: even if a raw u32::MAX sentinel somehow reached this function
+    /// unnormalized, it denotes "change owner to 4294967295", which for a non-root caller
+    /// that does not own uid 4294967295 must be rejected rather than silently accepted.
+    #[test]
+    fn setattr_permission_rejects_raw_uint_max_uid_from_non_owner() {
+        let err = super::CurvineFileSystem::check_setattr_permission(
+            true,
+            &hdr(1000, 100, 0),
+            1000,
+            100,
+            FATTR_UID,
+            Some(u32::MAX),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
     }
 
     #[test]
@@ -2573,9 +2950,7 @@ mod tests {
         super::CurvineFileSystem::check_utime_setattr_permission(
             true,
             FATTR_ATIME_NOW | FATTR_MTIME_NOW,
-            1000,
-            100,
-            0,
+            &hdr(1000, 100, 0),
             0,
             100,
             0o660,
@@ -2588,9 +2963,7 @@ mod tests {
         let err = super::CurvineFileSystem::check_utime_setattr_permission(
             true,
             FATTR_MTIME,
-            1000,
-            100,
-            0,
+            &hdr(1000, 100, 0),
             0,
             100,
             0o666,
@@ -2604,9 +2977,7 @@ mod tests {
         let err = super::CurvineFileSystem::check_utime_setattr_permission(
             true,
             FATTR_ATIME_NOW | FATTR_MTIME_NOW,
-            1000,
-            100,
-            0,
+            &hdr(1000, 100, 0),
             0,
             100,
             0o555,
@@ -2722,8 +3093,9 @@ mod tests {
     use crate::{
         fuse_init_flag_names, FUSE_ATOMIC_O_TRUNC, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS,
         FUSE_EXPORT_SUPPORT, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_KERNEL_MINOR_VERSION,
-        FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE,
-        FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
+        FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SETXATTR_EXT,
+        FUSE_SPLICE_MOVE, FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE,
+        SUPPORTED_INIT_FLAGS,
     };
 
     #[test]
@@ -2769,93 +3141,108 @@ mod tests {
         assert_eq!(encoded, b"user.visible\0");
     }
 
-    // The daemon must never advertise FUSE_ATOMIC_O_TRUNC (open does not truncate)
-    // or any other unsupported capability, even when the kernel offers it. The
-    // allowlist mask drops them.
-    //
-    // FUSE_EXPORT_SUPPORT is included here (dropped even when offered): its `.`/`..`
-    // reconstruction relies on root `.`/`..` lookups that currently return ENOENT,
-    // so the daemon must not advertise it. Not advertising it leaves the kernel's
-    // `fc->export_support` unset, so the kernel never issues the root `.`/`..` LOOKUP.
+    fn init_conf(write_back_cache: bool, enable_splice: bool) -> FuseConf {
+        FuseConf {
+            write_back_cache,
+            enable_splice,
+            ..FuseConf::default()
+        }
+    }
+
     #[test]
     fn negotiate_out_flags_drops_unsupported_kernel_caps() {
         let unsupported = FUSE_ATOMIC_O_TRUNC
             | FUSE_POSIX_ACL
             | FUSE_HAS_IOCTL_DIR
-            | FUSE_EXPORT_SUPPORT
-            | (1u32 << 30);
-        let out = CurvineFileSystem::negotiate_out_flags(unsupported, false, false);
+            | FUSE_INIT_EXT
+            | FUSE_SETXATTR_EXT;
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(unsupported, &conf);
         assert_eq!(
-            out, 0,
+            out & unsupported,
+            0,
             "no unsupported kernel-offered bit may be advertised"
         );
     }
 
-    // EXPORT_SUPPORT stays out: Curvine cannot serve kernel `.`/`..` handle reconstruction.
     #[test]
-    fn export_support_not_in_allowlist() {
+    fn setxattr_ext_is_not_advertised() {
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(FUSE_SETXATTR_EXT, &conf);
+
+        assert_eq!(
+            out & FUSE_SETXATTR_EXT,
+            0,
+            "the decoder only supports the 8-byte SETXATTR compatibility layout"
+        );
+    }
+
+    // Root `.`/`..` lookup reconstruction is supported, so kernel file handles
+    // remain valid across dcache eviction.
+    #[test]
+    fn export_support_is_in_allowlist() {
         assert_eq!(
             SUPPORTED_INIT_FLAGS & FUSE_EXPORT_SUPPORT,
-            0,
-            "FUSE_EXPORT_SUPPORT must not be advertised until root `.`/`..` lookup works"
+            FUSE_EXPORT_SUPPORT,
+            "FUSE_EXPORT_SUPPORT must be advertised when root lookup works"
         );
     }
 
     #[test]
     fn negotiate_out_flags_passes_through_supported_caps() {
-        let out = CurvineFileSystem::negotiate_out_flags(SUPPORTED_INIT_FLAGS, false, false);
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(SUPPORTED_INIT_FLAGS, &conf);
+        let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
         assert_eq!(
-            out, SUPPORTED_INIT_FLAGS,
-            "all supported+offered caps survive"
+            out,
+            SUPPORTED_INIT_FLAGS & !splice,
+            "all supported caps survive; splice stays off without config"
         );
         assert_eq!(out & FUSE_POSIX_LOCKS, FUSE_POSIX_LOCKS);
         assert_eq!(out & FUSE_FLOCK_LOCKS, FUSE_FLOCK_LOCKS);
         assert_eq!(out & FUSE_DO_READDIRPLUS, FUSE_DO_READDIRPLUS);
     }
 
-    // A supported cap the kernel did NOT offer must not be advertised (no
-    // phantom capabilities).
     #[test]
     fn negotiate_out_flags_no_phantom_when_kernel_offers_nothing() {
-        let out = CurvineFileSystem::negotiate_out_flags(0, false, false);
-        assert_eq!(out, 0);
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(0, &conf);
+        assert_eq!(out, 0, "no phantom cap when the kernel offers nothing");
         assert_eq!(out & FUSE_MAX_PAGES, 0);
         assert_eq!(out & FUSE_POSIX_LOCKS, 0);
     }
 
-    // WRITEBACK is a config-gated daemon-requested cap: present iff write_back,
-    // absent otherwise even when the kernel offers it.
     #[test]
     fn negotiate_out_flags_writeback_is_config_gated() {
-        let on = CurvineFileSystem::negotiate_out_flags(0, true, false);
+        let on = CurvineFileSystem::negotiate_out_flags(0, &init_conf(true, false));
         assert_eq!(on & FUSE_WRITEBACK_CACHE, FUSE_WRITEBACK_CACHE);
-        let off = CurvineFileSystem::negotiate_out_flags(FUSE_WRITEBACK_CACHE, false, false);
+        let off =
+            CurvineFileSystem::negotiate_out_flags(FUSE_WRITEBACK_CACHE, &init_conf(false, false));
         assert_eq!(off & FUSE_WRITEBACK_CACHE, 0);
     }
 
-    // SPLICE is config-gated and forced (not masked by the kernel offer, since
-    // the channel drives splice(2) directly).
     #[test]
     fn negotiate_out_flags_splice_is_config_gated() {
         let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
-        let on = CurvineFileSystem::negotiate_out_flags(0, false, true);
+        let on = CurvineFileSystem::negotiate_out_flags(0, &init_conf(false, true));
         assert_eq!(
             on & splice,
             splice,
             "splice advertised on config even if kernel omits it"
         );
-        let off = CurvineFileSystem::negotiate_out_flags(splice, false, false);
+        let off = CurvineFileSystem::negotiate_out_flags(splice, &init_conf(false, false));
         assert_eq!(off & splice, 0, "splice not advertised when disabled");
     }
 
-    // Containment: output never contains a bit outside the allowed universe,
-    // regardless of what the kernel offers.
     #[test]
     fn negotiate_out_flags_containment() {
         let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        let unsafe_bits = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | FUSE_INIT_EXT;
         let allowed = SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE;
-        let out = CurvineFileSystem::negotiate_out_flags(0xFFFF_FFFF, true, true);
+        let conf = init_conf(true, true);
+        let out = CurvineFileSystem::negotiate_out_flags(u32::MAX, &conf);
         assert_eq!(out & !allowed, 0, "no bit outside the allowed universe");
+        assert_eq!(out & unsafe_bits, 0, "unsafe bits never advertised");
     }
 
     #[test]
@@ -2870,6 +3257,22 @@ mod tests {
         assert!(!CurvineFileSystem::abi_supported(6, 40));
         assert!(!CurvineFileSystem::abi_supported(6, 0));
         assert!(!CurvineFileSystem::abi_supported(0, 0));
+    }
+
+    #[test]
+    fn advertised_timestamp_granularity_matches_millisecond_storage() {
+        assert_eq!(super::FUSE_TIME_GRANULARITY_NS, 1_000_000);
+    }
+
+    #[test]
+    fn unsupported_abi_message_explains_kernel_requirement() {
+        let message = CurvineFileSystem::unsupported_abi_message(7, 22);
+
+        assert!(message.contains("kernel FUSE protocol ABI 7.22"));
+        assert!(message.contains("requires >= 7.31"));
+        assert!(message.contains("userspace fuse/fuse3 package"));
+        assert!(message.contains("running kernel"));
+        assert!(message.contains("CLI/SDK without FUSE"));
     }
 
     // Higher-major short reply (mirrors libfuse `_do_init`'s `arg->major > 7`
@@ -2933,9 +3336,9 @@ mod tests {
 
     mod readdir_termination {
         use crate::fs::state::DirHandle;
-        use curvine_common::fs::{ListStream, Path};
-        use curvine_common::state::FileStatus;
-        use orpc::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_fs_api::{ListStream, Path};
+        use curvine_model::FileStatus;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 
         fn entries(names: &[&str]) -> Vec<FileStatus> {
             names

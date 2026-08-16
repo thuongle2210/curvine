@@ -23,6 +23,9 @@ set -e
 # ./build release, release mode.
 FS_HOME="$(cd "`dirname "$0"`/.."; pwd)"
 
+# Shared version helpers used by build packaging and by version tests.
+source "$FS_HOME/build/version.sh"
+
 # Check if cargo is available
 if ! command -v cargo &> /dev/null; then
     echo "Error: cargo is not installed or not in PATH" >&2
@@ -136,6 +139,7 @@ print_help() {
   echo "  --skip-java-sdk        Skip Java SDK compilation (useful for Docker builds)"
   echo "  --skip-python-sdk      Skip Python SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
+  echo "  BUILD_VERSION=<ver>   Override the package version used for artifacts and build-version"
   echo
   echo "Examples:"
   echo "  $0                                      # Build all packages in release mode with opendal-s3"
@@ -164,7 +168,7 @@ fi
 ARCH_NAME=$(get_arch_name)
 OS_VERSION=$(get_os_version)
 FUSE_VERSION=$(get_fuse_version)
-CURVINE_VERSION=$(grep '^version =' "$FS_HOME/Cargo.toml" | sed 's/^version = "\(.*\)"/\1/')
+CURVINE_VERSION=$(get_build_version "$FS_HOME/Cargo.toml")
 
 # Package Directory
 DIST_DIR="$FS_HOME/build/dist"
@@ -416,7 +420,8 @@ fi
 
 if should_build_package "client"; then
   CLIENT_RUST_BUILD_ARGS+=("-p" "curvine-client")
-  # COPY_TARGETS+=("curvine-client")
+  COPY_TARGETS+=("curvine-client")
+  CLIENT_ARTIFACT_CHECK_TARGETS+=("curvine-client")
 fi
 
 if should_build_package "cli"; then
@@ -629,12 +634,12 @@ append_alloc_feature() {
       ;;
     client-safe)
       if [[ " ${CLIENT_RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]]; then
-        add_feature "curvine-common/${ALLOC}"
+        add_feature "curvine-alloc/${ALLOC}"
       fi
       return 0
       ;;
     *)
-      add_feature "curvine-common/${ALLOC}"
+      add_feature "curvine-alloc/${ALLOC}"
       ;;
   esac
 }
@@ -720,9 +725,9 @@ check_minimal_artifact_deps() {
 
   local needed
   needed="$(artifact_dynamic_entries "$inspector" "$artifact")"
-  local server_native_pattern='libibverbs\.so|librdmacm\.so|libspdk|librte_'
+  local server_native_pattern='libibverbs\.so|librdmacm\.so|libspdk|libdpdk|librte_'
   if grep -E "$server_native_pattern" <<<"$needed" >/dev/null; then
-    echo "Error: ${label} contains server-native RDMA/SPDK runtime dependencies forbidden for client artifacts:" >&2
+    echo "Error: ${label} contains server-native RDMA/SPDK runtime dependencies forbidden for minimal client artifacts:" >&2
     echo "$needed" >&2
     exit 1
   fi
@@ -926,7 +931,7 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
 
   ensure_maturin_cmd || exit 1
 
-  PROTO_DIR="$FS_HOME/curvine-common/proto"
+  PROTO_DIR="$FS_HOME/crates/common/curvine-proto/proto"
   PY_SDK_PY="$FS_HOME/curvine-libsdk/python"
   PROTO_PKG="$PY_SDK_PY/curvine_libsdk/_proto"
   echo "Generating Python protobuf stubs into curvine_libsdk/python/curvine_libsdk/_proto/..."

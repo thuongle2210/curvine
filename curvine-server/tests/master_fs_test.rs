@@ -12,38 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::{ClusterConf, MasterConf};
-use curvine_common::error::FsError;
-use curvine_common::fs::RpcCode;
-use curvine_common::fs::{CurvineURI, Path};
-use curvine_common::proto::{
-    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
-    GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
-};
-use curvine_common::state::MountOptions;
-use curvine_common::state::{
+use curvine_config::{ClusterConf, MasterConf};
+use curvine_core_error::CommonResult;
+use curvine_error::FsError;
+use curvine_fs_api::RpcCode;
+use curvine_fs_api::{CurvineURI, Path};
+use curvine_model::MountOptions;
+use curvine_model::ProtoUtils;
+use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, LocatedBlock, MkdirOptsBuilder,
-    StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
+    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
-use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
-use curvine_common::utils::{ProtoUtils, SerdeUtils};
+use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
+use curvine_proto::{
+    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
+    GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+};
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+use curvine_rpc::handler::MessageHandler;
+use curvine_rpc::message::Builder;
+#[cfg(feature = "fault-injection")]
+use curvine_rpc::message::ResponseStatus;
+use curvine_runtime::common::LocalTime;
+use curvine_runtime::common::SerdeUtils;
+use curvine_runtime::common::Utils;
+use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
-use orpc::common::LocalTime;
-use orpc::common::Utils;
-use orpc::handler::MessageHandler;
-use orpc::message::Builder;
-#[cfg(feature = "fault-injection")]
-use orpc::message::ResponseStatus;
-use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
-use orpc::CommonResult;
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -306,7 +307,7 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::GetJobStatus,
         RpcCode::CancelJob,
         RpcCode::ReportTask,
-        RpcCode::GetMasterInfo,
+        RpcCode::GetFilesystemInfo,
         RpcCode::GetCvMetadataSnapshotPage,
         RpcCode::GetCvMetadataDeltaPage,
     ] {
@@ -336,8 +337,8 @@ fn control_plane_requests_use_the_async_handler() {
 fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
-    let msg = Builder::new_rpc(RpcCode::GetMasterInfo)
-        .proto_header(GetMasterInfoRequest::default())
+    let msg = Builder::new_rpc(RpcCode::GetFilesystemInfo)
+        .proto_header(GetFilesystemInfoRequest::default())
         .build();
 
     let response = handler.handle(&msg)?;
@@ -562,6 +563,171 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
         "stale worker location for block {} was not reconciled: {:?}",
         second.block.id, blocks
     );
+}
+
+fn create_ufs_backed_cache_file(
+    fs: &MasterFilesystem,
+    path: &str,
+    ttl_action: TtlAction,
+) -> CommonResult<(curvine_model::FileStatus, LocatedBlock)> {
+    let client = ClientAddress::default();
+    let status = fs.create_with_opts(
+        path,
+        CreateFileOptsBuilder::new().ttl_action(ttl_action).build(),
+        OpenFlags::new_create(),
+    )?;
+    let block = fs.add_block(path, None, client.clone(), vec![], vec![], 0, None)?;
+    fs.complete_file(
+        path,
+        None,
+        status.block_size,
+        vec![full_commit(&block, status.block_size)],
+        &client.client_name,
+        false,
+        None,
+    )?;
+    fs.set_attr(path, SetAttrOptsBuilder::new().ufs_mtime(12_345).build())?;
+
+    Ok((fs.file_status(path)?, block))
+}
+
+#[test]
+fn lost_worker_invalidates_unreadable_ufs_cache_but_preserves_source_metadata() -> CommonResult<()>
+{
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lost-worker-cache-invalidation");
+    let path = "/cached-file";
+    let (before, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+
+    assert!(before.cv_valid(None));
+    assert!(before.ufs_exists());
+
+    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
+
+    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+    assert!(cleanup.replication_block_ids.is_empty());
+
+    let after = fs.file_status(path)?;
+    assert!(!after.cv_exists());
+    assert!(after.ufs_exists());
+    assert!(!after.cv_valid(None));
+    assert_eq!(
+        after.storage_policy.ufs_mtime,
+        before.storage_policy.ufs_mtime
+    );
+    assert_eq!(after.len, before.len);
+
+    let blocks = fs.get_block_locations(path)?;
+    assert!(blocks.block_locs.is_empty());
+    Ok(())
+}
+
+#[test]
+fn lost_worker_cache_invalidation_replays_on_follower() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (leader, journal_system, loader, _follower_journal_system, follower) =
+        setup_pair("lost-worker-cache-invalidation");
+    let path = "/cached-file";
+    let (_, block) = create_ufs_backed_cache_file(&leader, path, TtlAction::Delete)?;
+
+    let cleanup = leader.delete_locations(block.locs[0].worker_id)?;
+    assert!(cleanup.replication_block_ids.is_empty());
+
+    let entries = journal_system.fs().fs_dir.read().take_entries();
+    assert!(entries
+        .iter()
+        .any(|entry| matches!(entry, JournalEntry::CacheInvalidation(_))));
+    apply_entries(&loader, &entries, 1)?;
+
+    let leader_status = leader.file_status(path)?;
+    let follower_status = follower.file_status(path)?;
+    assert_eq!(
+        follower_status.storage_policy.state,
+        leader_status.storage_policy.state
+    );
+    assert_eq!(
+        follower_status.storage_policy.ufs_mtime,
+        leader_status.storage_policy.ufs_mtime
+    );
+    assert_eq!(follower_status.len, leader_status.len);
+    assert!(!follower_status.cv_valid(None));
+    assert!(follower_status.ufs_exists());
+    assert!(follower.get_block_locations(path)?.block_locs.is_empty());
+    Ok(())
+}
+
+#[test]
+fn lost_worker_keeps_cache_valid_when_a_replica_survives() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lost-worker-cache-surviving-replica");
+    let path = "/cached-file";
+    let (_, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+
+    let mut replica_worker = WorkerInfo::default();
+    replica_worker.address.worker_id = 101;
+    fs.add_test_worker(replica_worker);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, BlockLocation::with_id(101))?;
+
+    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
+
+    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+    assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
+
+    let after = fs.file_status(path)?;
+    assert!(after.cv_valid(None));
+    let blocks = fs.get_block_locations(path)?;
+    assert_eq!(blocks.block_locs.len(), 1);
+    assert_eq!(blocks.block_locs[0].locs[0].worker_id, 101);
+    Ok(())
+}
+
+#[test]
+fn lost_worker_keeps_ufs_backed_fs_mode_file_for_replica_recovery() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lost-worker-fs-mode-replica-recovery");
+    let path = "/ufs-backed-file";
+    let (before, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Free)?;
+
+    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
+
+    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+    assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
+
+    let after = fs.file_status(path)?;
+    assert_eq!(after.storage_policy.state, before.storage_policy.state);
+    assert!(after.cv_valid(None));
+    Ok(())
+}
+
+#[test]
+fn lost_worker_does_not_invalidate_curvine_only_file() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lost-worker-curvine-only");
+    let path = "/curvine-only";
+    let client = ClientAddress::default();
+    let status = fs.create(path, false)?;
+    let block = fs.add_block(path, None, client.clone(), vec![], vec![], 0, None)?;
+    fs.complete_file(
+        path,
+        None,
+        status.block_size,
+        vec![full_commit(&block, status.block_size)],
+        &client.client_name,
+        false,
+        None,
+    )?;
+
+    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
+
+    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+    assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
+
+    let after = fs.file_status(path)?;
+    assert!(after.cv_exists());
+    assert!(!after.ufs_exists());
+    Ok(())
 }
 
 #[test]
@@ -920,6 +1086,80 @@ fn mkdir_inherits_setgid_parent_group_and_mode() -> CommonResult<()> {
     assert_eq!("parent-group", child.group);
     assert_eq!(0o2000, child.mode & 0o2000);
     assert_eq!(0o775, child.mode & 0o777);
+
+    Ok(())
+}
+
+#[test]
+fn create_file_inherits_setgid_parent_group() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "create-file-setgid-inherit");
+
+    let parent_opts = MkdirOptsBuilder::new()
+        .owner("parent-owner".to_string())
+        .group("parent-group".to_string())
+        .mode(0o2775)
+        .build();
+    fs.mkdir_with_opts("/parent", parent_opts)?;
+
+    let file_opts = CreateFileOptsBuilder::new()
+        .owner("file-owner".to_string())
+        .group("file-group".to_string())
+        .build();
+    fs.create_with_opts("/parent/file", file_opts, OpenFlags::new_create())?;
+
+    let file = fs.file_status("/parent/file")?;
+    assert_eq!("parent-group", file.group);
+    assert_eq!(0, file.mode & 0o2000);
+
+    Ok(())
+}
+
+#[test]
+fn mkdir_recursive_parents_persist_owner_group() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "mkdir-recursive-owner-group");
+
+    let opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .owner("cli-owner".to_string())
+        .group("cli-group".to_string())
+        .build();
+    fs.mkdir_with_opts("/owner/parent/child", opts)?;
+
+    for path in ["/owner", "/owner/parent", "/owner/parent/child"] {
+        let status = fs.file_status(path)?;
+        assert_eq!("cli-owner", status.owner);
+        assert_eq!("cli-group", status.group);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn create_file_recursive_parents_persist_owner_group() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "create-file-recursive-owner-group");
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .owner("cli-owner".to_string())
+        .group("cli-group".to_string())
+        .build();
+    fs.create_with_opts(
+        "/owner/parent/file",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    for path in ["/owner", "/owner/parent"] {
+        let status = fs.file_status(path)?;
+        assert_eq!("cli-owner", status.owner);
+        assert_eq!("cli-group", status.group);
+    }
+    let file_status = fs.file_status("/owner/parent/file")?;
+    assert_eq!("cli-owner", file_status.owner);
+    assert_eq!("cli-group", file_status.group);
 
     Ok(())
 }
@@ -1329,8 +1569,8 @@ fn test_hardlink_to_dangling_symlink_inode() -> CommonResult<()> {
     assert_eq!(symlink.id, nick.id);
     assert_eq!(symlink.nlink, 2);
     assert_eq!(nick.nlink, 2);
-    assert_eq!(symlink.file_type, curvine_common::state::FileType::Link);
-    assert_eq!(nick.file_type, curvine_common::state::FileType::Link);
+    assert_eq!(symlink.file_type, curvine_model::FileType::Link);
+    assert_eq!(nick.file_type, curvine_model::FileType::Link);
     Ok(())
 }
 
@@ -1570,17 +1810,29 @@ fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let mut ctx = RpcContext::new(&msg);
     handler.mkdir(&mut ctx)?;
 
+    let create_req = CreateFileRequest {
+        path: "/delete_file_retry/child.log".to_string(),
+        flags: OpenFlags::new_create().value(),
+        ..Default::default()
+    };
+    let create_msg = Builder::new_rpc(RpcCode::CreateFile)
+        .req_id(Utils::req_id())
+        .proto_header(create_req)
+        .build();
+    let mut create_ctx = RpcContext::new(&create_msg);
+    handler.retry_check_create_file(&mut create_ctx)?;
+
     let id = Utils::req_id();
     let req = DeleteRequest {
         path: "/delete_file_retry".to_string(),
-        recursive: false,
+        recursive: true,
     };
 
-    let f1 = handler.delete0(id, req.clone())?;
-    assert!(f1);
+    let f1: DeleteResult = handler.delete0(id, req.clone())?;
+    assert_eq!(f1.inodes, 1);
 
     let f2 = handler.delete0(id, req.clone())?;
-    assert!(f2);
+    assert_eq!(f2.inodes, 0);
 
     Ok(())
 }
@@ -2112,11 +2364,11 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("set-locks");
     fs.create("/lockfile.log", true)?;
-    let lock = curvine_common::state::FileLock {
+    let lock = curvine_model::FileLock {
         client_id: "client1".to_string(),
         owner_id: 1,
-        lock_type: curvine_common::state::LockType::WriteLock,
-        lock_flags: curvine_common::state::LockFlags::Plock,
+        lock_type: curvine_model::LockType::WriteLock,
+        lock_flags: curvine_model::LockFlags::Plock,
         start: 0,
         end: 100,
         ..Default::default()

@@ -14,18 +14,21 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::conf::JournalConf;
+use crate::conf::{JournalConf, JournalConfExt};
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
 use crate::raft::*;
 use crate::utils::SerdeUtils;
+use curvine_core_error::ErrorExt;
+use curvine_io::DataSlice;
+use curvine_net::net::InetAddr;
+use curvine_rpc::client::dispatch::{Callback, Envelope};
+use curvine_rpc::message::{Builder, RefMessage, ResponseStatus};
+use curvine_runtime::common::{DurationUnit, LocalTime, TimeSpent};
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::sync::channel::{CallChannel, CallReceiver};
 use log::{debug, error, info, warn};
-use orpc::client::dispatch::{Callback, Envelope};
-use orpc::common::{DurationUnit, LocalTime, TimeSpent};
-use orpc::io::net::InetAddr;
-use orpc::message::{Builder, RefMessage, ResponseStatus};
-use orpc::runtime::{RpcRuntime, Runtime};
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
@@ -35,6 +38,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
+
+struct ProposeApply {
+    response: ProposeResponse,
+    apply_done: Option<CallReceiver<RaftResult<()>>>,
+}
 
 pub struct RaftNode<A, B>
 where
@@ -455,22 +463,10 @@ where
         // Get the ready structure.
         let mut ready = self.raw.ready();
 
-        // If hard state changes, it needs to be saved.
-        if let Some(hs) = ready.hs() {
-            let store = self.raw.mut_store();
-            store.set_hard_state(hs)?;
-        }
-
         let soft_state = ready.ss().map(|ss| SoftState {
             leader_id: ss.leader_id,
             raft_state: ss.raft_state,
         });
-
-        // Get the message that needs to be sent to other nodes.
-        // Only the leader call returns true.
-        if !ready.messages().is_empty() {
-            self.send_messages(ready.take_messages()).await?;
-        }
 
         // Process snapshots.
         if *ready.snapshot() != Snapshot::default() {
@@ -478,11 +474,20 @@ where
                 .gen_apply_snapshot_job(ready.snapshot().clone())?;
         }
 
-        // Persist new log entries first so followers can be notified immediately
-        // via persisted_messages.  FSM apply of already-committed entries can
-        // happen afterwards without blocking the persistence pipeline.
+        // Persist entries before the HardState that may commit them. A crash may
+        // leave extra uncommitted entries, but must never leave commit past tail.
         if !ready.entries().is_empty() {
             self.storage.append(&ready.entries()[..])?;
+        }
+
+        if let Some(hs) = ready.hs() {
+            let store = self.raw.mut_store();
+            store.set_hard_state(hs)?;
+        }
+
+        // Raft messages may be sent only after their Ready state is durable.
+        if !ready.messages().is_empty() {
+            self.send_messages(ready.take_messages()).await?;
         }
 
         // Get the message that the leader has fallen into the disk and send these messages to other nodes.
@@ -610,11 +615,67 @@ where
         Ok(ConfChangeResponse::default())
     }
 
-    async fn apply_propose(&mut self, entry: Entry) -> RaftResult<ProposeResponse> {
-        self.storage
-            .apply_propose(false, ApplyMsg::new_entry(entry))
-            .await?;
-        Ok(ProposeResponse::default())
+    async fn apply_propose(
+        &mut self,
+        entry: Entry,
+        wait_for_response: bool,
+    ) -> RaftResult<ProposeApply> {
+        let applied_index = entry.index;
+        let apply_done = if wait_for_response {
+            let (tx, rx) = CallChannel::channel();
+            self.storage
+                .apply_propose(false, ApplyMsg::new_entry_with_ack(entry, tx))
+                .await?;
+            Some(rx)
+        } else {
+            self.storage
+                .apply_propose(false, ApplyMsg::new_entry(entry))
+                .await?;
+            None
+        };
+
+        Ok(ProposeApply {
+            response: ProposeResponse {
+                applied_index: Some(applied_index),
+            },
+            apply_done,
+        })
+    }
+
+    fn send_propose_response_after_apply(
+        rt: &Arc<Runtime>,
+        req_id: i64,
+        sender: Callback,
+        response: ProposeResponse,
+        apply_done: CallReceiver<RaftResult<()>>,
+    ) {
+        let response_msg = Builder::new_rpc(RaftCode::Propose)
+            .response(ResponseStatus::Success)
+            .proto_header(response)
+            .req_id(req_id)
+            .build();
+
+        rt.spawn(async move {
+            let result = match apply_done.receive().await {
+                Ok(Ok(())) => Ok(response_msg),
+                Ok(Err(error)) => Ok(Builder::new_rpc(RaftCode::Propose)
+                    .response(ResponseStatus::Error)
+                    .req_id(req_id)
+                    .data(DataSlice::Buffer(error.encode()))
+                    .build()),
+                Err(error) => {
+                    let error = RaftError::from(error);
+                    Ok(Builder::new_rpc(RaftCode::Propose)
+                        .response(ResponseStatus::Error)
+                        .req_id(req_id)
+                        .data(DataSlice::Buffer(error.encode()))
+                        .build())
+                }
+            };
+            if sender.send(result).is_err() {
+                warn!("The client connection has been closed, req {}", req_id)
+            }
+        });
     }
 
     // Whether you need to create a new snapshot.
@@ -643,12 +704,8 @@ where
         client_send: &mut HashMap<i64, Callback>,
     ) -> RaftResult<()> {
         for entry in entries {
-            if entry.get_data().is_empty() {
-                continue;
-            }
-
             let is_conf_change = matches!(entry.get_entry_type(), EntryType::EntryConfChange);
-            let should_respond = self.is_leader();
+            let should_respond = self.is_leader() && !entry.get_data().is_empty();
             let (entry_index, entry_term, entry_context) = if should_respond {
                 (entry.index, entry.term, Some(entry.get_context().to_vec()))
             } else {
@@ -656,14 +713,54 @@ where
             };
             let rep_msg = if is_conf_change {
                 let rep = self.apply_config_change(&entry)?;
+                self.storage
+                    .apply_propose(false, ApplyMsg::new_entry(entry))
+                    .await?;
                 Builder::new_rpc(RaftCode::ConfChange)
                     .response(ResponseStatus::Success)
                     .proto_header(rep)
             } else {
-                let rep = self.apply_propose(entry).await?;
-                Builder::new_rpc(RaftCode::Propose)
-                    .response(ResponseStatus::Success)
-                    .proto_header(rep)
+                let apply = self.apply_propose(entry, should_respond).await?;
+                if should_respond {
+                    let Some(entry_context) = entry_context else {
+                        warn!(
+                            "leader committed entry has no response context, index {}, term {}",
+                            entry_index, entry_term
+                        );
+                        continue;
+                    };
+                    let Some(apply_done) = apply.apply_done else {
+                        warn!(
+                            "leader committed entry has no apply acknowledgement, index {}, term {}",
+                            entry_index, entry_term
+                        );
+                        continue;
+                    };
+                    let req_id: i64 = match SerdeUtils::deserialize(&entry_context) {
+                        Ok(req_id) => req_id,
+                        Err(e) => {
+                            warn!(
+                                "failed to decode raft entry context for response, index {}, term {}: {}",
+                                entry_index, entry_term, e
+                            );
+                            continue;
+                        }
+                    };
+                    match client_send.remove(&req_id) {
+                        Some(sender) => Self::send_propose_response_after_apply(
+                            &self.rt,
+                            req_id,
+                            sender,
+                            apply.response,
+                            apply_done,
+                        ),
+
+                        None => {
+                            warn!("Not found client for request {}", req_id)
+                        }
+                    };
+                }
+                continue;
             };
 
             // Followers only need to replay the message and do not need to respond to the customer service.

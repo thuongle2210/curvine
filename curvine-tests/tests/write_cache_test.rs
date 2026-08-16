@@ -14,12 +14,12 @@
 
 use bytes::BytesMut;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem, UnifiedReader};
-use curvine_common::fs::{FileSystem, Path, Reader, RpcCode, Writer};
-use curvine_common::state::{AccessMode, MountOptionsBuilder, WriteType};
+use curvine_fs_api::{FileSystem, Path, Reader, RpcCode, Writer};
+use curvine_io::DataSlice;
+use curvine_model::{AccessMode, MountOptionsBuilder, WriteType};
+use curvine_runtime::common::Utils;
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_tests::Testing;
-use orpc::common::Utils;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::sys::DataSlice;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +82,98 @@ fn test_cache_mode() {
         // Delete curvine file to simulate expiry
         fs.cv().delete(&path, false).await.unwrap();
         test_cache_read(&fs, &path).await;
+    });
+}
+
+#[test]
+fn test_cache_mode_recaches_after_lost_worker_cleanup() {
+    let testing = Testing::builder()
+        .workers(2)
+        // The first worker remains alive in this in-process test, but the
+        // master treats it as lost. The next heartbeat leaves enough time for
+        // the cache reload while still allowing the mini-cluster to start.
+        .mutate_conf(|conf| {
+            conf.master.heartbeat_interval = "10s".to_string();
+            conf.master.worker_blacklist_interval = "20s".to_string();
+            conf.master.worker_lost_interval = "30s".to_string();
+        })
+        .build()
+        .unwrap();
+    let ufs_base = testing.ufs_path.clone();
+    let cluster = testing.start_cluster().unwrap();
+    let master = cluster.get_active_master_fs();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+
+    rt.block_on(async move {
+        let mount_dir = "cache_mode_lost_worker_recache";
+        let cv_path = Path::from_str(format!("/{mount_dir}/data.log")).unwrap();
+        let ufs_path = Path::from_str(format!("{ufs_base}/{mount_dir}")).unwrap();
+        let opts = MountOptionsBuilder::new()
+            .write_type(WriteType::CacheMode)
+            .replicas(1)
+            .build();
+        let ufs = UfsFileSystem::new(&ufs_path, opts.add_properties.clone(), None).unwrap();
+        ufs.mkdir(&ufs_path, true).await.unwrap();
+        fs.mount(
+            &ufs_path,
+            &Path::from_str(format!("/{mount_dir}")).unwrap(),
+            opts,
+        )
+        .await
+        .unwrap();
+
+        let (source_path, mount) = fs
+            .get_mount(&cv_path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        let data = "cache data is re-admitted after the last replica is lost";
+        let mut writer = mount
+            .ufs()
+            .unwrap()
+            .create(&source_path, true)
+            .await
+            .unwrap();
+        writer.write_string(data.to_string()).await.unwrap();
+        writer.complete().await.unwrap();
+
+        // First read is from UFS and schedules a normal cache load job.
+        let mut miss = fs.open(&cv_path).await.unwrap();
+        assert!(!matches!(miss, UnifiedReader::Fallback(_)));
+        assert_eq!(miss.read_as_string().await.unwrap(), data);
+        fs.wait_job_complete(&cv_path, false).await.unwrap();
+
+        let cached = fs.cv().get_block_locations(&cv_path).await.unwrap();
+        assert_eq!(cached.block_locs.len(), 1);
+        assert_eq!(cached.block_locs[0].locs.len(), 1);
+        let lost_worker_id = cached.block_locs[0].locs[0].worker_id;
+
+        // Match HeartbeatChecker's lost-worker sequence: remove the worker
+        // from placement, then clear its block locations at the master.
+        assert!(master
+            .worker_manager
+            .write()
+            .remove_expired_worker(lost_worker_id)
+            .is_some());
+        let cleanup = master.delete_locations(lost_worker_id).unwrap();
+        assert!(cleanup.replication_block_ids.is_empty());
+
+        let invalidated = fs.cv().get_status(&cv_path).await.unwrap();
+        assert!(!invalidated.cv_valid(None));
+        assert!(invalidated.ufs_exists());
+
+        // The next open must be a cache miss: it reads UFS and schedules a
+        // replacement load job. Once that job finishes, Curvine serves the
+        // following read again.
+        let mut reload_miss = fs.open(&cv_path).await.unwrap();
+        assert!(!matches!(reload_miss, UnifiedReader::Fallback(_)));
+        assert_eq!(reload_miss.read_as_string().await.unwrap(), data);
+        fs.wait_job_complete(&cv_path, false).await.unwrap();
+
+        let mut reloaded_hit = fs.open(&cv_path).await.unwrap();
+        assert!(matches!(reloaded_hit, UnifiedReader::Fallback(_)));
+        assert_eq!(reloaded_hit.read_as_string().await.unwrap(), data);
     });
 }
 
@@ -177,7 +269,15 @@ fn test_cache_mode_free() {
             .unwrap();
         assert!(mnt.ufs().unwrap().exists(&ufs_path).await.unwrap());
 
-        fs.free(&path, false).await.unwrap();
+        let free_res = fs.free(&path, false).await.unwrap();
+        assert!(
+            free_res.inodes > 0,
+            "cache mode free should report deleted inodes"
+        );
+        assert!(
+            free_res.bytes > 0,
+            "cache mode free should report released bytes"
+        );
 
         assert!(
             !fs.cv().exists(&path).await.unwrap(),
@@ -191,6 +291,51 @@ fn test_cache_mode_free() {
         let mut reader = fs.open(&path).await.unwrap();
         assert!(!matches!(reader, UnifiedReader::Cv(_)));
         assert_eq!(reader.read_as_string().await.unwrap(), data);
+    });
+}
+
+#[test]
+fn test_cache_mode_free_child_with_unified_disabled() {
+    let mut fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let parent = Path::from_str("/write_cache_CacheMode/cache_only_free").unwrap();
+        fs.mkdir(&parent, true).await.unwrap();
+        let path = Path::from_str("/write_cache_CacheMode/cache_only_free/child.log").unwrap();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string("cache-only free").await.unwrap();
+        writer.complete().await.unwrap();
+        let _ = fs.open(&path).await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let (ufs_path, mount) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+
+        fs.disable_unified();
+        let free_res = fs.free(&parent, true).await.unwrap();
+        assert!(
+            free_res.inodes > 0,
+            "cache-only cache mode free should report deleted inodes"
+        );
+        assert!(
+            free_res.bytes > 0,
+            "cache-only cache mode free should report released bytes"
+        );
+
+        assert!(!fs.cv().exists(&path).await.unwrap());
+        assert!(mount.ufs().unwrap().exists(&ufs_path).await.unwrap());
+        assert!(
+            fs.cv()
+                .exists(&Path::from_str("/write_cache_CacheMode").unwrap())
+                .await
+                .unwrap(),
+            "free must preserve the cache-mode mount point"
+        );
     });
 }
 

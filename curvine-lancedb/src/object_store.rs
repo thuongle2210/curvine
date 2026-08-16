@@ -24,12 +24,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::{Path as CurvinePath, Reader, Writer};
-use curvine_common::state::{
-    FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder,
-};
+use curvine_config::ClusterConf;
+use curvine_error::FsError;
+use curvine_fs_api::{Path as CurvinePath, Reader, Writer};
+use curvine_io::DataSlice;
+use curvine_model::{FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder};
+use curvine_net::net::InetAddr;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use lance_core::error::Result;
@@ -48,8 +48,6 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use once_cell::sync::Lazy;
-use orpc::io::net::InetAddr;
-use orpc::sys::DataSlice;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 use url::Url;
@@ -1356,7 +1354,7 @@ impl CurvineObjectStore {
         dirs.sort_by(|left, right| right.full_path().len().cmp(&left.full_path().len()));
         for dir in dirs {
             match self.context.fs.delete(&dir, false).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(FsError::DirNotEmpty(_)) => {}
                 Err(e) if is_not_found_error(&e) => {}
                 Err(e) => return Err(fs_error_to_object_store(location, e)),
@@ -1409,7 +1407,7 @@ impl CurvineObjectStore {
             }
 
             match self.context.fs.delete(&dir, false).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(FsError::DirNotEmpty(_)) => break,
                 Err(e) if is_not_found_error(&e) => break,
                 Err(e) => return Err(fs_error_to_object_store(location, e)),

@@ -16,12 +16,11 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
-use curvine_common::error::FsError;
-use curvine_common::FsResult;
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_runtime::common::{LocalTime, TimeSpent};
+use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use log::{error, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::runtime::{GroupExecutor, LoopTask};
-use orpc::try_log;
 use std::sync::Arc;
 
 pub struct HeartbeatChecker {
@@ -105,12 +104,19 @@ impl LoopTask for HeartbeatChecker {
             let rm = self.replication_manager.clone();
             let res = self.executor.spawn(move || {
                 let spend = TimeSpent::new();
-                let block_ids = try_log!(fs.delete_locations(id), vec![]);
-                let block_num = block_ids.len();
-                if let Err(e) = rm.report_under_replicated_blocks(id, block_ids) {
+                let cleanup = match fs.delete_locations(id) {
+                    Err(e) => {
+                        warn!("{}", curvine_core_error::err_msg!(e));
+                        Default::default()
+                    }
+                    Ok(res) => res,
+                };
+                let replication_block_num = cleanup.replication_block_ids.len();
+                if let Err(e) = rm.report_under_replicated_blocks(id, cleanup.replication_block_ids)
+                {
                     error!(
                         "Errors on reporting under-replicated {} blocks. err: {:?}",
-                        block_num, e
+                        replication_block_num, e
                     );
                 }
                 info!(
@@ -119,10 +125,12 @@ impl LoopTask for HeartbeatChecker {
                     spend.used_ms()
                 );
             });
-            let _ = try_log!(res);
+            if let Err(e) = &res {
+                warn!("{}", e);
+            }
         }
 
-        if let Ok(info) = self.fs.master_info() {
+        if let Ok(info) = self.fs.filesystem_info() {
             self.quota_manager.detector(Some(info));
         };
 

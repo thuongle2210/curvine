@@ -50,6 +50,8 @@ app_name = "curvine"
 hugepage = "10MB"
 reactor_mask = "0x30"  
 # iova_mode = "va"  # set on VM/container hosts if env_init fails with PA IOVA error
+# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").
+# qpair_acquire_timeout = "30s"
 # NVMe-oF targets  
 [[worker.spdk_disk.targets]]
 trtype = "tcp"  
@@ -64,6 +66,11 @@ short_circuit = false
 
 [transfer]
 enabled = true
+rpc_port = 9010
+web_port = 9011
+client_pending_queue_size = 1024
+client_submit_concurrency = 64
+log = { level = "debug", log_dir = "stdout", file_name = "transfer.log" }
 
 # fuse configuration  
 [fuse]  

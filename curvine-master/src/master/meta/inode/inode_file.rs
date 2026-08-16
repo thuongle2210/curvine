@@ -16,13 +16,13 @@ use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
-use curvine_common::state::{
+use curvine_core_error::{err_box, CommonResult};
+use curvine_error::FsResult;
+use curvine_model::{
     is_special_file_type, BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts,
     FileType, StoragePolicy, INTERNAL_CTIME_XATTR,
 };
-use curvine_common::FsResult;
-use orpc::common::LocalTime;
-use orpc::{err_box, CommonResult};
+use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -366,6 +366,18 @@ impl InodeFile {
         }
     }
 
+    /// Invalidates the Curvine cache copy of a UFS-backed file without
+    /// detaching its source metadata. The next cache-mode read can then use
+    /// the normal UFS cache-miss path to load a replacement copy.
+    pub fn invalidate_cache(&mut self) -> bool {
+        if self.storage_policy.invalidate_cache() {
+            self.blocks.clear();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Search for block by file position
     /// Returns the block reference if found
     pub fn search_block_mut_by_pos(&mut self, file_pos: i64) -> Option<&mut BlockMeta> {
@@ -630,7 +642,7 @@ impl PartialEq for InodeFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_common::state::FileAllocMode;
+    use curvine_model::FileAllocMode;
 
     fn test_file(block_size: i64) -> InodeFile {
         let mut opts = CreateFileOpts::with_create(false);

@@ -14,16 +14,17 @@
 
 use crate::proto::raft::{AppliedIndex, SnapshotData};
 use crate::raft::RaftResult;
-use orpc::sync::channel::CallSender;
+use curvine_runtime::sync::channel::CallSender;
 use raft::eraftpb::Entry;
 use raft::StateRole;
 
 pub enum ApplyMsg {
     Entry(Entry),
+    EntryWithAck((Entry, CallSender<RaftResult<()>>)),
     Scan(AppliedIndex),
     CreateSnapshot(CallSender<RaftResult<SnapshotData>>),
     ApplySnapshot((CallSender<RaftResult<()>>, SnapshotData)),
-    RoleChange(StateRole),
+    RoleChange((StateRole, CallSender<RaftResult<()>>)),
     Shutdown(CallSender<()>),
 }
 
@@ -32,14 +33,19 @@ impl ApplyMsg {
         ApplyMsg::Entry(entry)
     }
 
+    pub fn new_entry_with_ack(entry: Entry, ack: CallSender<RaftResult<()>>) -> Self {
+        ApplyMsg::EntryWithAck((entry, ack))
+    }
+
     pub fn new_scan(applied_index: AppliedIndex) -> ApplyMsg {
         ApplyMsg::Scan(applied_index)
     }
 
-    pub fn take_entry(self) -> Entry {
+    pub fn into_entry_with_ack(self) -> RaftResult<(Entry, Option<CallSender<RaftResult<()>>>)> {
         match self {
-            ApplyMsg::Entry(entry) => entry,
-            _ => panic!("invalid entry"),
+            ApplyMsg::Entry(entry) => Ok((entry, None)),
+            ApplyMsg::EntryWithAck((entry, ack)) => Ok((entry, Some(ack))),
+            _ => Err("expected raft entry apply message".to_string().into()),
         }
     }
 }

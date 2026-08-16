@@ -23,11 +23,11 @@ use crate::session::{FuseNotifyCode, FuseTask};
 use crate::{FuseError, FuseResult, FuseUtils};
 use crate::{FUSE_NOTIFY_UNIQUE, FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
 use bytes::BytesMut;
+use curvine_core_error::ternary;
+use curvine_io::DataSlice;
+use curvine_io::IOResult;
+use curvine_runtime::sync::channel::AsyncSender;
 use log::{info, warn};
-use orpc::io::IOResult;
-use orpc::sync::channel::AsyncSender;
-use orpc::sys::DataSlice;
-use orpc::ternary;
 use parking_lot::Mutex;
 use std::fmt::Debug;
 use std::io::IoSlice;
@@ -82,11 +82,11 @@ impl ResponseData {
     fn checked_iovec_count(data: &[DataSlice]) -> IOResult<usize> {
         let count = match data.len().checked_add(1) {
             Some(count) => count,
-            None => return orpc::err_box!("FUSE response iovec count overflow"),
+            None => return curvine_core_error::err_box!("FUSE response iovec count overflow"),
         };
         let max = Self::iovec_max();
         if count > max {
-            return orpc::err_box!(
+            return curvine_core_error::err_box!(
                 "FUSE response iovec count {} exceeds IOV_MAX {}",
                 count,
                 max
@@ -100,7 +100,7 @@ impl ResponseData {
         for slice in data {
             len = match len.checked_add(slice.len()) {
                 Some(len) => len,
-                None => return orpc::err_box!("FUSE response length overflow"),
+                None => return curvine_core_error::err_box!("FUSE response length overflow"),
             };
         }
         Ok(len)
@@ -110,7 +110,7 @@ impl ResponseData {
         let count = Self::checked_iovec_count(&self.data)?;
         let actual_len = Self::checked_frame_len(&self.data)?;
         if actual_len != self.header.len as usize {
-            return orpc::err_box!(
+            return curvine_core_error::err_box!(
                 "FUSE response length mismatch: header {}, actual {}",
                 self.header.len,
                 actual_len
@@ -125,7 +125,7 @@ impl ResponseData {
         for data in &self.data {
             // FUSE iovec replies require memory-backed data, not fd-backed IOSlice regions.
             if matches!(data, DataSlice::IOSlice(_)) {
-                return orpc::err_box!(
+                return curvine_core_error::err_box!(
                     "DataSlice::IOSlice is not supported in FUSE iovec responses"
                 );
             }
@@ -139,7 +139,12 @@ impl ResponseData {
         let frame_len = Self::checked_frame_len(&data)?;
         let frame_len = match u32::try_from(frame_len) {
             Ok(frame_len) => frame_len,
-            Err(_) => return orpc::err_box!("FUSE response length {} exceeds u32::MAX", frame_len),
+            Err(_) => {
+                return curvine_core_error::err_box!(
+                    "FUSE response length {} exceeds u32::MAX",
+                    frame_len
+                )
+            }
         };
         let error = ternary!(unique == FUSE_NOTIFY_UNIQUE, error, -error);
 
@@ -191,7 +196,7 @@ impl FuseResponse {
         if self.debug
             || !matches!(
                 e.errno,
-                libc::ENOENT | libc::ENODATA | libc::ENOSYS | libc::ENOTEMPTY
+                libc::ENOENT | libc::ENODATA | libc::ENOSYS | libc::ENOTEMPTY | libc::ENOTTY
             )
         {
             warn!("send_rep unique {}: {}", self.unique, e);
@@ -415,7 +420,7 @@ impl FuseResponse {
         }
     }
 
-    /// Finish a request that errored before any reply, using a parse reason instead of errno.
+    /// Finish a no-reply request whose opcode payload could not be decoded.
     pub(crate) fn finish_early(&self, errno: i32, reason: &'static str) {
         if let Some(slot) = &self.metrics {
             {
@@ -434,6 +439,27 @@ impl FuseResponse {
             // Parse failed after ctx creation: record decode error, not `requests_total`.
             FuseMetrics::get().record_parse_error(reason);
         }
+    }
+
+    /// Complete a request whose header was decoded but whose opcode payload was malformed.
+    pub(crate) async fn send_parse_error(
+        &self,
+        reason: &'static str,
+        message: String,
+    ) -> IOResult<()> {
+        if let Some(slot) = &self.metrics {
+            {
+                let mut m = slot.lock();
+                m.parse_reason = Some(reason);
+            }
+            FuseMetrics::get().record_parse_error(reason);
+        }
+
+        let error: FuseResult<()> = Err(FuseError::from_errno_msg(
+            libc::EPROTO,
+            format!("Malformed FUSE request payload: {message}").into(),
+        ));
+        self.send_rep(error).await
     }
 
     pub async fn send_rep<T: Debug, E: Into<FuseError> + Debug>(
@@ -642,7 +668,7 @@ mod tests {
         REPLY_TYPE_REPLIED,
     };
     use curvine_metrics::{Gauge, Metrics as m};
-    use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
+    use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver};
 
     #[test]
     fn as_iovec_rejects_io_slice_without_panicking() {
@@ -952,9 +978,8 @@ mod tests {
         );
     }
 
-    // T8: parse-after-ctx early finish — `finish_early` (the API the receiver
-    // calls when `parse_operator()` fails after the ctx exists) drops the guard,
-    // marks finished, and enqueues NO task. No requests_total would be emitted.
+    // T8: malformed no-reply operator — `finish_early` drops the guard, marks
+    // the metrics slot finished, and enqueues NO task. No requests_total is emitted.
     #[tokio::test]
     async fn t8_finish_early_drops_guard_no_task() {
         init_metrics();
@@ -1518,7 +1543,7 @@ mod tests {
         );
     }
 
-    // B4 / test 8: parse-after-ctx early finish emits decode_errors_total
+    // B4 / test 8: malformed no-reply early finish emits decode_errors_total
     // {phase=parse,reason=other} once and NO requests_total.
     #[tokio::test]
     async fn finish_early_emits_decode_error_not_requests_total() {

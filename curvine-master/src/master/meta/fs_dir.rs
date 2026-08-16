@@ -20,19 +20,19 @@ use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
 use crate::master::quota::eviction::evictor::Evictor;
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
+use curvine_error::FsError;
+use curvine_error::FsResult;
+use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
-    INTERNAL_CTIME_XATTR,
+    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TtlAction,
+    WorkerAddress, INTERNAL_CTIME_XATTR,
 };
-use curvine_common::FsResult;
+use curvine_runtime::common::{LocalTime, TimeSpent};
+use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
-use orpc::common::{LocalTime, TimeSpent};
-use orpc::sync::AtomicCounter;
-use orpc::{err_box, err_ext, try_option, CommonResult};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, HashSet, LinkedList};
 use std::mem;
 use std::sync::Arc;
 
@@ -46,6 +46,27 @@ pub struct FsDir {
     pub(crate) journal_writer: Arc<JournalWriter>,
     pub(crate) evictor: Arc<dyn Evictor>,
     pub(crate) op_id: AtomicCounter,
+}
+
+#[derive(Default)]
+pub(crate) struct CacheInvalidationResult {
+    pub delete_result: DeleteResult,
+    pub invalidated_block_ids: HashSet<i64>,
+}
+
+impl CacheInvalidationResult {
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.delete_result.inodes += other.delete_result.inodes;
+        for (block_id, locations) in other.delete_result.blocks {
+            self.delete_result
+                .blocks
+                .entry(block_id)
+                .or_default()
+                .extend(locations);
+        }
+        self.invalidated_block_ids
+            .extend(other.invalidated_block_ids);
+    }
 }
 
 impl FsDir {
@@ -130,7 +151,10 @@ impl FsDir {
         let pos = inp.existing_len() - 1;
         let name = inp.get_component(pos + 1)?.to_string();
 
-        Self::apply_setgid_directory_inheritance(&inp, &mut opts)?;
+        if let Some(group) = Self::setgid_parent_group(&inp)? {
+            opts.group = group;
+            opts.mode |= MODE_SETGID;
+        }
 
         let dir = InodeDir::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
 
@@ -142,21 +166,21 @@ impl FsDir {
         Ok(inp)
     }
 
-    fn apply_setgid_directory_inheritance(inp: &InodePath, opts: &mut MkdirOpts) -> FsResult<()> {
+    fn setgid_parent_group(inp: &InodePath) -> FsResult<Option<String>> {
         if inp.existing_len() == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let parent_pos = inp.existing_len() as i32 - 1;
         let parent = match inp.get_inode(parent_pos) {
             Some(parent) => parent,
-            None => return Ok(()),
+            None => return Ok(None),
         };
         let acl = parent.as_ref().acl()?;
         if acl.mode & MODE_SETGID != 0 {
-            opts.group = acl.group.clone();
-            opts.mode |= MODE_SETGID;
+            Ok(Some(acl.group.clone()))
+        } else {
+            Ok(None)
         }
-        Ok(())
     }
 
     // Create all previous directories that may be missing on the path.
@@ -529,13 +553,22 @@ impl FsDir {
         Ok(())
     }
 
-    pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
+    pub fn create_file(
+        &mut self,
+        mut inp: InodePath,
+        mut opts: CreateFileOpts,
+    ) -> FsResult<InodePath> {
         if inp.get_last_inode().is_some() {
             return err_ext!(FsError::file_exists(inp.path()));
         }
 
         // Create a directory that does not exist.
         inp = self.create_parent_dir(inp, opts.dir_opts())?;
+
+        if let Some(group) = Self::setgid_parent_group(&inp)? {
+            opts.group = group;
+        }
+
         let name = inp.name().to_string();
 
         // Create an inode file node.
@@ -938,6 +971,66 @@ impl FsDir {
         Ok(block_ids)
     }
 
+    /// Invalidate UFS-backed files whose cache is no longer readable after a
+    /// worker's locations are removed. A single missing block makes the whole
+    /// cache copy unusable, even when other blocks or replicas still exist.
+    ///
+    /// The returned locations belong to the discarded cache copies and should
+    /// be scheduled for deletion from any surviving workers.
+    pub(crate) fn invalidate_lost_cache_files(
+        &mut self,
+        block_ids: &[i64],
+    ) -> FsResult<CacheInvalidationResult> {
+        let inode_ids: HashSet<_> = block_ids.iter().map(|id| InodeId::get_id(*id)).collect();
+        let mut result = CacheInvalidationResult::default();
+        let mut changed_inodes = Vec::new();
+
+        for inode_id in inode_ids {
+            let Some(mut inode) = self.store.get_inode(inode_id, None)? else {
+                continue;
+            };
+            let File(file) = &mut inode else {
+                continue;
+            };
+
+            // Cache-mode load jobs use the Delete TTL action. Files in fs-mode
+            // use Free instead and retain their normal replica-recovery path.
+            if !file.storage_policy.both_exists()
+                || file.storage_policy.ttl_action != TtlAction::Delete
+            {
+                continue;
+            }
+
+            // `get_locs` purposefully omits empty location lists, so inspect
+            // each file block directly to find cache blocks with no replicas.
+            let mut cache_unreadable = false;
+            for block in &file.blocks {
+                if self.store.get_block_locations(block.id)?.is_empty() {
+                    cache_unreadable = true;
+                    break;
+                }
+            }
+            if !cache_unreadable {
+                continue;
+            }
+
+            let locations = file.get_locs(&self.store)?;
+            result
+                .invalidated_block_ids
+                .extend(file.blocks.iter().map(|block| block.id));
+            if file.invalidate_cache() {
+                result.delete_result.blocks.extend(locations);
+                changed_inodes.push(inode);
+            }
+        }
+
+        let journal_inodes = changed_inodes.clone();
+        self.store.apply_cache_invalidations(changed_inodes)?;
+        self.journal_writer
+            .log_cache_invalidations(self, journal_inodes)?;
+        Ok(result)
+    }
+
     pub fn get_worker_block_ids(&self, worker_id: u32) -> FsResult<Vec<i64>> {
         Ok(self.store.store.get_block_ids(worker_id)?)
     }
@@ -1126,8 +1219,7 @@ impl FsDir {
                     // Hard links to regular files and symlinks are valid; directories are not.
                     if !matches!(
                         file.file_type,
-                        curvine_common::state::FileType::File
-                            | curvine_common::state::FileType::Link
+                        curvine_model::FileType::File | curvine_model::FileType::Link
                     ) {
                         return err_ext!(FsError::common("Cannot create link to non-regular file"));
                     }

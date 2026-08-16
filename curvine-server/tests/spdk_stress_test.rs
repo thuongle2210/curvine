@@ -1,19 +1,17 @@
 #![cfg(feature = "spdk")]
 
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
-    BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-};
-use curvine_common::state::{ExtendedBlock, FileType, StorageType};
-use curvine_common::utils::ProtoUtils;
+use curvine_config::ClusterConf;
+use curvine_core_error::CommonResult;
+use curvine_fs_api::RpcCode;
+use curvine_io::DataSlice::Buffer;
+use curvine_io::{NvmeTarget, SpdkConf};
+use curvine_model::ProtoUtils;
+use curvine_model::{ExtendedBlock, FileType, StorageType};
+use curvine_net::net::NetUtils;
+use curvine_proto::{BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse};
+use curvine_rpc::message::{Builder, RequestStatus};
+use curvine_runtime::common::Utils;
 use curvine_server::worker::Worker;
-use orpc::common::Utils;
-use orpc::io::net::NetUtils;
-use orpc::io::{NvmeTarget, SpdkConf};
-use orpc::message::{Builder, RequestStatus};
-use orpc::sys::DataSlice::Buffer;
-use orpc::CommonResult;
 use prost::bytes::BytesMut;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -94,6 +92,7 @@ fn write_block(
         client_name: "stress".into(),
         chunk_size,
         pipeline_stream: vec![],
+        component_info: None,
     };
 
     let client = conf.worker_sync_client()?;
@@ -139,6 +138,7 @@ fn write_block(
         client_name: "stress".into(),
         chunk_size,
         pipeline_stream: vec![],
+        component_info: None,
     };
 
     let msg = Builder::new()

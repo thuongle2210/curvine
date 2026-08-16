@@ -17,11 +17,11 @@ use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::{LibRaftMessage, NodeId, RaftCode, RaftGroup, RaftResult};
 use crate::utils::SerdeUtils;
-use orpc::client::{ClientConf, ClusterConnector, SyncClient};
-use orpc::io::net::{InetAddr, NodeAddr};
-use orpc::message::{Builder, Message, RefMessage};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::CommonResult;
+use curvine_core_error::CommonResult;
+use curvine_net::net::{InetAddr, NodeAddr};
+use curvine_rpc::client::{ClientConf, ClusterConnector, SyncClient};
+use curvine_rpc::message::{Builder, Message, RefMessage};
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, ConfChangeType};
 use std::sync::Arc;
@@ -76,9 +76,15 @@ impl RaftClient {
     }
 
     // Send application layer messages.
-    pub async fn send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
+    pub async fn send_propose_response(&self, data: Vec<u8>) -> RaftResult<ProposeResponse> {
         let req = ProposeRequest { data };
-        let _: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
+        let response: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
+        Ok(response)
+    }
+
+    // Send application layer messages.
+    pub async fn send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
+        self.send_propose_response(data).await?;
         Ok(())
     }
 

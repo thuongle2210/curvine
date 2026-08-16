@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use curvine_client::file::{FsClient, FsContext};
-use curvine_common::fs::CurvineURI;
-use curvine_common::state::MountOptions;
+use curvine_core_error::CommonResult;
+use curvine_fs_api::CurvineURI;
+use curvine_model::MountOptions;
+use curvine_runtime::common::Logger;
+use curvine_runtime::runtime::RpcRuntime;
 use curvine_server::common::ufs_manager::UfsManager;
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::Logger;
-use orpc::runtime::RpcRuntime;
-use orpc::CommonResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -83,28 +83,30 @@ fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
         }
 
         let configs = get_s3_test_config().await;
-        let mnt_opt = MountOptions::builder().set_properties(configs).build();
-        let mount_resp = client.mount(&s3_path, &s3_mnt_path, mnt_opt.clone()).await;
+        let s3_mnt_opt = MountOptions::builder().set_properties(configs).build();
+        let mount_resp = client
+            .mount(&s3_path, &s3_mnt_path, s3_mnt_opt.clone())
+            .await;
         info!("S3 MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success");
 
         let mount_resp = client
-            .mount(&s3_path7, &s3_mnt_path7, mnt_opt.clone())
+            .mount(&s3_path7, &s3_mnt_path7, s3_mnt_opt.clone())
             .await;
         info!("S3 MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success",);
 
         let configs = get_hdfs_test_config().await;
-        let mnt_opt = MountOptions::builder().set_properties(configs).build();
+        let hdfs_mnt_opt = MountOptions::builder().set_properties(configs).build();
         let mount_resp = client
-            .mount(&hdfs_path, &hdfs_mnt_path, mnt_opt.clone())
+            .mount(&hdfs_path, &hdfs_mnt_path, hdfs_mnt_opt.clone())
             .await;
         info!("Hdfs MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success");
 
         // forbidden mount to root
         let mount_resp = client
-            .mount(&hdfs_path2, &hdfs_mnt_path2, mnt_opt.clone())
+            .mount(&hdfs_path2, &hdfs_mnt_path2, hdfs_mnt_opt.clone())
             .await;
         info!("Hdfs MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "mount should failed");
@@ -134,36 +136,38 @@ fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
         info!("target_path: {:?}", target_path);
 
         // monut s3 again
-        let mount_resp = client.mount(&s3_path, &s3_mnt_path, mnt_opt.clone()).await;
-        info!("MountResp: {:?}", mount_resp);
-        assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
-
         let mount_resp = client
-            .mount(&s3_path2, &s3_mnt_path2, mnt_opt.clone())
+            .mount(&s3_path, &s3_mnt_path, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
         let mount_resp = client
-            .mount(&s3_path3, &s3_mnt_path3, mnt_opt.clone())
+            .mount(&s3_path2, &s3_mnt_path2, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
         let mount_resp = client
-            .mount(&s3_path4, &s3_mnt_path4, mnt_opt.clone())
+            .mount(&s3_path3, &s3_mnt_path3, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
         let mount_resp = client
-            .mount(&s3_path5, &s3_mnt_path5, mnt_opt.clone())
+            .mount(&s3_path4, &s3_mnt_path4, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
         let mount_resp = client
-            .mount(&s3_path6, &s3_mnt_path6, mnt_opt.clone())
+            .mount(&s3_path5, &s3_mnt_path5, s3_mnt_opt.clone())
+            .await;
+        info!("MountResp: {:?}", mount_resp);
+        assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
+
+        let mount_resp = client
+            .mount(&s3_path6, &s3_mnt_path6, s3_mnt_opt.clone())
             .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "{}", "mount should success");

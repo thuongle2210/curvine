@@ -18,10 +18,9 @@ use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
-use curvine_common::fs::{StateReader, StateWriter};
-use curvine_common::state::{FileAllocOpts, FileStatus, LockFlags};
-use orpc::err_box;
-use orpc::sys::RawPtr;
+use curvine_core_error::err_box;
+use curvine_fs_api::{StateReader, StateWriter};
+use curvine_model::{FileAllocOpts, FileStatus, LockFlags};
 use std::sync::Arc;
 
 pub enum FileHandle {
@@ -34,7 +33,7 @@ impl FileHandle {
     pub fn new_backend(
         ino: u64,
         fh: u64,
-        reader: Option<RawPtr<FuseReader>>,
+        reader: Option<Arc<FuseReader>>,
         writer: Option<Arc<FuseWriter>>,
         status: FileStatus,
     ) -> Self {
@@ -119,12 +118,11 @@ impl FileHandle {
         }
     }
 
-    pub async fn resize(&self, opts: FileAllocOpts) -> FuseResult<()> {
+    pub async fn resize(&self, opts: FileAllocOpts) -> FuseResult<FileStatus> {
         match self {
             FileHandle::Backend(h) => {
                 if let Some(writer) = &h.writer {
-                    writer.resize(opts).await?;
-                    Ok(())
+                    Ok(writer.resize(opts).await?)
                 } else {
                     err_fuse!(libc::EACCES)
                 }

@@ -16,6 +16,7 @@ use crate::proto::*;
 use crate::state::*;
 use crate::worker_info::TransferWorkerCapabilities;
 use curvine_core_error::{try_err, CommonResult};
+use curvine_sys::version::ComponentVersion;
 use prost::bytes::BytesMut;
 use prost::Message;
 use std::fmt::Debug;
@@ -303,8 +304,8 @@ impl ProtoUtils {
         }
     }
 
-    pub fn master_info_to_pb(src: MasterInfo) -> GetMasterInfoResponse {
-        let mut pb = GetMasterInfoResponse {
+    pub fn filesystem_info_to_pb(src: FilesystemInfo) -> GetFilesystemInfoResponse {
+        let mut pb = GetFilesystemInfoResponse {
             active_master: src.active_master,
             journal_nodes: src.journal_nodes,
             inode_dir_num: src.inode_dir_num,
@@ -355,6 +356,7 @@ impl ProtoUtils {
             transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
             software_version: Some(src.software_version),
             startup_time_ms: Some(src.startup_time_ms),
+            component_info: src.component_info,
             storage_map: Default::default(),
         };
 
@@ -366,8 +368,8 @@ impl ProtoUtils {
         pb
     }
 
-    pub fn master_info_from_pb(src: GetMasterInfoResponse) -> MasterInfo {
-        MasterInfo {
+    pub fn filesystem_info_from_pb(src: GetFilesystemInfoResponse) -> FilesystemInfo {
+        FilesystemInfo {
             active_master: src.active_master,
             journal_nodes: src.journal_nodes,
             inode_dir_num: src.inode_dir_num,
@@ -383,6 +385,55 @@ impl ProtoUtils {
             decommission_workers: Self::worker_info_from_pb(src.decommission_workers),
             lost_workers: Self::worker_info_from_pb(src.lost_workers),
         }
+    }
+
+    /// Convert a structured component version into its wire representation for
+    /// handshake metadata (component_info / compatibility payloads).
+    pub fn component_version_to_pb(src: &ComponentVersion) -> ComponentInfoProto {
+        ComponentInfoProto {
+            component: Some(src.component.clone()),
+            release_version: Some(src.release_version.clone()),
+            git_commit: Some(src.git_commit.clone()),
+            git_tag: Some(src.git_tag.clone()),
+            git_branch: Some(src.git_branch.clone()),
+            protocol_version: Some(src.protocol_version),
+            min_protocol_version: Some(src.min_protocol_version),
+            capabilities: src.capabilities.clone(),
+        }
+    }
+
+    /// Build the default compatibility contract a master advertises during the
+    /// GetFilesystemInfo handshake: the master's own version plus a lenient
+    /// diagnose policy. Legacy peers without the field keep working untouched.
+    pub fn default_master_compatibility_to_pb(
+        src: &ComponentVersion,
+    ) -> ServerCompatibilityInfoProto {
+        ServerCompatibilityInfoProto {
+            server: Self::component_version_to_pb(src),
+            compatibility_mode: CompatibilityModeProto::Diagnose as i32,
+            ..Default::default()
+        }
+    }
+
+    /// Build the compatibility contract a server advertises from its own
+    /// version and the configured compatibility policy. The advertised mode,
+    /// minimum bounds and blocked versions mirror the policy so peers learn
+    /// what the server accepts; the protocol version range stays a product
+    /// contract carried by the server's own version.
+    pub fn compatibility_to_pb(
+        src: &ComponentVersion,
+        policy: &crate::CompatibilityPolicy,
+    ) -> ServerCompatibilityInfoProto {
+        let mut pb = Self::default_master_compatibility_to_pb(src);
+        pb.compatibility_mode = policy.mode.to_proto() as i32;
+        pb.min_worker_version = policy.min_worker_version.as_ref().map(|v| v.to_string());
+        pb.min_client_version = policy.min_client_version.as_ref().map(|v| v.to_string());
+        pb.blocked_versions = policy
+            .blocked_versions
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        pb
     }
 
     pub fn worker_info_from_pb(workers: Vec<WorkerInfoProto>) -> Vec<WorkerInfo> {
@@ -406,6 +457,7 @@ impl ProtoUtils {
                 },
                 software_version: info.software_version.unwrap_or_default(),
                 startup_time_ms: info.startup_time_ms.unwrap_or_default(),
+                component_info: info.component_info,
                 ..Default::default()
             };
             for (k, v) in info.storage_map {
@@ -590,6 +642,7 @@ impl ProtoUtils {
             provider: info.provider.map(|v| v.into()),
             auto_cache: Some(info.auto_cache),
             access_mode: Some(info.access_mode.into()),
+            write_cache: Some(info.write_cache),
         }
     }
 
@@ -609,6 +662,7 @@ impl ProtoUtils {
             provider: info.provider.map(|x| x.into()),
             auto_cache: info.auto_cache.unwrap_or(true),
             access_mode: info.access_mode.map(AccessMode::from).unwrap_or_default(),
+            write_cache: info.write_cache.unwrap_or(false),
         }
     }
 
@@ -627,6 +681,7 @@ impl ProtoUtils {
             provider: opts.provider.map(|v| v.into()),
             auto_cache: opts.auto_cache,
             access_mode: opts.access_mode.map(|v| v.into()),
+            write_cache: opts.write_cache,
         }
     }
 
@@ -645,6 +700,7 @@ impl ProtoUtils {
             provider: opts.provider.map(Provider::from),
             auto_cache: opts.auto_cache,
             access_mode: opts.access_mode.map(AccessMode::from),
+            write_cache: opts.write_cache,
         }
     }
 
@@ -750,12 +806,22 @@ impl ProtoUtils {
             bytes: res.bytes,
         }
     }
+
+    pub fn delete_res_from_pb(res: FreeResultProto) -> DeleteResult {
+        Self::free_res_from_pb(res).into()
+    }
+
+    pub fn delete_res_to_pb(res: DeleteResult) -> FreeResultProto {
+        Self::free_res_to_pb(res.into())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::proto::CompatibilityModeProto;
     use crate::state::{AccessMode, FileStatus, MountInfo, MountOptions, INTERNAL_CTIME_XATTR};
     use crate::utils::ProtoUtils;
+    use curvine_sys::version::ComponentVersion;
     use std::collections::HashMap;
 
     #[test]
@@ -766,6 +832,7 @@ mod tests {
             mount_id: 7,
             auto_cache: false,
             access_mode: AccessMode::ReadWrite,
+            write_cache: true,
             ..Default::default()
         };
 
@@ -774,6 +841,7 @@ mod tests {
 
         assert!(!round_trip.auto_cache);
         assert_eq!(round_trip.access_mode, AccessMode::ReadWrite);
+        assert!(round_trip.write_cache);
     }
 
     #[test]
@@ -781,6 +849,7 @@ mod tests {
         let opts = MountOptions::builder()
             .auto_cache(false)
             .access_mode(AccessMode::ReadWrite)
+            .write_cache(true)
             .build();
 
         let pb = ProtoUtils::mount_options_to_pb(opts);
@@ -788,6 +857,7 @@ mod tests {
 
         assert_eq!(round_trip.auto_cache, Some(false));
         assert_eq!(round_trip.access_mode, Some(AccessMode::ReadWrite));
+        assert_eq!(round_trip.write_cache, Some(true));
     }
 
     #[test]
@@ -823,5 +893,62 @@ mod tests {
         let round_trip = ProtoUtils::file_status_from_pb(pb);
         assert_eq!(round_trip.ctime(), 1_000);
         assert!(!round_trip.x_attr.contains_key(INTERNAL_CTIME_XATTR));
+    }
+
+    #[test]
+    fn component_version_to_pb_maps_all_fields() {
+        let version = ComponentVersion {
+            component: "master".to_string(),
+            release_version: "0.4.0-alpha".to_string(),
+            git_commit: "359fce7d982a15f09c3b4e0b2e62fee4229609dd".to_string(),
+            git_tag: "v0.4.0-alpha".to_string(),
+            git_branch: "main".to_string(),
+            protocol_version: 1,
+            min_protocol_version: 1,
+            capabilities: vec!["transfer".to_string(), "batch-write".to_string()],
+        };
+
+        let pb = ProtoUtils::component_version_to_pb(&version);
+
+        assert_eq!(pb.component.as_deref(), Some("master"));
+        assert_eq!(pb.release_version.as_deref(), Some("0.4.0-alpha"));
+        assert_eq!(
+            pb.git_commit.as_deref(),
+            Some("359fce7d982a15f09c3b4e0b2e62fee4229609dd")
+        );
+        assert_eq!(pb.git_tag.as_deref(), Some("v0.4.0-alpha"));
+        assert_eq!(pb.git_branch.as_deref(), Some("main"));
+        assert_eq!(pb.protocol_version, Some(1));
+        assert_eq!(pb.min_protocol_version, Some(1));
+        assert_eq!(
+            pb.capabilities,
+            vec!["transfer".to_string(), "batch-write".to_string()]
+        );
+    }
+
+    #[test]
+    fn default_master_compatibility_embeds_server_and_is_diagnose() {
+        let version = ComponentVersion {
+            component: "master".to_string(),
+            release_version: "0.4.0-alpha".to_string(),
+            git_commit: "abc".to_string(),
+            git_tag: String::new(),
+            git_branch: "main".to_string(),
+            protocol_version: 1,
+            min_protocol_version: 1,
+            capabilities: vec![],
+        };
+
+        let pb = ProtoUtils::default_master_compatibility_to_pb(&version);
+
+        assert_eq!(pb.server.component.as_deref(), Some("master"));
+        assert_eq!(pb.server.release_version.as_deref(), Some("0.4.0-alpha"));
+        assert_eq!(
+            pb.compatibility_mode,
+            CompatibilityModeProto::Diagnose as i32
+        );
+        assert!(pb.min_worker_version.is_none());
+        assert!(pb.min_client_version.is_none());
+        assert!(pb.blocked_versions.is_empty());
     }
 }

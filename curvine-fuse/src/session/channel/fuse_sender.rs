@@ -17,15 +17,17 @@ use crate::fuse_metrics::{
     mono_now, ActiveGuard, FuseMetrics, FuseReqStatus, WriteOutcome, NOTIFY_SUCCESS,
     NOTIFY_WRITE_FAILED,
 };
+use crate::session::channel::{new_splice_pipe, SplicePipeSetupError};
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
+use curvine_core_error::{err_box, try_option_ref};
+use curvine_io::IOResult;
 use curvine_metrics::Gauge;
+use curvine_runtime::runtime::Runtime;
+use curvine_runtime::sync::channel::AsyncReceiver;
+use curvine_sys as sys;
+use curvine_sys::pipe::{AsyncFd, Pipe2};
 use log::{info, warn};
-use orpc::io::IOResult;
-use orpc::runtime::Runtime;
-use orpc::sync::channel::AsyncReceiver;
-use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
-use orpc::{err_box, sys, try_option_ref};
 use std::sync::Arc;
 
 /// Small responses use writev; splice only pays off for larger payloads.
@@ -46,7 +48,7 @@ pub struct FuseSender<T> {
 
 impl<T: FileSystem> FuseSender<T> {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub(super) fn new(
         fs: Arc<T>,
         rt: Arc<Runtime>,
         kernel_fd: Arc<AsyncFd>,
@@ -57,9 +59,9 @@ impl<T: FileSystem> FuseSender<T> {
         mnt: &str,
         idx: usize,
         metrics_enabled: bool,
-    ) -> IOResult<Self> {
+    ) -> Result<Self, SplicePipeSetupError> {
         let pipe2 = if enable_splice {
-            Some(Pipe2::new(PipeFd::new(buf_size, false, false)?)?)
+            Some(new_splice_pipe(buf_size)?)
         } else {
             None
         };

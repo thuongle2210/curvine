@@ -14,7 +14,7 @@
 
 #![allow(clippy::should_implement_trait)]
 
-use curvine_config::{ClientConf, ClusterConf};
+use curvine_config::{ClientConf, ClusterConf, TransferConf};
 use curvine_core_error::{err_box, try_err};
 use curvine_error::FsResult;
 use curvine_net::net::InetAddr;
@@ -116,6 +116,30 @@ pub struct FilesystemConf {
     pub large_file_size: String,
     pub max_read_parallel: i64,
     pub sequential_read_threshold: u64,
+
+    /// Client-side Transfer routing only. Service-side store and scheduler settings remain
+    /// owned by the Transfer process configuration.
+    pub transfer: TransferClientConf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransferClientConf {
+    pub enabled: bool,
+    pub endpoints: Vec<String>,
+    pub client_pending_queue_size: usize,
+    pub client_submit_concurrency: usize,
+}
+
+impl Default for TransferClientConf {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoints: vec![],
+            client_pending_queue_size: TransferConf::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
+            client_submit_concurrency: TransferConf::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
+        }
+    }
 }
 
 impl FilesystemConf {
@@ -272,9 +296,87 @@ impl FilesystemConf {
         let mut cluster = ClusterConf {
             client,
             log,
+            transfer: TransferConf {
+                enabled: self.transfer.enabled,
+                endpoints: self.transfer.endpoints,
+                client_pending_queue_size: self.transfer.client_pending_queue_size,
+                client_submit_concurrency: self.transfer.client_submit_concurrency,
+                ..Default::default()
+            },
             ..Default::default()
         };
         cluster.client.init()?;
+        cluster.transfer.init()?;
         Ok(cluster)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FilesystemConf, TransferClientConf};
+
+    #[test]
+    fn keeps_transfer_routing_in_cluster_conf() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.transfer = TransferClientConf {
+            enabled: true,
+            endpoints: vec!["transfer-0:9010".to_string(), "transfer-1:9010".to_string()],
+            client_pending_queue_size: 2048,
+            client_submit_concurrency: 128,
+        };
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert!(cluster.transfer.enabled);
+        assert_eq!(
+            cluster.transfer.endpoints,
+            vec!["transfer-0:9010", "transfer-1:9010"]
+        );
+        assert_eq!(cluster.transfer.client_pending_queue_size(), 2048);
+        assert_eq!(cluster.transfer.client_submit_concurrency(), 128);
+    }
+
+    #[test]
+    fn parses_transfer_routing_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                client_hostname = "java-client"
+                io_threads = 16
+                worker_threads = 16
+                replicas = 1
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                write_chunk_num = 8
+                read_chunk_size = "128KB"
+                read_chunk_num = 8
+                read_parallel = 1
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+
+                [transfer]
+                enabled = true
+                endpoints = ["transfer-0:9010", "transfer-1:9010"]
+                client_pending_queue_size = 4096
+                client_submit_concurrency = 256
+            "#,
+        )
+        .unwrap();
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert!(cluster.transfer.enabled);
+        assert_eq!(
+            cluster.transfer.endpoints,
+            vec!["transfer-0:9010", "transfer-1:9010"]
+        );
+        assert_eq!(cluster.transfer.client_pending_queue_size(), 4096);
+        assert_eq!(cluster.transfer.client_submit_concurrency(), 256);
     }
 }

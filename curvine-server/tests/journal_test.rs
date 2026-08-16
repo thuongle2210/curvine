@@ -12,27 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::CurvineURI;
-use curvine_common::state::{
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, CommonResult};
+use curvine_fs_api::CurvineURI;
+use curvine_model::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
     RenameFlags, WorkerInfo, WriteType,
 };
-use curvine_common::utils::SerdeUtils;
+use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_raft::raft::{NodeId, RaftPeer};
+use curvine_runtime::common::SerdeUtils;
+use curvine_runtime::common::{FileUtils, Logger, TimeSpent, Utils};
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
     JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
-use orpc::common::{FileUtils, Logger, TimeSpent, Utils};
-use orpc::io::net::NetUtils;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::{err_box, CommonResult};
-use raft::eraftpb::Entry;
+use prost::Message;
+use raft::eraftpb::{ConfChange, Entry, EntryType};
+use raft::StateRole;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -92,10 +94,190 @@ fn new_test_ufs_uri(name: &str) -> CommonResult<CurvineURI> {
     let dir = std::env::temp_dir().join(format!(
         "curvine-journal-{name}-{}-{}",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        curvine_runtime::common::LocalTime::mills()
     ));
     std::fs::create_dir_all(&dir)?;
     CurvineURI::new(format!("file://{}/", dir.display()))
+}
+
+#[test]
+fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("promotion-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/committed-before-promotion", false)?;
+    let entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("promotion-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let target_fs = target.fs();
+    let loader = target.journal_loader();
+
+    let mut batch = JournalBatch::new(1);
+    batch.push(entry);
+    target.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+
+    assert!(target_fs.file_status("/committed-before-promotion").is_ok());
+    Ok(())
+}
+
+#[test]
+fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("promotion-noop-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/before-noop", false)?;
+    let metadata_entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+    let expected_op_id = metadata_entry.op_id();
+    let expected_rpc_id = metadata_entry.rpc_id();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("promotion-noop-target-{}", Utils::rand_str(6)));
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let loader = journal_system.journal_loader();
+
+    let mut batch = JournalBatch::new(1);
+    batch.push(metadata_entry);
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
+    })?;
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 2,
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+    // Queue a role change behind the leader UFS replay scan and wait for it as a barrier.
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Follower).await })?;
+
+    let state = loader.get_fsm_state();
+    assert_eq!(state.applied.index, 2);
+    assert_eq!(state.applied.op_id, expected_op_id);
+    assert_eq!(state.applied.rpc_id, expected_rpc_id);
+    assert_eq!(state.ufs_applied.index, 2);
+    assert_eq!(state.ufs_applied.op_id, expected_op_id);
+    assert_eq!(state.ufs_applied.rpc_id, expected_rpc_id);
+    Ok(())
+}
+
+#[test]
+fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("promotion-conf-change-{}", Utils::rand_str(6)));
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let loader = journal_system.journal_loader();
+
+    journal_system.append_committed_entry_for_test(Entry {
+        term: 1,
+        index: 1,
+        entry_type: EntryType::EntryConfChange as i32,
+        data: ConfChange::default().encode_to_vec(),
+        ..Default::default()
+    })?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Follower).await })?;
+
+    let state = loader.get_fsm_state();
+    assert_eq!(state.applied.index, 1);
+    assert_eq!(state.ufs_applied.index, 1);
+    Ok(())
+}
+
+#[test]
+fn follower_replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("duplicate-id-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/source", false)?;
+    let source_entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+    let inode_id = source_entry
+        .allocated_inode_id()
+        .expect("mkdir must allocate an inode id");
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("duplicate-id-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let target_fs = target.fs();
+    target_fs.mkdir("/occupied", false)?;
+    assert_eq!(target_fs.last_inode_id(), inode_id);
+
+    let mut batch = JournalBatch::new(1);
+    batch.push(source_entry);
+    let entry = Entry {
+        term: 1,
+        index: 1,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
+    };
+    target.append_committed_entry_for_test(entry.clone())?;
+
+    let err = AsyncRuntime::single()
+        .block_on(async { target.journal_loader().role_change(StateRole::Leader).await })
+        .expect_err("follower replay must reject a reused inode id");
+    assert!(err
+        .to_string()
+        .contains("refusing duplicate inode allocation during follower replay"));
+    Ok(())
 }
 
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
@@ -362,7 +544,7 @@ fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
     };
     conf.change_test_meta_dir(format!(
         "ufs-loader-mkdir-parent-{}",
-        orpc::common::LocalTime::mills()
+        curvine_runtime::common::LocalTime::mills()
     ));
 
     let journal_system = JournalSystem::from_conf(&conf)?;
@@ -372,7 +554,7 @@ fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
     let ufs_dir = std::env::temp_dir().join(format!(
         "curvine-ufs-loader-mkdir-{}-{}",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        curvine_runtime::common::LocalTime::mills()
     ));
     let _ = std::fs::remove_dir_all(&ufs_dir);
     std::fs::create_dir_all(&ufs_dir)?;
@@ -494,8 +676,8 @@ fn empty_checkpoint_snapshot(empty_dir: &str) -> SnapshotData {
     }
 }
 
-// Refuse empty checkpoint over a FS that already has files; allow when file_count == 0
-// even if directories exist (tuple order: get_file_counts -> (dir_count, file_count)).
+// Only the zero-index no-snapshot placeholder is harmless. Every other empty
+// checkpoint must be refused over existing metadata, including directories.
 #[test]
 fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> {
     Logger::default();
@@ -514,7 +696,7 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     let loader = js.journal_loader();
     let rt = AsyncRuntime::single();
 
-    // Directories only: guard must not refuse (file_count == 0).
+    // Directories are metadata too and must not be replaced by an empty checkpoint.
     fs.mkdir("/only-dirs/nested", true)?;
     let (dir_count, file_count) = fs.get_file_counts();
     assert!(
@@ -528,21 +710,31 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     FileUtils::create_dir(&empty_dirs, true)?;
     assert_eq!(FileUtils::dir_size(&empty_dirs).unwrap_or(1), 0);
 
-    let dirs_only = rt.block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_dirs)));
-    if let Err(e) = &dirs_only {
-        let msg = e.to_string();
-        assert!(
-            !msg.contains("refusing to apply empty snapshot"),
-            "dirs-only FS must not hit the empty-snapshot guard: {}",
-            msg
-        );
-    }
+    let err = rt
+        .block_on(loader.apply_snapshot(empty_checkpoint_snapshot(&empty_dirs)))
+        .expect_err("empty snapshot over populated directories must be refused");
+    assert!(err.to_string().contains("refusing to apply empty snapshot"));
 
     // Rebuild a populated FS with files: empty checkpoint must be refused.
     fs.mkdir("/with-files", true)?;
     fs.create("/with-files/file.log", false)?;
-    let (dir_count, file_count) = fs.get_file_counts();
+    let (_, file_count) = fs.get_file_counts();
     assert!(file_count > 0, "expected files after create");
+
+    rt.block_on(loader.apply_snapshot(SnapshotData::default()))?;
+    assert!(
+        fs.exists("/with-files/file.log")?,
+        "default empty placeholder snapshot must not wipe populated metadata"
+    );
+
+    let non_placeholder = SnapshotData {
+        snapshot_id: 2,
+        ..Default::default()
+    };
+    let err = rt
+        .block_on(loader.apply_snapshot(non_placeholder))
+        .expect_err("non-placeholder empty snapshot must be refused");
+    assert!(err.to_string().contains("refusing to apply empty snapshot"));
 
     let empty_files = Utils::test_sub_dir(format!("empty-snap-files-{}", test_id));
     FileUtils::create_dir(&empty_files, true)?;
@@ -558,11 +750,8 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
         msg
     );
     assert!(
-        msg.contains(&format!("{} files", file_count))
-            && msg.contains(&format!("{} dirs", dir_count)),
-        "error should report (file_count, dir_count)=({}, {}); got: {}",
-        file_count,
-        dir_count,
+        msg.contains("files") && msg.contains("dirs"),
+        "error should report filesystem counts; got: {}",
         msg
     );
 

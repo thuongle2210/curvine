@@ -17,16 +17,16 @@ use std::time::Duration;
 
 use crate::common::UfsFactory;
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_common::conf::{ClusterConf, TransferStoreType};
-use curvine_common::error::FsError;
+use curvine_config::{ClusterConf, TransferStoreType};
+use curvine_core_error::CommonResult;
+use curvine_error::FsError;
+use curvine_net::net::ConnState;
+use curvine_rpc::handler::HandlerService;
+use curvine_rpc::server::{RpcServer, ServerStateListener};
+use curvine_runtime::common::Logger;
+use curvine_runtime::runtime::RpcRuntime;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
-use orpc::common::Logger;
-use orpc::handler::HandlerService;
-use orpc::io::net::ConnState;
-use orpc::runtime::RpcRuntime;
-use orpc::server::{RpcServer, ServerStateListener};
-use orpc::CommonResult;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::transfer::{
@@ -94,9 +94,10 @@ impl TransferServer {
         if !conf.transfer.enabled {
             return Err(FsError::common("curvine-transfer requires transfer.enabled=true").into());
         }
-        Logger::init(conf.master.log.clone());
+        Logger::init(conf.transfer.log.clone());
         let _ = TransferMetrics::get()?;
-        conf.print();
+        info!("allocator: {}", curvine_alloc::allocator_type_name());
+        info!("git version: {}", curvine_sys::version::GIT_VERSION);
 
         let rt = Arc::new(conf.transfer_server_conf().create_runtime());
         let stop = Arc::new(AtomicBool::new(false));
@@ -111,6 +112,26 @@ impl TransferServer {
             )?),
         });
         let store_backend = store.backend_label();
+        let report_endpoints = if conf.transfer.endpoints.is_empty() {
+            vec![format!(
+                "{}:{}",
+                conf.transfer.hostname, conf.transfer.rpc_port
+            )]
+        } else {
+            conf.transfer.endpoints.clone()
+        };
+        info!(
+            "configured curvine-transfer store_backend={} rpc_addr={}:{} web_addr={}:{} report_endpoints={:?} max_running={} max_tasks={} task_stale_timeout_ms={}",
+            store_backend,
+            conf.transfer.hostname,
+            conf.transfer.rpc_port,
+            conf.transfer.hostname,
+            conf.transfer.web_port,
+            report_endpoints,
+            conf.transfer.max_running_transfers,
+            conf.transfer.max_tasks_per_transfer,
+            conf.transfer.task_stale_timeout.as_millis(),
+        );
         let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone())?;
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let cache = ClusterMetadataCache::with_snapshot_policy(
@@ -134,26 +155,6 @@ impl TransferServer {
             conf.client.clone(),
             conf.transfer.max_tasks_per_transfer,
             conf.transfer.ufs_max_concurrency_per_endpoint,
-        );
-        let report_endpoints = if conf.transfer.endpoints.is_empty() {
-            vec![format!(
-                "{}:{}",
-                conf.transfer.hostname, conf.transfer.rpc_port
-            )]
-        } else {
-            conf.transfer.endpoints.clone()
-        };
-        info!(
-            "configured curvine-transfer store_backend={} rpc_addr={}:{} web_addr={}:{} report_endpoints={:?} max_running={} max_tasks={} task_stale_timeout_ms={}",
-            store_backend,
-            conf.transfer.hostname,
-            conf.transfer.rpc_port,
-            conf.transfer.hostname,
-            conf.transfer.web_port,
-            report_endpoints,
-            conf.transfer.max_running_transfers,
-            conf.transfer.max_tasks_per_transfer,
-            conf.transfer.task_stale_timeout.as_millis(),
         );
         let scheduler = TransferScheduler::new(
             store.clone(),

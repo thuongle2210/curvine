@@ -14,16 +14,16 @@
 
 use crate::worker::block::{BlockStore, HeartbeatTask, MasterClient};
 use curvine_client_core::file::FsContext;
-use curvine_common::conf::ClusterConf;
-use curvine_common::executor::ScheduledExecutor;
-use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
-use curvine_common::utils::ProtoUtils;
-use dashmap::DashMap;
+use curvine_config::ClusterConf;
+use curvine_core_error::CommonResult;
+use curvine_model::ProtoUtils;
+use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
+use curvine_runtime::common::TimeSpent;
+use curvine_runtime::runtime::ScheduledExecutor;
+use curvine_runtime::runtime::{GroupExecutor, Runtime};
+use curvine_runtime::sync::StateCtl;
+use dashmap::{DashMap, DashSet};
 use log::info;
-use orpc::common::TimeSpent;
-use orpc::runtime::{GroupExecutor, Runtime};
-use orpc::sync::StateCtl;
-use orpc::CommonResult;
 use std::sync::Arc;
 
 /// Worker block management role.
@@ -44,6 +44,7 @@ pub struct BlockActor {
     // 1. Block file deletion report.
     // 2. Add a new block.
     report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+    pending_deletes: Arc<DashSet<i64>>,
 }
 
 impl BlockActor {
@@ -82,6 +83,7 @@ impl BlockActor {
             worker_ctl,
             block_report_limit,
             report_blocks: Arc::new(DashMap::new()),
+            pending_deletes: Arc::new(DashSet::new()),
         })
     }
 
@@ -105,6 +107,7 @@ impl BlockActor {
             self.client.clone(),
             self.store.clone(),
             self.report_blocks.clone(),
+            self.pending_deletes.clone(),
             self.heartbeat_interval_ms,
         )?;
         Ok(())
@@ -128,6 +131,7 @@ impl BlockActor {
                 self.store.clone(),
                 cmds,
                 self.report_blocks.clone(),
+                self.pending_deletes.clone(),
             );
             return Ok(0);
         }
@@ -144,6 +148,7 @@ impl BlockActor {
                 self.store.clone(),
                 cmds,
                 self.report_blocks.clone(),
+                self.pending_deletes.clone(),
             );
             off = end;
         }
@@ -157,6 +162,7 @@ impl BlockActor {
         client: MasterClient,
         store: BlockStore,
         report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+        pending_deletes: Arc<DashSet<i64>>,
         heartbeat_interval_ms: u64,
     ) -> CommonResult<()> {
         let scheduler = ScheduledExecutor::new("worker-heartbeat", heartbeat_interval_ms);
@@ -167,6 +173,7 @@ impl BlockActor {
             client,
             store,
             report_blocks,
+            pending_deletes,
         };
 
         scheduler.start(task)?;

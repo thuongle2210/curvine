@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::conf::ClusterConf;
-use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
+use curvine_config::ClusterConf;
+use curvine_core_error::CommonResult;
+use curvine_fs_api::RpcCode;
+use curvine_io::DataSlice::Buffer;
+use curvine_model::ProtoUtils;
+use curvine_model::{ExtendedBlock, FileAllocOpts, FileType, StorageType};
+use curvine_net::net::NetUtils;
+use curvine_proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
     BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
     FileWriteData, FilesBatchWriteRequest,
 };
-use curvine_common::state::{ExtendedBlock, FileAllocOpts, FileType, StorageType};
-use curvine_common::utils::ProtoUtils;
+use curvine_rpc::message::{Builder, Message, RequestStatus};
+use curvine_runtime::common::Utils;
 use curvine_server::worker::Worker;
-use orpc::common::Utils;
-use orpc::io::net::NetUtils;
-use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::DataSlice::Buffer;
-use orpc::CommonResult;
 use prost::bytes::BytesMut;
 use std::thread;
 
@@ -131,6 +131,7 @@ fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<(
         client_name: "test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
     let req_id = Utils::req_id();
 
@@ -204,6 +205,7 @@ fn test_worker_batch_short_circuit_complete_uses_open_context_without_server_fil
         chunk_size: CHUNK_SIZE,
         short_circuit: true,
         client_name: "test".to_string(),
+        component_info: None,
     };
     let open_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -230,6 +232,7 @@ fn test_worker_batch_short_circuit_complete_uses_open_context_without_server_fil
         req_id: open_req_id,
         seq_id: 1,
         cancel: false,
+        component_info: None,
     };
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -268,6 +271,7 @@ fn test_worker_batch_short_circuit_complete_requires_open_connection() -> Common
         chunk_size: CHUNK_SIZE,
         short_circuit: true,
         client_name: "test".to_string(),
+        component_info: None,
     };
     let open_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -289,6 +293,7 @@ fn test_worker_batch_short_circuit_complete_requires_open_connection() -> Common
         req_id,
         seq_id: 1,
         cancel: false,
+        component_info: None,
     };
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -326,6 +331,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         chunk_size: CHUNK_SIZE,
         short_circuit: false,
         client_name: "test".to_string(),
+        component_info: None,
     };
     let open_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -347,6 +353,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
             .collect(),
         req_id,
         seq_id: 1,
+        component_info: None,
     };
     let write_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -400,6 +407,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         req_id,
         seq_id: 4,
         cancel: false,
+        component_info: None,
     };
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlocksBatch)
@@ -437,7 +445,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
     let session = rt.block_on(async {
         let controller = Arc::new(
             FaultHttpController::new(&base, &token)
-                .map_err(|e| orpc::CommonError::from(e.to_string()))?,
+                .map_err(|e| curvine_core_error::CommonError::from(e.to_string()))?,
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -455,7 +463,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
                     let _ = error;
                 }
                 Err(error) => {
-                    return Err(orpc::CommonError::from(format!(
+                    return Err(curvine_core_error::CommonError::from(format!(
                         "worker fault HTTP never became ready at {base}: {error}"
                     )));
                 }
@@ -467,20 +475,20 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
         session
             .preflight()
             .await
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+            .map_err(|e| curvine_core_error::CommonError::from(e.to_string()))?;
         let rule = FaultRuleBuilder::named("worker.rpc.before_dispatch")
             .matches("req_id", open_req_id)
             .and_then(|builder| builder.matches("rpc_code", RpcCode::WriteBlock as i32))
             .and_then(|builder| builder.matches("request_status", i8::from(RequestStatus::Open)))
             .and_then(|builder| builder.times(1))
             .and_then(|builder| builder.return_error("worker HTTP control-plane failure"))
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+            .map_err(|e| curvine_core_error::CommonError::from(e.to_string()))?;
         session
             .configure("worker", "http-fail-write-open", rule)
             .await
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+            .map_err(|e| curvine_core_error::CommonError::from(e.to_string()))?;
 
-        Ok::<FaultTestSession, orpc::CommonError>(session)
+        Ok::<FaultTestSession, curvine_core_error::CommonError>(session)
     })?;
 
     let block_size = (CHUNK_SIZE * LOOP_NUM) as i64;
@@ -497,6 +505,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
         client_name: "fault-http-test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
     let open = Builder::new()
         .code(RpcCode::WriteBlock)
@@ -511,7 +520,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
         let rule = session
             .wait_for_executions("worker", "http-fail-write-open", 1, Duration::from_secs(5))
             .await
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
+            .map_err(|e| curvine_core_error::CommonError::from(e.to_string()))?;
         assert_eq!(rule.executions, 1);
         assert_eq!(
             rule.last_context.as_ref().unwrap().get("rpc_code"),
@@ -524,8 +533,8 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
         session
             .cleanup()
             .await
-            .map_err(|e| orpc::CommonError::from(e.to_string()))?;
-        Ok::<(), orpc::CommonError>(())
+            .map_err(|e| curvine_core_error::CommonError::from(e.to_string()))?;
+        Ok::<(), curvine_core_error::CommonError>(())
     })?;
 
     let healthy_block = Utils::req_id().abs();
@@ -546,6 +555,7 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         client_name: "test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
 
     let req_id = Utils::req_id();
@@ -612,6 +622,7 @@ fn test_worker_short_circuit_open_resizes_block_file() -> CommonResult<()> {
         client_name: "test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
 
     let req_id = Utils::req_id();
@@ -645,6 +656,7 @@ fn test_worker_short_circuit_open_resizes_block_file() -> CommonResult<()> {
         client_name: "test".to_string(),
         chunk_size: CHUNK_SIZE,
         pipeline_stream: Vec::new(),
+        component_info: None,
     };
     let complete_msg = Builder::new()
         .code(RpcCode::WriteBlock)

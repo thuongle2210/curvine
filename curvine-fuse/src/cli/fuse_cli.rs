@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use curvine_common::conf::ClientConfCliOverrides;
-use curvine_common::version;
+use curvine_config::ClientConfCliOverrides;
+use curvine_sys::version;
 
 use crate::cli::mount_args::{FuseMountArgs, FuseRuntimeArgs};
 
@@ -41,6 +41,10 @@ pub struct ListConfigFlagsArgs {
     args_conflicts_with_subcommands = true
 )]
 pub struct FuseCli {
+    /// Print the component version in JSON format and exit
+    #[arg(long, global = true)]
+    pub version_json: bool,
+
     #[command(subcommand)]
     pub cmd: Option<FuseSubcommand>,
 
@@ -87,7 +91,7 @@ impl FuseCli {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orpc::common::Utils;
+    use curvine_runtime::common::Utils;
     use std::fs;
 
     fn with_valid_conf<T>(extra_args: &[&str], test: impl FnOnce(FuseRuntimeArgs) -> T) -> T {
@@ -175,7 +179,7 @@ mod tests {
 
     #[test]
     fn metrics_enabled_defaults_to_true() {
-        use curvine_common::conf::FuseConf;
+        use curvine_config::FuseConf;
         assert!(FuseConf::default().metrics_enabled);
     }
 
@@ -206,6 +210,14 @@ mod tests {
         let err =
             FuseCli::try_parse_from(["curvine-fuse", "--io-threads", "4", "mount"]).unwrap_err();
         assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn version_json_parses_without_mount_args() {
+        let cli = FuseCli::try_parse_from(["curvine-fuse", "--version-json"]).unwrap();
+
+        assert!(cli.version_json);
+        assert!(cli.cmd.is_none());
     }
 
     #[test]

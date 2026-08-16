@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rocksdb::{DBConf, RocksUtils};
+use crate::rocksdb::{DBConf, DBConfExt, RocksUtils};
+use curvine_core_error::{err_box, try_err, CommonResult};
+use curvine_runtime::common::{FileUtils, Utils};
 use log::{info, warn};
-use orpc::common::{FileUtils, Utils};
-use orpc::{err_box, try_err, CommonResult};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::properties;
 use rocksdb::statistics::Ticker;
@@ -278,7 +278,13 @@ impl DBEngine {
     pub fn flush_mem(&self, sync: bool) -> CommonResult<()> {
         let mut opts = FlushOptions::default();
         opts.set_wait(sync);
-        self.db.flush_opt(&opts)?;
+        let cfs = self
+            .conf
+            .family_list
+            .iter()
+            .map(|cf| self.cf(cf))
+            .collect::<CommonResult<Vec<_>>>()?;
+        self.db.flush_cfs_opt(&cfs, &opts)?;
         Ok(())
     }
 

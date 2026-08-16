@@ -18,12 +18,12 @@ use crate::{
     StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
 use crate::{BlockMeta, BlockState};
-use curvine_common::conf::{ClusterConf, WorkerDataDir};
-use curvine_common::state::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_config::{ClusterConf, WorkerDataDir};
+use curvine_core_error::{err_box, CommonResult};
+use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_runtime::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
 use indexmap::map::Values;
 use log::info;
-use orpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
-use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -82,7 +82,12 @@ impl RemovedBlockState {
         Ok(())
     }
 
-    pub fn release_space(&self) {
+    pub fn release(&self) {
+        self.layout.release(&self.dir, &self.meta);
+        if let Some(committed) = self.committed.as_ref() {
+            self.layout.release(&self.dir, committed);
+        }
+
         self.dir
             .release_space(self.meta.is_final(), self.meta.physical_bytes());
         if let Some(committed) = self.committed.as_ref() {
@@ -154,7 +159,7 @@ impl VfsDataset {
                 if dir.storage_type() == StorageType::SpdkDisk {
                     if let Some(bdev) = dir.state.bdev_name.as_ref() {
                         if let Some(prev_id) = seen.insert(bdev.clone(), dir.id()) {
-                            return orpc::err_box!(
+                            return curvine_core_error::err_box!(
                                 "SPDK dirs {} and {} both map to bdev '{}' (dir_id collision).",
                                 prev_id,
                                 dir.id(),
@@ -270,7 +275,10 @@ impl VfsDataset {
                     .dir_list
                     .get_dir(meta.dir_id())
                     .ok_or_else(|| {
-                        orpc::err_msg!(format!("No storage directory found: {:?}", meta.dir_id()))
+                        curvine_core_error::err_msg!(format!(
+                            "No storage directory found: {:?}",
+                            meta.dir_id()
+                        ))
                     })?
                     .clone();
                 let required_bytes = meta.physical_bytes().max(block.len);
@@ -345,7 +353,7 @@ impl VfsDataset {
 
     pub fn rollback_file_open(&mut self, reservation: &FileOpenReservation) -> CommonResult<()> {
         let pending = self.meta.remove(reservation.pending.id()).ok_or_else(|| {
-            orpc::err_msg!(format!(
+            curvine_core_error::err_msg!(format!(
                 "block {} open reservation missing during rollback",
                 reservation.pending.id()
             ))
@@ -383,7 +391,7 @@ impl VfsDataset {
             .dir_list
             .get_dir(writing.dir_id())
             .ok_or_else(|| {
-                orpc::err_msg!(format!(
+                curvine_core_error::err_msg!(format!(
                     "No storage directory found: {:?}",
                     writing.dir_id()
                 ))
@@ -477,21 +485,17 @@ impl VfsDataset {
     }
 
     pub fn remove_block_state_by_id(&mut self, id: i64) -> CommonResult<RemovedBlockState> {
-        let meta = match self.meta.remove(id) {
+        let meta = match self.meta.get(id).cloned() {
             None => return err_box!("Not found block {}", id),
             Some(meta) => meta,
         };
-        let committed = self.committed_rewrites.remove(&id);
         let layout = self.layouts.get(meta.storage_type()).clone();
         let dir = match self.dir_list.get_dir(meta.dir_id()) {
             None => return err_box!("No storage directory found: {:?}", meta.dir_id()),
             Some(dir) => dir.clone(),
         };
-
-        layout.release(&dir, &meta);
-        if let Some(committed) = committed.as_ref() {
-            layout.release(&dir, committed);
-        }
+        let meta = self.meta.remove(id).expect("block metadata must exist");
+        let committed = self.committed_rewrites.remove(&id);
 
         Ok(RemovedBlockState {
             meta,
@@ -501,10 +505,21 @@ impl VfsDataset {
         })
     }
 
+    pub fn restore_removed_block(&mut self, removed: RemovedBlockState) {
+        let id = removed.meta.id();
+        self.meta.put(removed.meta);
+        if let Some(committed) = removed.committed {
+            self.committed_rewrites.insert(id, committed);
+        }
+    }
+
     pub(crate) fn remove_block_by_id(&mut self, id: i64) -> CommonResult<BlockMeta> {
         let removed = self.remove_block_state_by_id(id)?;
-        removed.deallocate()?;
-        removed.release_space();
+        if let Err(e) = removed.deallocate() {
+            self.restore_removed_block(removed);
+            return Err(e);
+        }
+        removed.release();
         Ok(removed.meta)
     }
 
@@ -716,12 +731,12 @@ mod test {
     use crate::{
         Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion, VfsDataset, VfsDir,
     };
-    use curvine_common::conf::{ClusterConf, WorkerConf};
-    use curvine_common::state::{ExtendedBlock, FileType, StorageType};
-    use orpc::common::FileUtils;
-    use orpc::sync::AtomicLong;
-    use orpc::sys::FsStats;
-    use orpc::CommonResult;
+    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_core_error::CommonResult;
+    use curvine_model::{ExtendedBlock, FileType, StorageType};
+    use curvine_runtime::common::FileUtils;
+    use curvine_runtime::sync::AtomicLong;
+    use curvine_sys::FsStats;
     use std::io::Write;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -868,7 +883,7 @@ mod test {
         Ok(())
     }
     #[test]
-    fn failed_file_deallocate_keeps_capacity_reserved() -> CommonResult<()> {
+    fn failed_file_deallocate_keeps_block_and_capacity_reserved() -> CommonResult<()> {
         let mut ds = create_data_set(true, "deallocate-failure");
         let block = ExtendedBlock::with_mem(1, "100B")?;
         let available = ds.available();
@@ -881,10 +896,13 @@ mod test {
         std::fs::write(block_path.join("child"), b"data")?;
 
         assert!(ds.abort_block(&block).is_err());
-        assert!(ds.get_block(block.id).is_none());
+        assert!(ds.get_block(block.id).is_some());
         assert_eq!(ds.available(), available - 100);
 
         FileUtils::delete_path(block_path, true)?;
+        ds.abort_block(&block)?;
+        assert!(ds.get_block(block.id).is_none());
+        assert_eq!(ds.available(), available);
         Ok(())
     }
     #[test]

@@ -16,17 +16,17 @@
 
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsWriter};
-use curvine_common::conf::ClusterConf;
-use curvine_common::error::FsError;
-use curvine_common::fs::Path;
-use curvine_common::fs::Reader;
-use curvine_common::fs::Writer;
-use curvine_common::state::{FileAllocMode, FileAllocOpts};
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, CommonError, CommonResult};
+use curvine_error::FsError;
+use curvine_fs_api::Path;
+use curvine_fs_api::Reader;
+use curvine_fs_api::Writer;
+use curvine_model::{FileAllocMode, FileAllocOpts};
+use curvine_runtime::common::{LocalTime, Utils};
+use curvine_runtime::runtime::RpcRuntime;
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::{LocalTime, Utils};
-use orpc::runtime::RpcRuntime;
-use orpc::{err_box, CommonError, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 // Test local short-circuit read and write
@@ -186,7 +186,7 @@ fn _abort() -> CommonResult<()> {
     let path = Path::from_str("/file-abort.log")?;
 
     rt.block_on(async move {
-        let before = fs.get_master_info().await?.available;
+        let before = fs.get_filesystem_info().await?.available;
         let mut writer = fs.create(&path, true).await?;
         writer.write("123".as_bytes()).await?;
         writer.flush().await?;
@@ -195,7 +195,7 @@ fn _abort() -> CommonResult<()> {
         fs.delete(&path, false).await?;
 
         tokio::time::sleep(Duration::from_secs(10)).await;
-        let after = fs.get_master_info().await?.available;
+        let after = fs.get_filesystem_info().await?.available;
 
         println!("before {}, after {}", before, after);
         assert_eq!(before, after);
@@ -664,7 +664,7 @@ async fn test_resize(
     fs: &CurvineFileSystem,
     path: &Path,
     opts: FileAllocOpts,
-) -> CommonResult<curvine_common::state::FileBlocks> {
+) -> CommonResult<curvine_model::FileBlocks> {
     let block_size = fs.conf().client.block_size;
     fs.resize(path, opts.clone()).await?;
     let file_blocks = fs.get_block_locations(path).await?;

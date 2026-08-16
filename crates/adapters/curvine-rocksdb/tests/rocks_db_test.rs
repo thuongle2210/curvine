@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core_error::CommonResult;
 use curvine_rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
-use orpc::common::{FileUtils, Utils};
-use orpc::CommonResult;
+use curvine_runtime::common::{FileUtils, Utils};
 
 // Rocksdb database core function test
 #[test]
@@ -60,6 +60,30 @@ fn test_rocksdb_checkpoint_and_restore_functionality() -> CommonResult<()> {
 
     assert!(db.get("k1".as_bytes())?.is_some());
     assert!(db.get("k2".as_bytes())?.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn test_rocksdb_checkpoint_flushes_all_column_families() -> CommonResult<()> {
+    let base_dir = Utils::test_sub_dir(format!("rocks_multi_cf_checkpoint_{}", Utils::rand_str(6)));
+    FileUtils::delete_path(&base_dir, true)?;
+
+    let conf = DBConf::new(&base_dir)
+        .set_disable_wal(true)
+        .add_cf("cf1")
+        .add_cf("cf2");
+    let mut db = DBEngine::new(conf, true)?;
+    db.put_cf("cf1", b"k1", b"v1")?;
+    db.put_cf("cf2", b"k2", b"v2")?;
+
+    let checkpoint = db.create_checkpoint(1)?;
+    db.put_cf("cf1", b"late", b"late")?;
+    db.restore(checkpoint)?;
+
+    assert_eq!(db.get_cf("cf1", b"k1")?, Some(b"v1".to_vec()));
+    assert_eq!(db.get_cf("cf2", b"k2")?, Some(b"v2".to_vec()));
+    assert!(db.get_cf("cf1", b"late")?.is_none());
 
     Ok(())
 }

@@ -17,12 +17,12 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
-use curvine_common::state::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
-use curvine_common::utils::SerdeUtils;
+use curvine_core_error::{err_box, try_err, try_option, CommonResult};
+use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
 use curvine_rocksdb::{DBConf, RocksUtils};
+use curvine_runtime::common::SerdeUtils;
+use curvine_runtime::common::{FileUtils, Utils};
 use log::info;
-use orpc::common::{FileUtils, Utils};
-use orpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
 
@@ -157,7 +157,6 @@ impl InodeStore {
         while let Some((parent_id, edge_name, inode)) = stack.pop_front() {
             // Delete inode edges
             batch.delete_child(parent_id, &edge_name)?;
-            del_res.inodes += 1;
 
             match &inode {
                 InodeView::Dir(dir) => {
@@ -176,6 +175,8 @@ impl InodeStore {
                 _ => {
                     deleted_files += 1;
                     let res = self.decrement_inode_nlink(inode.id(), ctime, &mut batch)?;
+                    del_res.inodes += res.inodes;
+                    del_res.bytes += res.bytes;
                     del_res.blocks.extend(res.blocks);
                 }
             }
@@ -194,6 +195,15 @@ impl InodeStore {
     }
 
     pub fn apply_free(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+        for inode in inodes {
+            batch.write_inode(&inode)?;
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    pub fn apply_cache_invalidations(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         for inode in inodes {
             batch.write_inode(&inode)?;
@@ -477,7 +487,10 @@ impl InodeStore {
                         batch.delete_inode(inode_id)?;
 
                         // Collect block info
-                        del_res.blocks.extend(f.get_locs(self)?);
+                        let locs = f.get_locs(self)?;
+                        del_res.inodes = 1;
+                        del_res.bytes = u64::try_from(f.get_locs_bytes(&locs)).unwrap_or(0);
+                        del_res.blocks.extend(locs);
 
                         self.ttl_bucket_list.remove(&inode_view);
                     } else {

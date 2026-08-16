@@ -13,16 +13,26 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_common::conf::ClusterConf;
-use curvine_common::version;
+use curvine_alloc as _;
+use curvine_config::ClusterConf;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_data_transfer::transfer::TransferServer;
 use curvine_master::master::Master;
+use curvine_runtime::common::{LocalTime, Utils};
+use curvine_sys::version;
 use curvine_worker::Worker;
-use orpc::common::{LocalTime, Utils};
-use orpc::{err_box, CommonResult};
 
 fn main() -> CommonResult<()> {
     let args: ServerArgs = ServerArgs::parse();
+    if args.version_json {
+        let json = match version::component_version_json(args.component_name()) {
+            Ok(json) => json,
+            Err(e) => return err_box!("Failed to serialize component version: {}", e),
+        };
+        println!("{}", json);
+        return Ok(());
+    }
+
     println!(
         "datetime: {}, git version: {}, args: {:#?}",
         LocalTime::now_datetime(),
@@ -31,7 +41,7 @@ fn main() -> CommonResult<()> {
     );
 
     let service = args.get_service()?;
-    let mut conf = args.get_conf()?;
+    let mut conf = args.get_conf(&service)?;
 
     Utils::set_panic_exit_hook();
 
@@ -59,6 +69,9 @@ fn main() -> CommonResult<()> {
 #[derive(Debug, Parser, Clone)]
 #[command(version = version::VERSION)]
 pub struct ServerArgs {
+    #[arg(long, help = "Print the component version in JSON format and exit")]
+    version_json: bool,
+
     // Start the worker or the master
     #[arg(long, default_value = "")]
     service: String,
@@ -69,6 +82,15 @@ pub struct ServerArgs {
 }
 
 impl ServerArgs {
+    pub fn component_name(&self) -> &'static str {
+        match self.service.to_lowercase().as_str() {
+            "master" => "master",
+            "worker" => "worker",
+            "transfer" => "data-transfer",
+            _ => "server",
+        }
+    }
+
     pub fn get_service(&self) -> CommonResult<ServiceType> {
         let service = self.service.to_lowercase();
         match service.as_str() {
@@ -79,8 +101,11 @@ impl ServerArgs {
         }
     }
 
-    pub fn get_conf(&self) -> CommonResult<ClusterConf> {
-        ClusterConf::from(&self.conf)
+    pub fn get_conf(&self, service: &ServiceType) -> CommonResult<ClusterConf> {
+        match service {
+            ServiceType::Transfer => ClusterConf::from_transfer(&self.conf),
+            ServiceType::Master | ServiceType::Worker => ClusterConf::from(&self.conf),
+        }
     }
 }
 
@@ -88,4 +113,28 @@ pub enum ServiceType {
     Master,
     Worker,
     Transfer,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_json_accepts_service_component() {
+        let args =
+            ServerArgs::try_parse_from(["curvine-server", "--service", "master", "--version-json"])
+                .expect("server version json should parse");
+
+        assert!(args.version_json);
+        assert_eq!(args.component_name(), "master");
+    }
+
+    #[test]
+    fn version_json_without_service_uses_server_component() {
+        let args = ServerArgs::try_parse_from(["curvine-server", "--version-json"])
+            .expect("server version json should parse without service");
+
+        assert!(args.version_json);
+        assert_eq!(args.component_name(), "server");
+    }
 }
