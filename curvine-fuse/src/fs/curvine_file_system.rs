@@ -1395,7 +1395,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_traverse_permissions(op.header.nodeid, op.header)
             .await?;
 
-        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        let status = self.state.fs_stat_guarded(op.header.nodeid).await?;
 
         let mut fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
@@ -1975,6 +1975,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.ensure_writable_path(&path, RpcCode::Delete).await?;
 
+        let _guard = self.state.lock_path(&path).await;
         self.fs.delete(&path, false).await?;
         self.state.unlink(op.header.nodeid, name, false)?;
         self.state
@@ -3092,10 +3093,10 @@ mod tests {
     use super::CurvineFileSystem;
     use crate::{
         fuse_init_flag_names, FUSE_ATOMIC_O_TRUNC, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS,
-        FUSE_EXPORT_SUPPORT, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_KERNEL_MINOR_VERSION,
-        FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SETXATTR_EXT,
-        FUSE_SPLICE_MOVE, FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE,
-        SUPPORTED_INIT_FLAGS,
+        FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR,
+        FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL,
+        FUSE_POSIX_LOCKS, FUSE_SETXATTR_EXT, FUSE_SPLICE_MOVE, FUSE_SPLICE_READ, FUSE_SPLICE_WRITE,
+        FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
     };
 
     #[test]
@@ -3174,6 +3175,18 @@ mod tests {
             out & FUSE_SETXATTR_EXT,
             0,
             "the decoder only supports the 8-byte SETXATTR compatibility layout"
+        );
+    }
+
+    #[test]
+    fn explicit_data_invalidation_is_not_advertised() {
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(FUSE_EXPLICIT_INVAL_DATA, &conf);
+
+        assert_eq!(
+            out & FUSE_EXPLICIT_INVAL_DATA,
+            0,
+            "page-cache invalidation is currently delegated to the kernel"
         );
     }
 
