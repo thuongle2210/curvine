@@ -504,7 +504,7 @@ where
     ) -> FsResult<()> {
         let now = now_ms();
         self.probe_stale_running_tasks(&job, now).await?;
-        let _ = self.store.mark_stale_attempts(
+        let stale = self.store.mark_stale_attempts(
             &job.job_id,
             job.run_id,
             &lease.owner,
@@ -512,21 +512,14 @@ where
             now,
             self.conf.task_probe_concurrency(),
         )?;
-        // Recover all Stale tasks (newly marked + orphan leftovers from CAS races).
-        let stale_tasks = self.store.list_tasks_by_state(
-            &job.job_id,
-            job.run_id,
-            TransferTaskState::Stale,
-            self.conf.task_probe_concurrency(),
-        )?;
-        for task in stale_tasks {
-            if task.retry_count as usize > self.conf.task_max_retries {
+        for attempt in stale {
+            if attempt.task.retry_count as usize > self.conf.task_max_retries {
                 if !self.store.update_task_state(TransferTaskStateUpdate {
-                    job_id: task.job_id.clone(),
-                    run_id: task.run_id,
+                    job_id: attempt.task.job_id.clone(),
+                    run_id: attempt.task.run_id,
                     owner: lease.owner.clone(),
                     lease_epoch: lease.lease_epoch,
-                    task_id: task.task_id.clone(),
+                    task_id: attempt.task.task_id.clone(),
                     from_states: vec![TransferTaskState::Stale],
                     state: TransferTaskState::Failed,
                     message: "transfer task did not report progress before the retry limit was reached; check Transfer worker health".to_string(),
@@ -539,11 +532,11 @@ where
                 return Ok(());
             }
             if !self.store.update_task_state(TransferTaskStateUpdate {
-                job_id: task.job_id.clone(),
-                run_id: task.run_id,
+                job_id: attempt.task.job_id.clone(),
+                run_id: attempt.task.run_id,
                 owner: lease.owner.clone(),
                 lease_epoch: lease.lease_epoch,
-                task_id: task.task_id.clone(),
+                task_id: attempt.task.task_id.clone(),
                 from_states: vec![TransferTaskState::Stale],
                 state: TransferTaskState::Pending,
                 message: "retry stale task attempt".to_string(),
