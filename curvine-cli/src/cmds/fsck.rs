@@ -50,7 +50,11 @@ struct FsckReport {
     storage_placements: BTreeMap<String, usize>,
     worker_placements: BTreeMap<String, usize>,
     block_count: usize,
+    expected_replicas: usize,
+    recorded_replicas: usize,
+    available_replicas: usize,
     mismatch_blocks: usize,
+    mismatch_replicas: usize,
     under_replicated_blocks: usize,
     unavailable_replicas: usize,
     errors: Vec<(String, String)>,
@@ -76,10 +80,24 @@ impl FsckReport {
         for block in &mut details.blocks {
             block.replicas.sort_by_key(|replica| replica.worker_id);
             self.block_count += 1;
+            self.expected_replicas += details.status.replicas.max(0) as usize;
+            self.recorded_replicas += block.replicas.len();
+            self.available_replicas += block
+                .replicas
+                .iter()
+                .filter(|replica| replica.address.is_some())
+                .count();
 
             if block_mismatches(&details.status, block) {
                 self.mismatch_blocks += 1;
             }
+            self.mismatch_replicas += block
+                .replicas
+                .iter()
+                .filter(|replica| {
+                    replica.storage_type != details.status.storage_policy.storage_type
+                })
+                .count();
             if block.replicas.len() < details.status.replicas.max(0) as usize {
                 self.under_replicated_blocks += 1;
             }
@@ -254,6 +272,22 @@ fn render_report(report: &FsckReport, detail: bool, policy_mismatch: bool) -> St
         &report.worker_placements,
     );
 
+    writeln!(output, "\n--- Replica Health ---").unwrap();
+    writeln!(output, "  Expected replicas: {}", report.expected_replicas).unwrap();
+    writeln!(output, "  Recorded replicas: {}", report.recorded_replicas).unwrap();
+    writeln!(
+        output,
+        "  Available replicas: {}",
+        report.available_replicas
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "  Unavailable replicas: {}",
+        report.unavailable_replicas
+    )
+    .unwrap();
+
     writeln!(output, "\n--- Findings ---").unwrap();
     writeln!(
         output,
@@ -263,16 +297,17 @@ fn render_report(report: &FsckReport, detail: bool, policy_mismatch: bool) -> St
     .unwrap();
     writeln!(
         output,
-        "  Under-replicated blocks: {}",
-        report.under_replicated_blocks
+        "  Mismatched replica placements: {}",
+        report.mismatch_replicas
     )
     .unwrap();
     writeln!(
         output,
-        "  Unavailable replicas: {}",
-        report.unavailable_replicas
+        "  Under-replicated blocks: {}",
+        report.under_replicated_blocks
     )
     .unwrap();
+    writeln!(output, "  Failed files: {}", report.errors.len()).unwrap();
     for (path, error) in &report.errors {
         writeln!(output, "  Failed to inspect {}: {}", path, error).unwrap();
     }
@@ -323,11 +358,17 @@ fn render_file(file: &FileScan, policy_mismatch: bool, include_status: bool) -> 
                 .as_ref()
                 .map(|address| format!("{}:{}", address.hostname, address.rpc_port))
                 .unwrap_or_else(|| format!("worker-{} (unavailable)", replica.worker_id));
+            let mismatch = if replica.storage_type != status.storage_policy.storage_type {
+                " [MISMATCH]"
+            } else {
+                ""
+            };
             writeln!(
                 output,
-                "  {:<28} {}",
+                "  {:<28} {}{}",
                 worker,
-                replica.storage_type.as_str_name()
+                replica.storage_type.as_str_name(),
+                mismatch
             )
             .unwrap();
         }
@@ -370,6 +411,36 @@ mod tests {
     use super::*;
     use curvine_model::{BlockReplicaDetail, StoragePolicy, StorageType, WorkerAddress};
 
+    fn address(worker_id: u32, hostname: &str) -> WorkerAddress {
+        WorkerAddress {
+            worker_id,
+            hostname: hostname.to_string(),
+            rpc_port: 50010,
+            ..Default::default()
+        }
+    }
+
+    fn replica(
+        worker_id: u32,
+        storage_type: StorageType,
+        address: Option<WorkerAddress>,
+    ) -> BlockReplicaDetail {
+        BlockReplicaDetail {
+            worker_id,
+            storage_type,
+            address,
+        }
+    }
+
+    fn block(block_id: i64, offset: i64, replicas: Vec<BlockReplicaDetail>) -> FileBlockDetail {
+        FileBlockDetail {
+            block_id,
+            len: 100,
+            offset,
+            replicas,
+        }
+    }
+
     fn details() -> FileBlockDetails {
         FileBlockDetails {
             status: FileStatus {
@@ -382,29 +453,138 @@ mod tests {
                 },
                 ..Default::default()
             },
-            blocks: vec![FileBlockDetail {
-                block_id: 7,
-                len: 100,
-                offset: 0,
-                replicas: vec![
-                    BlockReplicaDetail {
-                        worker_id: 1,
-                        storage_type: StorageType::SpdkDisk,
-                        address: Some(WorkerAddress {
-                            worker_id: 1,
-                            hostname: "worker-a".to_string(),
-                            rpc_port: 50010,
-                            ..Default::default()
-                        }),
-                    },
-                    BlockReplicaDetail {
-                        worker_id: 2,
-                        storage_type: StorageType::Disk,
-                        address: None,
-                    },
+            blocks: vec![block(
+                7,
+                0,
+                vec![
+                    replica(1, StorageType::SpdkDisk, Some(address(1, "worker-a"))),
+                    replica(2, StorageType::Disk, None),
                 ],
-            }],
+            )],
         }
+    }
+
+    #[test]
+    fn list_page_size_parser_accepts_positive_boundaries() {
+        assert_eq!(parse_positive_usize("1").unwrap(), 1);
+        assert_eq!(parse_positive_usize("256").unwrap(), 256);
+        assert_eq!(
+            parse_positive_usize(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn list_page_size_parser_rejects_invalid_values() {
+        for value in ["0", "-1", "abc", "1.5", "184467440737095516160"] {
+            assert!(parse_positive_usize(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn healthy_file_has_no_warnings() {
+        let mut healthy = details();
+        healthy.blocks[0].replicas[1] =
+            replica(2, StorageType::SpdkDisk, Some(address(2, "worker-b")));
+        let mut report = FsckReport::default();
+        report.add_file(healthy);
+
+        assert_eq!(report.expected_replicas, 2);
+        assert_eq!(report.recorded_replicas, 2);
+        assert_eq!(report.available_replicas, 2);
+        assert_eq!(report.unavailable_replicas, 0);
+        assert_eq!(report.under_replicated_blocks, 0);
+        assert!(!report.has_warnings());
+    }
+
+    #[test]
+    fn empty_file_has_no_blocks_or_replica_expectations() {
+        let mut empty = details();
+        empty.status.len = 0;
+        empty.blocks.clear();
+        let mut report = FsckReport::default();
+        report.add_file(empty);
+
+        assert_eq!(report.block_count, 0);
+        assert_eq!(report.expected_replicas, 0);
+        assert_eq!(report.recorded_replicas, 0);
+        assert!(!report.has_warnings());
+    }
+
+    #[test]
+    fn missing_replicas_are_counted_as_under_replicated() {
+        let mut under_replicated = details();
+        under_replicated.blocks[0].replicas.truncate(1);
+        let mut report = FsckReport::default();
+        report.add_file(under_replicated);
+
+        assert_eq!(report.expected_replicas, 2);
+        assert_eq!(report.recorded_replicas, 1);
+        assert_eq!(report.available_replicas, 1);
+        assert_eq!(report.under_replicated_blocks, 1);
+        assert!(report.has_warnings());
+    }
+
+    #[test]
+    fn block_without_replicas_is_under_replicated_not_mismatched() {
+        let mut missing = details();
+        missing.blocks[0].replicas.clear();
+        let mut report = FsckReport::default();
+        report.add_file(missing);
+
+        assert_eq!(report.under_replicated_blocks, 1);
+        assert_eq!(report.mismatch_blocks, 0);
+        assert_eq!(report.mismatch_replicas, 0);
+    }
+
+    #[test]
+    fn unavailable_replica_is_recorded_but_not_available() {
+        let mut report = FsckReport::default();
+        report.add_file(details());
+
+        assert_eq!(report.recorded_replicas, 2);
+        assert_eq!(report.available_replicas, 1);
+        assert_eq!(report.unavailable_replicas, 1);
+        assert_eq!(report.under_replicated_blocks, 0);
+    }
+
+    #[test]
+    fn add_file_sorts_blocks_and_replicas_deterministically() {
+        let mut unordered = details();
+        unordered.blocks = vec![
+            block(8, 100, vec![replica(1, StorageType::SpdkDisk, None)]),
+            block(
+                7,
+                0,
+                vec![
+                    replica(3, StorageType::SpdkDisk, None),
+                    replica(1, StorageType::SpdkDisk, None),
+                ],
+            ),
+        ];
+        let mut report = FsckReport::default();
+        report.add_file(unordered);
+
+        assert_eq!(report.files[0].details.blocks[0].block_id, 7);
+        assert_eq!(report.files[0].details.blocks[1].block_id, 8);
+        assert_eq!(report.files[0].details.blocks[0].replicas[0].worker_id, 1);
+        assert_eq!(report.files[0].details.blocks[0].replicas[1].worker_id, 3);
+    }
+
+    #[test]
+    fn scan_error_sets_warning_and_is_rendered() {
+        let report = FsckReport {
+            root: "/data".to_string(),
+            is_dir: true,
+            errors: vec![("/data/bad".to_string(), "rpc failed".to_string())],
+            ..Default::default()
+        };
+        let output = render_report(&report, false, false);
+
+        assert!(report.has_warnings());
+        assert!(output.contains("Failed files: 1"));
+        assert!(output.contains("Failed to inspect /data/bad: rpc failed"));
+        assert!(output.contains("Status: WARNING"));
     }
 
     #[test]
@@ -433,23 +613,126 @@ mod tests {
         assert!(output.contains("SPDK_DISK: 1 (50.0%)"));
         assert!(output.contains("DISK: 1 (50.0%)"));
         assert!(output.contains("Policy mismatch blocks: 1"));
+        assert!(output.contains("Mismatched replica placements: 1"));
+        assert!(output.contains("Expected replicas: 2"));
+        assert!(output.contains("Recorded replicas: 2"));
+        assert!(output.contains("Available replicas: 1"));
+    }
+
+    #[test]
+    fn multiple_mismatched_replicas_count_as_one_mismatch_block() {
+        let mut mixed = details();
+        mixed.status.replicas = 3;
+        mixed.blocks[0].replicas = vec![
+            replica(1, StorageType::SpdkDisk, Some(address(1, "worker-a"))),
+            replica(2, StorageType::Disk, Some(address(2, "worker-b"))),
+            replica(3, StorageType::Ssd, Some(address(3, "worker-c"))),
+        ];
+        let mut report = FsckReport::default();
+        report.add_file(mixed);
+
+        assert_eq!(report.mismatch_blocks, 1);
+        assert_eq!(report.mismatch_replicas, 2);
+        assert_eq!(report.under_replicated_blocks, 0);
+    }
+
+    #[test]
+    fn storage_distribution_uses_replica_placements_as_denominator() {
+        let mut mixed = details();
+        mixed.status.replicas = 4;
+        mixed.blocks[0].replicas = vec![
+            replica(1, StorageType::SpdkDisk, Some(address(1, "worker-a"))),
+            replica(2, StorageType::SpdkDisk, Some(address(2, "worker-b"))),
+            replica(3, StorageType::Disk, Some(address(3, "worker-c"))),
+            replica(4, StorageType::Ssd, None),
+        ];
+        let mut report = FsckReport {
+            root: "/data".to_string(),
+            is_dir: true,
+            ..Default::default()
+        };
+        report.add_file(mixed);
+        let output = render_report(&report, false, false);
+
+        assert!(output.contains("SPDK_DISK: 2 (50.0%)"));
+        assert!(output.contains("DISK: 1 (25.0%)"));
+        assert!(output.contains("SSD: 1 (25.0%)"));
+    }
+
+    #[test]
+    fn unavailable_replica_contributes_persisted_storage_type() {
+        let mut report = FsckReport::default();
+        report.add_file(details());
+
+        assert_eq!(report.storage_placements.get("DISK"), Some(&1));
+        assert_eq!(
+            report.worker_placements.get("worker-2 (unavailable)"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn mismatch_marker_only_labels_mismatched_replicas() {
+        let output = render_file(&FileScan { details: details() }, false, false);
+        let matching = output
+            .lines()
+            .find(|line| line.contains("worker-a:50010"))
+            .unwrap();
+        let mismatching = output
+            .lines()
+            .find(|line| line.contains("worker-2 (unavailable)"))
+            .unwrap();
+
+        assert!(!matching.contains("[MISMATCH]"));
+        assert!(mismatching.contains("[MISMATCH]"));
     }
 
     #[test]
     fn policy_mismatch_hides_matching_blocks() {
         let mut details = details();
-        details.blocks.push(FileBlockDetail {
-            block_id: 8,
-            len: 100,
-            offset: 100,
-            replicas: vec![BlockReplicaDetail {
-                worker_id: 1,
-                storage_type: StorageType::SpdkDisk,
-                address: None,
-            }],
-        });
+        details
+            .blocks
+            .push(block(8, 100, vec![replica(1, StorageType::SpdkDisk, None)]));
         let output = render_file(&FileScan { details }, true, false);
         assert!(output.contains("blk_7"));
         assert!(!output.contains("blk_8"));
+    }
+
+    #[test]
+    fn policy_mismatch_hides_fully_matching_files_in_directory_detail() {
+        let mut matching = details();
+        matching.status.path = "/data/matching".to_string();
+        matching.blocks[0].replicas = vec![replica(
+            1,
+            StorageType::SpdkDisk,
+            Some(address(1, "worker-a")),
+        )];
+        let mut mismatching = details();
+        mismatching.status.path = "/data/mismatching".to_string();
+        let mut report = FsckReport {
+            root: "/data".to_string(),
+            is_dir: true,
+            ..Default::default()
+        };
+        report.add_file(matching);
+        report.add_file(mismatching);
+
+        let output = render_report(&report, false, true);
+        assert!(!output.contains("File: /data/matching"));
+        assert!(output.contains("File: /data/mismatching"));
+    }
+
+    #[test]
+    fn empty_directory_renders_empty_distributions_and_ok_status() {
+        let report = FsckReport {
+            root: "/empty".to_string(),
+            is_dir: true,
+            ..Default::default()
+        };
+        let output = render_report(&report, false, false);
+
+        assert_eq!(output.matches("  (none)").count(), 2);
+        assert!(output.contains("Files: 0 | Blocks: 0"));
+        assert!(output.contains("Status: OK"));
     }
 }
