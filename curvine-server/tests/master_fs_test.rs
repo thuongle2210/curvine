@@ -2692,6 +2692,47 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
 }
 
 #[test]
+fn file_block_details_preserve_worker_reported_storage_type() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-storage-type");
+    let path = "/file-block-details.log";
+    let client = ClientAddress::default();
+    let status = fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: block.locs[0].worker_id,
+            full_report: true,
+            total_len: 1,
+            blocks: vec![BlockReportInfo::new(
+                block.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::SpdkDisk,
+                block.block.len,
+            )],
+        },
+        None,
+    )?;
+
+    let details = fs.get_file_block_details(path)?;
+    assert_eq!(
+        details.status.storage_policy.storage_type,
+        status.storage_policy.storage_type
+    );
+    assert_eq!(details.blocks.len(), 1);
+    assert_eq!(details.blocks[0].block_id, block.block.id);
+    assert_eq!(details.blocks[0].replicas.len(), 1);
+    assert_eq!(
+        details.blocks[0].replicas[0].storage_type,
+        StorageType::SpdkDisk
+    );
+    assert!(details.blocks[0].replicas[0].address.is_some());
+    Ok(())
+}
+
+#[test]
 fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "complete-with-attr");
