@@ -2883,6 +2883,7 @@ fn file_block_details_compute_cumulative_offsets() -> CommonResult<()> {
         details.blocks[2].offset,
         details.blocks[0].len + details.blocks[1].len
     );
+    print!("{:#?}", details);
     Ok(())
 }
 

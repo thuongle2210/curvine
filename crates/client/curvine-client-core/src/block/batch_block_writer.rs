@@ -19,7 +19,9 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_model::{CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress};
+use curvine_model::{
+    BlockLocation, CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress,
+};
 use futures::future::try_join_all;
 use std::sync::Arc;
 
@@ -33,6 +35,13 @@ impl BatchWriterAdapter {
         match self {
             BatchLocal(f) => f.worker_address(),
             BatchRemote(f) => f.worker_address(),
+        }
+    }
+
+    fn actual_storage_type(&self, block_index: usize) -> Option<StorageType> {
+        match self {
+            BatchLocal(f) => f.actual_storage_type(block_index),
+            BatchRemote(f) => f.actual_storage_type(block_index),
         }
     }
 
@@ -192,14 +201,35 @@ impl BatchBlockWriter {
             return Err(e);
         }
 
-        Ok(self.to_commit_blocks())
+        self.to_commit_blocks()
     }
 
-    pub fn to_commit_blocks(&self) -> Vec<CommitBlock> {
+    pub fn to_commit_blocks(&self) -> FsResult<Vec<CommitBlock>> {
         let mut commit_blocks = Vec::with_capacity(self.located_blocks.len());
 
         for (i, located_block) in self.located_blocks.iter().enumerate() {
-            let mut commit_block = CommitBlock::from(located_block);
+            let locations = self
+                .inners
+                .iter()
+                .map(|writer| {
+                    let storage_type = writer.actual_storage_type(i).ok_or_else(|| {
+                        FsError::common(format!(
+                            "missing actual storage type for block {} on worker {}",
+                            located_block.block.id,
+                            writer.worker_address().worker_id
+                        ))
+                    })?;
+                    Ok(BlockLocation::new(
+                        writer.worker_address().worker_id,
+                        storage_type,
+                    ))
+                })
+                .collect::<FsResult<Vec<_>>>()?;
+            let mut commit_block = CommitBlock {
+                block_id: located_block.block.id,
+                block_len: located_block.block.len,
+                locations,
+            };
 
             if let Some(&length) = self.file_lengths.get(i) {
                 commit_block.block_len = length;
@@ -208,6 +238,6 @@ impl BatchBlockWriter {
             commit_blocks.push(commit_block);
         }
 
-        commit_blocks
+        Ok(commit_blocks)
     }
 }

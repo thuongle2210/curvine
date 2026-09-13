@@ -17,7 +17,7 @@ use crate::file::FsContext;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_model::{ExtendedBlock, WorkerAddress};
+use curvine_model::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_runtime::common::Utils;
 
 pub struct BatchBlockWriterRemote {
@@ -28,6 +28,7 @@ pub struct BatchBlockWriterRemote {
     seq_id: i32,
     req_id: i64,
     block_size: i64,
+    actual_storage_types: Vec<StorageType>,
 }
 
 impl BatchBlockWriterRemote {
@@ -54,6 +55,23 @@ impl BatchBlockWriterRemote {
             )
             .await?;
 
+        if write_context.contexts.len() != blocks.len() {
+            return err_box!(
+                "batch block response count mismatch, expected {}, actual {}",
+                blocks.len(),
+                write_context.contexts.len()
+            );
+        }
+        for (block, context) in blocks.iter().zip(&write_context.contexts) {
+            if context.id != block.id {
+                return err_box!(
+                    "batch block response id mismatch, expected {}, actual {}",
+                    block.id,
+                    context.id
+                );
+            }
+        }
+
         for context in &write_context.contexts {
             if block_size != context.block_size {
                 return err_box!(
@@ -63,6 +81,11 @@ impl BatchBlockWriterRemote {
                 );
             }
         }
+        let actual_storage_types = write_context
+            .contexts
+            .iter()
+            .map(|context| context.storage_type)
+            .collect();
 
         let writer = Self {
             blocks,
@@ -72,6 +95,7 @@ impl BatchBlockWriterRemote {
             seq_id,
             req_id,
             block_size,
+            actual_storage_types,
         };
 
         Ok(writer)
@@ -127,5 +151,9 @@ impl BatchBlockWriterRemote {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub fn actual_storage_type(&self, block_index: usize) -> Option<StorageType> {
+        self.actual_storage_types.get(block_index).copied()
     }
 }
