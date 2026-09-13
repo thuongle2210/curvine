@@ -24,6 +24,10 @@ pub enum Commands {
     #[command(name = "fs")]
     Fs(FsCommand),
 
+    /// Inspect actual per-worker block placement
+    #[command(name = "fsck")]
+    Fsck(FsckCommand),
+
     #[command(name = "report")]
     Report(ReportCommand),
 
