@@ -165,8 +165,17 @@ impl FsClient {
     }
 
     pub async fn file_status(&self, path: &Path) -> FsResult<FileStatus> {
+        self.file_status0(path, None).await
+    }
+
+    pub async fn file_status_by_id(&self, path: &Path, inode_id: i64) -> FsResult<FileStatus> {
+        self.file_status0(path, Some(inode_id)).await
+    }
+
+    async fn file_status0(&self, path: &Path, inode_id: Option<i64>) -> FsResult<FileStatus> {
         let header = GetFileStatusRequest {
             path: path.encode(),
+            inode_id,
         };
 
         let rep_header: GetFileStatusResponse = self.rpc(RpcCode::FileStatus, header).await?;
@@ -177,6 +186,7 @@ impl FsClient {
     pub async fn file_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         let header = GetFileStatusRequest {
             path: path.encode(),
+            inode_id: None,
         };
         self.rpc_bytes(RpcCode::FileStatus, header).await
     }
@@ -787,9 +797,28 @@ impl FsClient {
     }
 
     pub async fn resize(&self, path: &Path, alloc_opts: FileAllocOpts) -> FsResult<FileBlocks> {
+        self.resize0(path, None, alloc_opts).await
+    }
+
+    pub async fn resize_by_id(
+        &self,
+        path: &Path,
+        inode_id: i64,
+        alloc_opts: FileAllocOpts,
+    ) -> FsResult<FileBlocks> {
+        self.resize0(path, Some(inode_id), alloc_opts).await
+    }
+
+    async fn resize0(
+        &self,
+        path: &Path,
+        inode_id: Option<i64>,
+        alloc_opts: FileAllocOpts,
+    ) -> FsResult<FileBlocks> {
         let req = FileResizeRequest {
             path: path.encode(),
             opts: ProtoUtils::file_alloc_opts_to_pb(alloc_opts),
+            inode_id,
         };
 
         let rep: FileResizeResponse = self.rpc(RpcCode::ResizeFile, req).await?;
@@ -797,11 +826,30 @@ impl FsClient {
     }
 
     pub async fn assign_worker(&self, path: &Path, block: ExtendedBlock) -> FsResult<LocatedBlock> {
+        self.assign_worker0(path, None, block).await
+    }
+
+    pub async fn assign_worker_by_id(
+        &self,
+        path: &Path,
+        inode_id: i64,
+        block: ExtendedBlock,
+    ) -> FsResult<LocatedBlock> {
+        self.assign_worker0(path, Some(inode_id), block).await
+    }
+
+    async fn assign_worker0(
+        &self,
+        path: &Path,
+        inode_id: Option<i64>,
+        block: ExtendedBlock,
+    ) -> FsResult<LocatedBlock> {
         let req = AssignWorkerRequest {
             path: path.encode(),
             block: ProtoUtils::extend_block_to_pb(block),
             exclude_workers: self.context.exclude_workers(),
             client_address: self.context.client_addr_pb(),
+            inode_id,
         };
 
         let rep: AssignWorkerResponse = self.rpc(RpcCode::AssignWorker, req).await?;

@@ -28,8 +28,14 @@ pub use self::journal_conf::JournalConf;
 mod master_conf;
 pub use self::master_conf::MasterConf;
 
+mod mds_conf;
+pub use self::mds_conf::{KvBackendType, MdsConf};
+
 mod compatibility_conf;
 pub use self::compatibility_conf::CompatibilityConf;
+
+mod discovery_conf;
+pub use self::discovery_conf::DiscoveryConf;
 
 mod worker_conf;
 pub use self::worker_conf::{WorkerConf, WorkerDataDir};
@@ -44,7 +50,7 @@ mod client_conf;
 pub use self::client_conf::{ClientConf, ClientConfCliOverrides};
 
 mod fuse_conf;
-pub use self::fuse_conf::FuseConf;
+pub use self::fuse_conf::{FuseConf, FuseConfCliOverrides};
 
 mod job_conf;
 pub use self::job_conf::JobConf;
@@ -54,6 +60,16 @@ pub use self::transfer_conf::*;
 
 mod ufs_conf;
 pub use self::ufs_conf::{UfsConf, UfsConfBuilder};
+
+/// Unified layered config-loading pipeline (file → env → cli).
+pub mod pipeline;
+pub use pipeline::{ConfigLoader, DiscoveredPath};
+
+/// Unified validation framework (per-section validate + unknown-key audit).
+pub mod validation;
+
+/// Hot-reload extension points (no watcher/RPC wired yet — see module docs).
+pub mod reload;
 
 impl curvine_model::ClientConfDefaults for ClientConf {
     fn replicas(&self) -> i32 {

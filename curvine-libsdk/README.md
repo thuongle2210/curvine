@@ -109,15 +109,18 @@ python3 curvine-libsdk/python/test/curvineFileSystemTest.py
 
 ## Java SDK
 
-JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. JNI library name must match **`CurvineNative.getLibraryName()`** (see `java/native/`). Put the matching **`.so`** in **`build/dist/lib/`** next to the JAR and ensure **`java.library.path`** includes that directory (`bin/dfs` wrappers often set this).
+JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. On Linux, `CurvineNative` resolves native libraries using an ordered candidate list: the detected `<distribution><major>` name, then `linux`, `centos7`, `amzn2`, `alinux3`, and `rocky9` for the detected architecture, followed by the generic `x86` library name where applicable. Package the names produced by the native build under `java/native/` and ensure **`java.library.path`** includes the directory containing them (`bin/dfs` wrappers often set this). This fallback order lets one jar run on distributions without a dedicated native filename, provided the fallback `.so` is present.
+
+The canonical HDFS backend selector is `hdfs.provider=native` (or `jvm` for the JVM-backed OpenDAL HDFS provider). The legacy boolean `hdfs.native=true` remains supported when `hdfs.provider` is absent.
 
 **`cannot allocate memory in static TLS block`** (large JNI `.so` + glibc): load from a real **`build/dist/lib`** path first (`CurvineNative` scans `java.library.path` entries); if it still fails, try preloading **`LD_PRELOAD`** with the same **`libcurvine_libsdk_<os>_<arch>_64.so`**, or use a host/OS image validated for Curvine JNI.
 
 ### Transfer load routing
 
 When the cluster has Transfer enabled, configure the Java client with the same switch and the
-reachable Transfer service addresses. `CurvineLoadClient` then keeps its existing submit/status/
-cancel API while routing those requests to Transfer instead of the legacy Master Job API:
+reachable Transfer service addresses. `CurvineTransferClient` provides load/export submission,
+status, cancellation, retry, and wait operations while routing requests to Transfer instead of
+the legacy Master Job API:
 
 ```java
 Configuration conf = new Configuration();
@@ -125,14 +128,21 @@ conf.set("fs.cv.master_addrs", "master-0:8995,master-1:8995");
 conf.set("fs.cv.transfer.enabled", "true");
 conf.set("fs.cv.transfer.endpoints", "transfer-0:9010,transfer-1:9010");
 
-try (CurvineLoadClient client = CurvineLoadClient.from(conf)) {
+try (CurvineTransferClient client = CurvineTransferClient.from(conf)) {
     LoadJobResult job = client.submitLoad(LoadJobRequest.builder()
             .sourcePath("s3://bucket/model/v1")
             .targetPath("/bucket/model/v1")
             .build());
     LoadJobStatus status = client.getJobStatus(job.getJobId());
+    LoadJobResult export = client.submitExport(ExportJobRequest.builder()
+            .sourcePath("/bucket/model/v1")
+            .build());
 }
 ```
+
+`submitLoad(request, true)` implements the CLI `cv load --force` behavior. Export targets are
+derived from the existing mount mapping; export source paths must be Curvine paths. The existing
+`CurvineLoadClient` remains a compatibility facade for load-only callers.
 
 `fs.cv.transfer.endpoints` is a comma-separated list and is independent from Master addresses.
 It must point to the externally reachable Transfer service endpoint; the client does not infer it

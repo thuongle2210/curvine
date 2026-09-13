@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::validation::ConfValidate;
+use crate::{pipeline, validation};
 use crate::{
-    CliConf, ClientConf, DBConf, FuseConf, JobConf, JournalConf, MasterConf, TransferConf,
-    WorkerConf,
+    CliConf, ClientConf, DBConf, DiscoveryConf, FuseConf, JobConf, JournalConf, MasterConf,
+    MdsConf, TransferConf, WorkerConf,
 };
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_fault::FaultHttpConfig;
@@ -24,11 +26,9 @@ use curvine_rpc::client::{ClientConf as RpcConf, ClientFactory, SyncClient};
 use curvine_rpc::ServerConf;
 use curvine_runtime::common::{LogConf, Utils};
 use log::info;
-use nix::ifaddrs::getifaddrs;
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::fmt::{Display, Formatter};
-use std::fs::read_to_string;
+use std::net::IpAddr;
 use std::time::Duration;
 
 // Cluster configuration files.
@@ -50,6 +50,8 @@ pub struct ClusterConf {
     pub net_interface: String,
 
     pub master: MasterConf,
+
+    pub mds: MdsConf,
 
     // Log synchronization configuration.
     pub journal: JournalConf,
@@ -74,6 +76,8 @@ pub struct ClusterConf {
     pub transfer: TransferConf,
 
     pub cli: CliConf,
+
+    pub discovery: DiscoveryConf,
 }
 
 impl ClusterConf {
@@ -86,43 +90,49 @@ impl ClusterConf {
     pub const DEFAULT_FUSE_WEB_PORT: u16 = 9003;
 
     pub const ENV_MASTER_HOSTNAME: &'static str = "CURVINE_MASTER_HOSTNAME";
+    pub const ENV_MDS_HOSTNAME: &'static str = "CURVINE_MDS_HOSTNAME";
     pub const ENV_WORKER_HOSTNAME: &'static str = "CURVINE_WORKER_HOSTNAME";
     pub const ENV_CLIENT_HOSTNAME: &'static str = "CURVINE_CLIENT_HOSTNAME";
     pub const ENV_TRANSFER_HOSTNAME: &'static str = "CURVINE_TRANSFER_HOSTNAME";
     pub const ENV_CONF_FILE: &'static str = "CURVINE_CONF_FILE";
 
+    /// Loads through the unified pipeline:
+    /// `file(toml) → env(allowlist) → deserialize once → normalize →
+    /// validate → discovery.init → resolve_master_addrs`.
+    /// See [`crate::pipeline`] for layer semantics.
     pub fn from<T: AsRef<str>>(path: T) -> CommonResult<Self> {
-        let mut conf = Self::read(path)?;
+        let text = pipeline::read_file_text(path.as_ref())?;
+        validation::warn_unknown_keys(&text);
+        let doc = pipeline::build_document(&text, &[])?;
+        let mut conf: Self = doc.try_into()?;
         conf.normalize_whitespace();
-        conf.apply_hostname_overrides()?;
-        conf.master.init()?;
-        conf.client.init()?;
-        conf.fuse.init()?;
-        conf.job.init()?;
-        conf.transfer.init()?;
+        conf.validate()?;
+        conf.discovery.init(&conf.cluster_id)?;
         conf.resolve_master_addrs();
         Ok(conf)
     }
 
     /// Load only the configuration needed by the standalone Transfer service.
+    /// Same pipeline as [`Self::from`] with a transfer-scoped env layer
+    /// (only client/transfer hostnames resolve) and a reduced validation set.
     pub fn from_transfer<T: AsRef<str>>(path: T) -> CommonResult<Self> {
-        let mut conf = Self::read(path)?;
+        let text = pipeline::read_file_text(path.as_ref())?;
+        validation::warn_unknown_keys(&text);
+        let doc = pipeline::build_transfer_document(&text, &[])?;
+        let mut conf: Self = doc.try_into()?;
         conf.normalize_whitespace();
-        conf.apply_transfer_hostname_overrides()?;
-        conf.client.init()?;
-        conf.transfer.init()?;
+        conf.client.validate()?;
+        conf.transfer.validate()?;
+        conf.discovery.init(&conf.cluster_id)?;
         conf.resolve_master_addrs();
         Ok(conf)
     }
 
-    fn read<T: AsRef<str>>(path: T) -> CommonResult<Self> {
-        let str = try_err!(read_to_string(path.as_ref()));
-        Ok(try_err!(toml::from_str::<Self>(&str)))
-    }
-
     fn normalize_whitespace(&mut self) {
+        self.cluster_id = self.cluster_id.trim().to_string();
         self.net_interface = self.net_interface.trim().to_string();
         self.master.hostname = self.master.hostname.trim().to_string();
+        self.mds.hostname = self.mds.hostname.trim().to_string();
         self.journal.hostname = self.journal.hostname.trim().to_string();
         self.worker.hostname = self.worker.hostname.trim().to_string();
         self.client.hostname = self.client.hostname.trim().to_string();
@@ -149,90 +159,6 @@ impl ClusterConf {
             .iter()
             .map(|endpoint| endpoint.trim().to_string())
             .collect();
-    }
-
-    fn apply_hostname_overrides(&mut self) -> CommonResult<()> {
-        // Hostname resolution is either/or. A configured network interface
-        // (non-empty, e.g. `eth0`) wins: resolve its local IPv4 and apply it to
-        // every role hostname, ignoring the hostname env vars. An empty
-        // interface honors the per-role hostname env-var overrides instead.
-        if !self.net_interface.is_empty() {
-            let ip = Self::interface_ipv4(&self.net_interface)?;
-
-            // net_interface takes precedence over the CURVINE_*_HOSTNAME env
-            // vars. Warn (rather than silently ignore) when any of them is also
-            // set, so an operator who exported a hostname override but sees it
-            // have no effect can tell why. `from()` runs during config loading,
-            // before `Logger::init`, so the log macros would be dropped — use
-            // eprintln! to make the warning visible on stderr.
-            for env_key in [
-                Self::ENV_MASTER_HOSTNAME,
-                Self::ENV_WORKER_HOSTNAME,
-                Self::ENV_CLIENT_HOSTNAME,
-                Self::ENV_TRANSFER_HOSTNAME,
-            ] {
-                if let Ok(v) = env::var(env_key) {
-                    eprintln!(
-                        "[WARN] net_interface '{}' is set (resolved to {}); ignoring {}='{}'. \
-                         net_interface overrides the CURVINE_*_HOSTNAME env vars.",
-                        self.net_interface, ip, env_key, v
-                    );
-                }
-            }
-
-            self.master.hostname = ip.clone();
-            self.journal.hostname = ip.clone();
-            self.worker.hostname = ip.clone();
-            self.client.hostname = ip.clone();
-            self.transfer.hostname = ip;
-        } else {
-            if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
-                let hostname = v.trim().to_string();
-                self.master.hostname = hostname.clone();
-                self.journal.hostname = hostname;
-            }
-
-            // Apply worker hostname from environment variable (used by worker process)
-            if let Ok(v) = env::var(Self::ENV_WORKER_HOSTNAME) {
-                self.worker.hostname = v.trim().to_string();
-            }
-
-            // Apply client hostname from environment variable
-            if let Ok(v) = env::var(Self::ENV_CLIENT_HOSTNAME) {
-                self.client.hostname = v.trim().to_string();
-            }
-
-            if let Ok(v) = env::var(Self::ENV_TRANSFER_HOSTNAME) {
-                self.transfer.hostname = v.trim().to_string();
-            }
-        }
-
-        Ok(())
-    }
-
-    fn apply_transfer_hostname_overrides(&mut self) -> CommonResult<()> {
-        if !self.net_interface.is_empty() {
-            let ip = Self::interface_ipv4(&self.net_interface)?;
-            for env_key in [Self::ENV_CLIENT_HOSTNAME, Self::ENV_TRANSFER_HOSTNAME] {
-                if let Ok(v) = env::var(env_key) {
-                    eprintln!(
-                        "[WARN] net_interface '{}' is set (resolved to {}); ignoring {}='{}'. \\
-                         net_interface overrides the CURVINE_*_HOSTNAME env vars.",
-                        self.net_interface, ip, env_key, v
-                    );
-                }
-            }
-            self.client.hostname = ip.clone();
-            self.transfer.hostname = ip;
-        } else {
-            if let Ok(v) = env::var(Self::ENV_CLIENT_HOSTNAME) {
-                self.client.hostname = v.trim().to_string();
-            }
-            if let Ok(v) = env::var(Self::ENV_TRANSFER_HOSTNAME) {
-                self.transfer.hostname = v.trim().to_string();
-            }
-        }
-        Ok(())
     }
 
     fn resolve_master_addrs(&mut self) {
@@ -459,26 +385,19 @@ impl ClusterConf {
         Ok(toml::to_string_pretty(self)?)
     }
 
-    /// Resolve the local IPv4 address bound to the named network interface
-    /// (e.g. `eth0`).
+    /// Resolve the local IPv4 address bound to the named network interface.
     ///
-    /// Enumerates the host's interface addresses via `getifaddrs(3)` and returns
-    /// the first IPv4 address whose interface name matches `interface`. Returns
-    /// an error if the interface does not exist or has no IPv4 address assigned
-    /// (an IPv6-only interface yields no match).
+    /// Returns the first IPv4 address of the named interface (`eth0`-style name on Unix,
+    /// adapter friendly name on Windows), or an error if it has none.
     pub fn interface_ipv4<T: AsRef<str>>(interface: T) -> CommonResult<String> {
         let interface = interface.as_ref();
-        let addrs = try_err!(getifaddrs());
+        let addrs = try_err!(if_addrs::get_if_addrs());
         for ifaddr in addrs {
-            if ifaddr.interface_name != interface {
+            if ifaddr.name != interface {
                 continue;
             }
-            // Only entries carrying an address are relevant; an interface can
-            // also surface broadcast/netmask-only rows we must skip.
-            if let Some(address) = ifaddr.address {
-                if let Some(sin) = address.as_sockaddr_in() {
-                    return Ok(sin.ip().to_string());
-                }
+            if let IpAddr::V4(v4) = ifaddr.ip() {
+                return Ok(v4.to_string());
             }
         }
         err_box!("no IPv4 address found on network interface '{}'", interface)
@@ -494,6 +413,7 @@ impl Default for ClusterConf {
             cluster_id: "curvine".to_string(),
             net_interface: String::new(),
             master: Default::default(),
+            mds: Default::default(),
             journal: Default::default(),
             worker: Default::default(),
             fault_injection: Default::default(),
@@ -503,6 +423,7 @@ impl Default for ClusterConf {
             job: Default::default(),
             transfer: Default::default(),
             cli: Default::default(),
+            discovery: Default::default(),
         }
     }
 }
@@ -519,16 +440,62 @@ mod tests {
     use crate::RaftPeer;
     use curvine_runtime::common::Utils;
 
-    // The loopback interface is present on every supported host and always
-    // carries 127.0.0.1, so it is a stable target for the happy path.
+    struct EnvVarsGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvVarsGuard {
+        fn unset(keys: &'static [&'static str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|key| {
+                    let value = std::env::var_os(key);
+                    std::env::remove_var(key);
+                    (*key, value)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvVarsGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_whitespace_trims_cluster_id() {
+        let mut conf = ClusterConf {
+            cluster_id: " curvine ".to_string(),
+            ..Default::default()
+        };
+
+        conf.normalize_whitespace();
+
+        assert_eq!(conf.cluster_id, "curvine");
+    }
+
+    // Discover the loopback interface by its 127.0.0.1 address instead of
+    // hard-coding `lo`: on Windows if-addrs reports the adapter friendly name
+    // (locale-dependent), so the interface name differs across platforms.
+    fn loopback_name() -> String {
+        if_addrs::get_if_addrs()
+            .expect("failed to enumerate network interfaces")
+            .into_iter()
+            .find(|ifaddr| ifaddr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .expect("a loopback interface carrying 127.0.0.1 must exist")
+            .name
+    }
+
     #[test]
     fn interface_ipv4_resolves_loopback() {
-        #[cfg(target_os = "macos")]
-        let loopback = "lo0";
-        #[cfg(not(target_os = "macos"))]
-        let loopback = "lo";
+        let loopback = loopback_name();
 
-        let ip = ClusterConf::interface_ipv4(loopback)
+        let ip = ClusterConf::interface_ipv4(&loopback)
             .expect("loopback interface must resolve to an IPv4 address");
         assert_eq!(ip, "127.0.0.1");
     }
@@ -580,6 +547,13 @@ mod tests {
 
     #[test]
     fn trims_whitespace_in_hostname_config() {
+        const HOSTNAME_ENV_KEYS: &[&str] = &[
+            ClusterConf::ENV_MASTER_HOSTNAME,
+            ClusterConf::ENV_WORKER_HOSTNAME,
+            ClusterConf::ENV_CLIENT_HOSTNAME,
+            ClusterConf::ENV_TRANSFER_HOSTNAME,
+        ];
+        let _hostname_env = EnvVarsGuard::unset(HOSTNAME_ENV_KEYS);
         let path = std::env::temp_dir().join(format!(
             "curvine-trim-conf-{}-{}.toml",
             std::process::id(),
@@ -679,7 +653,79 @@ mod tests {
         let conf = ClusterConf::from(path).unwrap();
 
         assert_eq!(conf.master.rpc_port, ClusterConf::DEFAULT_MASTER_PORT);
+        assert!(!conf.mds.enabled);
         assert!(!conf.client.master_addrs.is_empty());
+    }
+
+    #[test]
+    fn legacy_config_without_mds_uses_disabled_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-legacy-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                cluster_id = "legacy"
+
+                [master]
+            "#,
+        )
+        .unwrap();
+        let conf = ClusterConf::from(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!conf.mds.enabled);
+        assert_eq!(conf.mds.rpc_port, crate::MdsConf::DEFAULT_RPC_PORT);
+        assert_eq!(conf.mds.web_port, crate::MdsConf::DEFAULT_WEB_PORT);
+    }
+
+    #[test]
+    fn disabled_mds_skips_validation() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-disabled-mds-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [mds]
+                enabled = false
+                hostname = " "
+                rpc_port = 0
+            "#,
+        )
+        .unwrap();
+        let conf = ClusterConf::from(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!conf.mds.enabled);
+    }
+
+    #[test]
+    fn enabled_mds_is_validated() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-enabled-mds-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [mds]
+                enabled = true
+                rpc_port = 0
+            "#,
+        )
+        .unwrap();
+        let err = ClusterConf::from(path.to_str().unwrap())
+            .expect_err("enabled MDS must validate its configuration")
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(err.contains("mds.rpc_port must be greater than zero"));
     }
 
     #[test]
@@ -707,24 +753,87 @@ mod tests {
         assert!(!conf.client.master_addrs.is_empty());
     }
 
+    // Full-profile real-path check: ClusterConf::from() itself (not a
+    // re-implementation of its stages) must resolve every role hostname
+    // (including MDS) from net_interface when set in the file, overriding
+    // file-configured hostnames.
+    #[test]
+    fn from_resolves_all_hostnames_via_net_interface() {
+        let loopback = loopback_name();
+
+        let path = std::env::temp_dir().join(format!(
+            "curvine-full-nic-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+                net_interface = "{loopback}"
+
+                [master]
+                hostname = "file-master"
+
+                [worker]
+                hostname = "file-worker"
+
+                [client]
+                hostname = "file-client"
+
+                [transfer]
+                hostname = "file-transfer"
+            "#
+            ),
+        )
+        .unwrap();
+
+        let conf = ClusterConf::from(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(conf.net_interface, loopback);
+        assert_eq!(conf.master.hostname, "127.0.0.1");
+        assert_eq!(conf.mds.hostname, "127.0.0.1");
+        assert_eq!(conf.journal.hostname, "127.0.0.1");
+        assert_eq!(conf.worker.hostname, "127.0.0.1");
+        assert_eq!(conf.client.hostname, "127.0.0.1");
+        assert_eq!(conf.transfer.hostname, "127.0.0.1");
+    }
+
     #[test]
     fn transfer_net_interface_keeps_master_address() {
-        #[cfg(target_os = "macos")]
-        let loopback = "lo0";
-        #[cfg(not(target_os = "macos"))]
-        let loopback = "lo";
+        let loopback = loopback_name();
 
-        let mut conf = ClusterConf {
-            net_interface: loopback.to_string(),
-            ..Default::default()
-        };
-        conf.master.hostname = "cv-master".to_string();
-        conf.journal.journal_addrs.clear();
+        // Transfer-scoped env layer resolves only client/transfer hostnames
+        // from the NIC; master/journal entries keep their file values, so the
+        // derived client.master_addrs still point at the master.
+        let path = std::env::temp_dir().join(format!(
+            "curvine-transfer-nic-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+                net_interface = "{loopback}"
 
-        conf.apply_transfer_hostname_overrides().unwrap();
-        conf.resolve_master_addrs();
+                [master]
+                hostname = "cv-master"
+
+                [journal]
+                journal_addrs = []
+            "#
+            ),
+        )
+        .unwrap();
+
+        let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
 
         assert_eq!(conf.master.hostname, "cv-master");
+        assert_eq!(conf.client.hostname, "127.0.0.1");
+        assert_eq!(conf.transfer.hostname, "127.0.0.1");
         assert_eq!(conf.client.master_addrs[0].hostname, "cv-master");
     }
 }

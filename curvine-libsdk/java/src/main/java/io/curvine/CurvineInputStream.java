@@ -17,8 +17,6 @@ package io.curvine;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
-import javax.annotation.Nonnull;
-
 import org.apache.hadoop.fs.FSExceptionMessages;
 import org.apache.hadoop.fs.FSInputStream;
 import org.apache.hadoop.fs.FileSystem;
@@ -59,13 +57,15 @@ public class CurvineInputStream extends FSInputStream {
     }
 
     @Override
-    public int read(@Nonnull byte[] buf) throws IOException {
+    public int read(byte[] buf) throws IOException {
         checkClosed();
         return read(buf, 0, buf.length);
     }
 
     @Override
-    public int read(@Nonnull byte[] buf, int offset, int length) throws IOException {
+    public int read(byte[] buf, int offset, int length) throws IOException {
+        checkClosed();
+
         if (length == 0) {
             return 0;
         } else if (pos < 0) {
@@ -73,8 +73,6 @@ public class CurvineInputStream extends FSInputStream {
         } else if (pos >= fileSize) {
             return -1;
         }
-
-        checkClosed();
 
         if (buf.length - offset < length) {
             throw new IndexOutOfBoundsException(

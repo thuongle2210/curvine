@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// C++/CXX SDK links LibFilesystem with the same deep async layout queries.
+#![recursion_limit = "512"]
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod cxx_compat;
+
 pub use curvine_sdk_core::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
 
 #[cfg(feature = "rust-sdk")]

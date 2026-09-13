@@ -18,7 +18,7 @@ use crate::worker::storage::{
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{CommonError, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo};
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -168,27 +168,64 @@ impl BlockStore {
         let started = Instant::now();
         let plan = reservation.prepare(block.len);
         self.observe_file_layout_operation("finalize", started.elapsed());
-        let result = match plan {
-            Ok(plan) => self.with_dataset_write("finalize", |state| {
-                state.publish_file_finalize(&reservation, plan)
-            }),
-            Err(error) => Err(error),
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                if error.to_string().contains("length mismatch") {
+                    // Deterministic mismatch: retrying can never succeed, so
+                    // abort the block instead of looping forever.
+                    if let Err(abort) =
+                        self.with_dataset_write("finalize", |state| state.abort_block(block))
+                    {
+                        log::error!(
+                            "failed to abort block {} after prepare error {}: {}; rollback to Writing",
+                            block.id,
+                            error,
+                            abort
+                        );
+                        self.rollback_finalize_reservation(block.id, &abort, |state| {
+                            state.rollback_file_finalize(&reservation)
+                        });
+                    }
+                } else {
+                    // Transient failure: release the reservation so the block
+                    // returns to Writing and finalize can be retried.
+                    self.rollback_finalize_reservation(block.id, &error, |state| {
+                        state.rollback_file_finalize(&reservation)
+                    });
+                }
+                return Err(error);
+            }
         };
-        match result {
+
+        match self.with_dataset_write("finalize", |state| {
+            state.publish_file_finalize(&reservation, plan)
+        }) {
             Ok(meta) => Ok(meta),
             Err(error) => {
-                if let Err(rollback) = self.with_dataset_write("finalize", |state| {
+                self.rollback_finalize_reservation(block.id, &error, |state| {
                     state.rollback_file_finalize(&reservation)
-                }) {
-                    log::error!(
-                        "failed to roll back block {} finalization after {}: {}",
-                        block.id,
-                        error,
-                        rollback
-                    );
-                }
+                });
                 Err(error)
             }
+        }
+    }
+
+    /// Roll back a finalize reservation after a failed prepare or publish.
+    /// Failures are logged while the caller keeps the original error.
+    fn rollback_finalize_reservation(
+        &self,
+        block_id: i64,
+        reason: &CommonError,
+        rollback: impl FnOnce(&mut BlockDataset) -> CommonResult<()>,
+    ) {
+        if let Err(failed) = self.with_dataset_write("finalize", rollback) {
+            log::error!(
+                "failed to roll back block {} finalization after {}: {}",
+                block_id,
+                reason,
+                failed
+            );
         }
     }
 
@@ -237,11 +274,32 @@ impl BlockStore {
         off: i64,
         logical_len: i64,
     ) -> CommonResult<(BlockMeta, BlockReadContext)> {
+        self.open_reader_by_id_inner(id, off, Some(logical_len))
+    }
+
+    /// Opens the currently readable generation using its stored metadata length
+    /// as the logical read boundary. This is intended for internal block copies
+    /// that do not have a client-provided logical length.
+    pub fn open_reader_by_id_at_stored_len(
+        &self,
+        id: i64,
+        off: i64,
+    ) -> CommonResult<(BlockMeta, BlockReadContext)> {
+        self.open_reader_by_id_inner(id, off, None)
+    }
+
+    fn open_reader_by_id_inner(
+        &self,
+        id: i64,
+        off: i64,
+        logical_len: Option<i64>,
+    ) -> CommonResult<(BlockMeta, BlockReadContext)> {
         let state = self.read()?;
         let meta = state
             .get_readable_block(id)
             .ok_or_else(|| curvine_core_error::err_msg!(format!("block {} not exists", id)))?
             .clone();
+        let logical_len = logical_len.unwrap_or_else(|| meta.len());
         let (layout, dir) = state.layout_for(&meta)?;
         let reader = layout.open_reader(&dir, &meta, off, logical_len)?;
         Ok((meta, reader))
@@ -347,8 +405,6 @@ mod tests {
     use curvine_io::DataSlice;
     use curvine_runtime::common::FileUtils;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Instant;
@@ -385,31 +441,22 @@ mod tests {
         Ok(())
     }
 
-    struct DeleteDenied {
-        parent: PathBuf,
-        permissions: std::fs::Permissions,
-    }
-
-    impl Drop for DeleteDenied {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.parent, self.permissions.clone());
-        }
-    }
-
-    fn deny_block_delete(store: &BlockStore) -> CommonResult<DeleteDenied> {
+    fn finalized_block(store: &BlockStore) -> CommonResult<()> {
         let mut block = ExtendedBlock::with_id(1);
         block.len = 100;
-        let meta = finalize_block(store, &block)?;
-        let path = store.short_circuit(&meta)?.unwrap();
-        let parent = PathBuf::from(path).parent().unwrap().to_path_buf();
-        let permissions = std::fs::metadata(&parent)?.permissions();
-        let mut readonly = permissions.clone();
-        readonly.set_mode(0o500);
-        std::fs::set_permissions(&parent, readonly)?;
-        Ok(DeleteDenied {
-            parent,
-            permissions,
-        })
+        finalize_block(store, &block)?;
+        Ok(())
+    }
+
+    fn replace_block_file_with_non_empty_dir(store: &BlockStore) -> CommonResult<String> {
+        let meta = store.get_block(1)?;
+        let path = store
+            .short_circuit(&meta)?
+            .expect("file layout must expose a local path");
+        FileUtils::delete_path(&path, false)?;
+        std::fs::create_dir(&path)?;
+        std::fs::write(std::path::Path::new(&path).join("child"), b"data")?;
+        Ok(path)
     }
 
     #[test]
@@ -443,25 +490,38 @@ mod tests {
     #[test]
     fn async_remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
         let store = create_store("deallocate-error")?;
-        let _delete_denied = deny_block_delete(&store)?;
+        finalized_block(&store)?;
+        let path = replace_block_file_with_non_empty_dir(&store)?;
         store.read()?.increment_blocks_to_delete();
 
         let result = store.async_remove_block(1);
         assert!(result.is_err());
-        let state = store.read()?;
-        assert!(state.get_block(1).is_some());
-        assert_eq!(state.num_blocks_to_delete(), 0);
+        {
+            let state = store.read()?;
+            assert!(state.get_block(1).is_some());
+            assert_eq!(state.num_blocks_to_delete(), 0);
+        }
+
+        FileUtils::delete_path(path, true)?;
+        store.read()?.increment_blocks_to_delete();
+        assert!(store.async_remove_block(1)?.is_some());
+        assert!(store.read()?.get_block(1).is_none());
         Ok(())
     }
 
     #[test]
     fn remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
         let store = create_store("remove-deallocate-error")?;
-        let _delete_denied = deny_block_delete(&store)?;
+        finalized_block(&store)?;
+        let path = replace_block_file_with_non_empty_dir(&store)?;
 
         let result = store.remove_block(1);
         assert!(result.is_err());
         assert!(store.read()?.get_block(1).is_some());
+
+        FileUtils::delete_path(path, true)?;
+        store.remove_block(1)?;
+        assert!(store.read()?.get_block(1).is_none());
         Ok(())
     }
 
@@ -543,6 +603,65 @@ mod tests {
     }
 
     #[test]
+    fn failed_rewrite_finalize_with_shorter_length_restores_committed_block() -> CommonResult<()> {
+        let store = create_store_with_capacity("rewrite-shrink-abort", "16MB")?;
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let finalized = finalize_block(&store, &block)?;
+        assert!(finalized.is_final());
+        let available = store.read()?.available();
+
+        let rewriting = store.open_block(&block)?;
+        assert_eq!(rewriting.state(), &BlockState::Writing);
+
+        block.len = 20;
+        let error = store.finalize_block(&block).unwrap_err();
+        assert!(
+            error.to_string().contains("length mismatch"),
+            "expected a length mismatch prepare failure, got: {error}"
+        );
+
+        let restored = store.get_block(block.id)?;
+        assert!(restored.is_final());
+        assert_eq!(restored.len(), 50);
+        let active_path = store
+            .short_circuit(&restored)?
+            .expect("file layout must expose a local path");
+        assert_eq!(std::fs::metadata(&active_path)?.len(), 50);
+
+        let (_, dir) = store.read()?.layout_for(&restored)?;
+        let staging = BlockMeta::new(block.id, block.len, &dir);
+        let staging_path = FileLayout::block_path(&dir, &staging)?;
+        assert!(!staging_path.exists());
+        assert_eq!(store.read()?.available(), available);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_first_write_finalize_with_length_mismatch_aborts_block() -> CommonResult<()> {
+        let store = create_store_with_capacity("first-write-abort", "16MB")?;
+        let available = store.read()?.available();
+
+        let block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = store.open_block(&block)?;
+        assert_eq!(writing.state(), &BlockState::Writing);
+        let staging_path = store
+            .short_circuit(&writing)?
+            .expect("file layout must expose a local path");
+        write_block(&staging_path, 30)?;
+
+        let error = store.finalize_block(&block).unwrap_err();
+        assert!(
+            error.to_string().contains("length mismatch"),
+            "expected a length mismatch prepare failure, got: {error}"
+        );
+
+        assert!(store.get_block(block.id).is_err());
+        assert!(!std::path::Path::new(&staging_path).exists());
+        assert_eq!(store.read()?.available(), available);
+        Ok(())
+    }
+
+    #[test]
     fn finalizing_new_block_remains_reportable_and_readable() -> CommonResult<()> {
         let store = create_store_with_capacity("finalizing-report", "16MB")?;
         let block = ExtendedBlock::with_mem(1, "1MB")?;
@@ -605,12 +724,24 @@ mod tests {
             .expect("rewrite finalize must reserve");
         let plan = reservation.prepare(block.len)?;
 
-        let (_, mut committed_reader) = store.open_reader_by_id(block.id, 0, block.len)?;
+        let (_, mut committed_reader) = store.open_reader_by_id_at_stored_len(block.id, 0)?;
         store.write()?.publish_file_finalize(&reservation, plan)?;
         assert_eq!(read_bytes(&mut committed_reader, 4)?, b"old!");
 
-        let (_, mut published_reader) = store.open_reader_by_id(block.id, 0, block.len)?;
+        let (_, mut published_reader) = store.open_reader_by_id_at_stored_len(block.id, 0)?;
         assert_eq!(read_bytes(&mut published_reader, 4)?, b"new!");
+        Ok(())
+    }
+
+    #[test]
+    fn stored_len_reader_reads_finalized_block() -> CommonResult<()> {
+        let store = create_store_with_capacity("stored-len-reader", "16MB")?;
+        let block = ExtendedBlock::with_mem(1, "4B")?;
+        finalize_block(&store, &block)?;
+
+        let (meta, mut reader) = store.open_reader_by_id_at_stored_len(block.id, 0)?;
+        assert_eq!(meta.len(), block.len);
+        assert_eq!(read_bytes(&mut reader, block.len as i32)?, vec![0; 4]);
         Ok(())
     }
 

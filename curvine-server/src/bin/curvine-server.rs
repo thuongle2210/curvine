@@ -14,10 +14,11 @@
 
 use clap::Parser;
 use curvine_alloc as _;
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, ConfigLoader};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_data_transfer::transfer::TransferServer;
 use curvine_master::master::Master;
+use curvine_mds::Mds;
 use curvine_runtime::common::{LocalTime, Utils};
 use curvine_sys::version;
 use curvine_worker::Worker;
@@ -57,6 +58,11 @@ fn main() -> CommonResult<()> {
             worker.block_on_start()?;
         }
 
+        ServiceType::Mds => {
+            let mds = Mds::with_conf(conf)?;
+            mds.block_on_start()?;
+        }
+
         ServiceType::Transfer => {
             let transfer = TransferServer::with_conf(conf)?;
             transfer.block_on_start()?;
@@ -86,6 +92,7 @@ impl ServerArgs {
         match self.service.to_lowercase().as_str() {
             "master" => "master",
             "worker" => "worker",
+            "mds" => "mds",
             "transfer" => "data-transfer",
             _ => "server",
         }
@@ -96,28 +103,69 @@ impl ServerArgs {
         match service.as_str() {
             "master" => Ok(ServiceType::Master),
             "worker" => Ok(ServiceType::Worker),
+            "mds" => Ok(ServiceType::Mds),
             "transfer" => Ok(ServiceType::Transfer),
             v => err_box!("Unsupported service type: {}", v),
         }
     }
 
     pub fn get_conf(&self, service: &ServiceType) -> CommonResult<ClusterConf> {
-        match service {
-            ServiceType::Transfer => ClusterConf::from_transfer(&self.conf),
-            ServiceType::Master | ServiceType::Worker => ClusterConf::from(&self.conf),
-        }
+        // Unified discovery: `--conf` > CURVINE_CONF_FILE > well-known
+        // locations (launch scripts export the env var; bare local runs fall
+        // back to ./conf/curvine-cluster.toml).
+        let found = ConfigLoader::discover(Some(&self.conf)).ok_or_else(
+            || -> curvine_core_error::CommonError {
+                format!(
+                    "no configuration file found: pass --conf or set {}, or place \
+                     {} in {{./, ./conf/, ~/.curvine/, $CURVINE_HOME/conf/}}",
+                    ClusterConf::ENV_CONF_FILE,
+                    ConfigLoader::DEFAULT_FILE_NAME
+                )
+                .into()
+            },
+        )?;
+        println!("Loading config from {} ({})", found.as_str(), found.source);
+
+        let load = match service {
+            ServiceType::Transfer => ClusterConf::from_transfer,
+            ServiceType::Master | ServiceType::Worker | ServiceType::Mds => ClusterConf::from,
+        };
+        load(found.as_str())
     }
 }
 
 pub enum ServiceType {
     Master,
     Worker,
+    Mds,
     Transfer,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let value = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.value.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn version_json_accepts_service_component() {
@@ -136,5 +184,36 @@ mod tests {
 
         assert!(args.version_json);
         assert_eq!(args.component_name(), "server");
+    }
+
+    #[test]
+    fn get_conf_loads_from_discovered_config() {
+        let _master_hostname = EnvVarGuard::unset(ClusterConf::ENV_MASTER_HOSTNAME);
+        let tmpdir = std::env::temp_dir().join(format!("cv-test-srv-conf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(tmpdir.join("conf")).unwrap();
+        let conf_path = tmpdir.join("conf").join(ConfigLoader::DEFAULT_FILE_NAME);
+        std::fs::write(&conf_path, "[master]\nhostname = \"test-master\"\n").unwrap();
+
+        let args = ServerArgs::try_parse_from([
+            "curvine-server",
+            "--conf",
+            conf_path.to_str().unwrap(),
+            "--service",
+            "master",
+        ])
+        .expect("parse server args");
+        let conf = args.get_conf(&ServiceType::Master).unwrap();
+        assert_eq!(conf.master.hostname, "test-master");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn accepts_mds_service() {
+        let args = ServerArgs::try_parse_from(["curvine-server", "--service", "mds"])
+            .expect("mds service should parse");
+
+        assert!(matches!(args.get_service().unwrap(), ServiceType::Mds));
+        assert_eq!(args.component_name(), "mds");
     }
 }
