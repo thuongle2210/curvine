@@ -22,6 +22,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.IOException;
 import java.time.Duration;
 
 public class LoadJobClientTest {
@@ -58,6 +59,29 @@ public class LoadJobClientTest {
         Assert.assertEquals("s3://bucket/a", request.getSourcePath());
         Assert.assertEquals("/mnt/a", request.getTargetPath());
         Assert.assertTrue(request.isOverwrite());
+    }
+
+    @Test
+    public void terminalStateDetectionMatchesForceRetrySemantics() {
+        Assert.assertFalse(CurvineTransferClient.isTerminal(JobTaskStateProto.PENDING));
+        Assert.assertFalse(CurvineTransferClient.isTerminal(JobTaskStateProto.LOADING));
+        Assert.assertFalse(CurvineTransferClient.isTerminal(JobTaskStateProto.UNKNOWN));
+        Assert.assertTrue(CurvineTransferClient.isTerminal(JobTaskStateProto.COMPLETED));
+        Assert.assertTrue(CurvineTransferClient.isTerminal(JobTaskStateProto.FAILED));
+        Assert.assertTrue(CurvineTransferClient.isTerminal(JobTaskStateProto.PARTIAL_SUCCESS));
+        Assert.assertTrue(CurvineTransferClient.isTerminal(JobTaskStateProto.CANCELED));
+    }
+
+    @Test
+    public void forceRetryRequiresTransferRouting() throws IOException {
+        try {
+            CurvineTransferClient.checkForceAllowed(true, false);
+            Assert.fail("expected force to require transfer routing");
+        } catch (IOException expected) {
+            Assert.assertTrue(expected.getMessage().contains("fs.cv.transfer.enabled=true"));
+        }
+        CurvineTransferClient.checkForceAllowed(false, false);
+        CurvineTransferClient.checkForceAllowed(true, true);
     }
 
     @Test
@@ -106,12 +130,75 @@ public class LoadJobClientTest {
                 .build());
         Assert.assertTrue(failed.isFinished());
         Assert.assertFalse(failed.isSuccessful());
+        Assert.assertFalse(failed.isPartialSuccess());
+
+        LoadJobStatus partial = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
+                .setJobId("job-3")
+                .setState(JobTaskStateProto.PARTIAL_SUCCESS)
+                .setSourcePath("s3://bucket/c")
+                .setTargetPath("/mnt/c")
+                .setProgress(JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(5)
+                        .setTotalSize(10)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.PARTIAL_SUCCESS.getNumber())
+                        .setMessage("partial")
+                        .build())
+                .build());
+        Assert.assertTrue(partial.isFinished());
+        Assert.assertFalse(partial.isSuccessful());
+        Assert.assertTrue(partial.isPartialSuccess());
+
+        LoadJobStatus running = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
+                .setJobId("job-4")
+                .setState(JobTaskStateProto.LOADING)
+                .setSourcePath("s3://bucket/d")
+                .setTargetPath("/mnt/d")
+                .setProgress(JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(1)
+                        .setTotalSize(10)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.LOADING.getNumber())
+                        .setMessage("running")
+                        .build())
+                .build());
+        Assert.assertFalse(running.isFinished());
+
+        LoadJobStatus unknownState = LoadJobStatus.fromProto(GetJobStatusResponse.newBuilder()
+                .setJobId("job-5")
+                .setState(JobTaskStateProto.UNKNOWN)
+                .setSourcePath("s3://bucket/e")
+                .setTargetPath("/mnt/e")
+                .setProgress(JobTaskProgressProto.newBuilder()
+                        .setLoadedSize(1)
+                        .setTotalSize(10)
+                        .setUpdateTime(1)
+                        .setState(JobTaskStateProto.UNKNOWN.getNumber())
+                        .setMessage("unknown-state")
+                        .build())
+                .build());
+        Assert.assertFalse(unknownState.isFinished());
+        Assert.assertFalse(unknownState.isSuccessful());
+        Assert.assertFalse(unknownState.isPartialSuccess());
     }
 
     @Test
     public void saturatingDeadlineDoesNotWrap() {
         long deadline = CurvineLoadClient.saturatingDeadlineNanos(Duration.ofNanos(Long.MAX_VALUE));
         Assert.assertEquals(Long.MAX_VALUE, deadline);
+    }
+
+    @Test
+    public void saturatingDeadlineHandlesDurationConversionOverflow() {
+        long deadline = CurvineLoadClient.saturatingDeadlineNanos(Duration.ofSeconds(Long.MAX_VALUE));
+        Assert.assertEquals(Long.MAX_VALUE, deadline);
+    }
+
+    @Test
+    public void saturatingDurationHandlesConversionOverflow() {
+        Assert.assertEquals(
+                Long.MAX_VALUE,
+                CurvineTransferClient.saturatingDurationNanos(Duration.ofSeconds(Long.MAX_VALUE)));
     }
 
     @Test

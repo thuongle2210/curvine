@@ -52,6 +52,10 @@ impl FuseError {
     pub(crate) fn errno(&self) -> i32 {
         self.errno
     }
+
+    pub fn is_enoent(&self) -> bool {
+        self.errno == libc::ENOENT
+    }
 }
 
 /// Normalize arbitrary errno input into a positive POSIX errno, falling back to `EIO`.
@@ -239,6 +243,13 @@ mod tests {
         let err: FuseError = FsError::file_too_large(1 << 60).into();
         assert_eq!(err.errno, libc::EFBIG);
         assert_eq!(errno_label(err.errno), "EFBIG");
+    }
+
+    #[test]
+    fn disk_out_of_space_maps_to_enospc() {
+        let err: FuseError = FsError::disk_out_of_space("strict free_ratio floor").into();
+        assert_eq!(err.errno, libc::ENOSPC);
+        assert_eq!(errno_label(err.errno), "ENOSPC");
     }
 
     #[test]

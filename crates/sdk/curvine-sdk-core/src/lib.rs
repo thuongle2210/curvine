@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// LibFilesystem::create/open monomorphize deep UnifiedFileSystem futures here.
+#![recursion_limit = "512"]
+
 mod core;
 
 mod lib_filesystem;
@@ -27,7 +30,9 @@ mod lib_fs_reader;
 pub use self::lib_fs_reader::LibFsReader;
 
 pub mod blocking_job {
-    pub use crate::core::job::{cancel_job, get_job_status, submit_load_job};
+    pub use crate::core::job::{
+        cancel_job, get_job_status, retry_job, submit_export_job, submit_load_job,
+    };
 }
 
 #[cfg(feature = "rust-sdk")]

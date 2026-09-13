@@ -38,10 +38,25 @@ For more detailed information, please refer to:
 - [Benchmark](https://curvineio.github.io/docs/category/benchmark)
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
 - [Best Practices](https://curvineio.github.io/docs/User-Manuals/best-practices)
+- [Curvine defeated the commercial version of Alluxio in the MLPerf benchmark tests](https://curvineio.github.io/blog/2026/09/07/mlperf-storage-curvine-vs-alluxio)
 - [Curvine passes LTP Test 1129 cases](https://curvineio.github.io/blog/2026/08/11/curvine-ltp-compatibility)
 - [Tiered KV cache for large LLMs on Amazon SageMaker HyperPod with Curvine](https://aws.amazon.com/cn/blogs/machine-learning/tiered-kv-cache-for-large-llms-on-amazon-sagemaker-hyperpod-with-curvine/)
 - [AI Agent Storage Selection: How Curvine Supports 10,000-Scale Agent Workloads on EKS](https://curvineio.github.io/blog/2026/07/07/ai-agent-storage-curvine-eks)
 
+## 🏗️ Architecture Design
+
+Curvine is a high-performance distributed cache file system built in Rust. It layers a distributed POSIX file system over cloud object storage, exposing full POSIX semantics upward while using object storage as the durable persistence layer downward. The architecture is organized into four cooperating layers, each color-coded in the diagram below:
+
+![curvine-architecture](images/curvine-architecture.png)
+
+- **Access Layer** — The workloads that use Curvine: AI Agent Pods (10,000+ stateful workloads), AI/big-data engines (training, inference, OLAP), and the native `cv` CLI.
+- **Protocol & Interface Layer** — Multiple access paths so existing tools work unmodified: POSIX FUSE (`curvine-fuse`), an S3-compatible gateway, an HDFS/UFS adapter, Java/Python/Rust SDKs, and a native Kubernetes CSI driver for PVC provisioning.
+- **Curvine Cluster Core** — The heart of the system, split into a **Control Plane** and a **Data Plane**:
+  - *Control Plane*: the **Master node** (Raft-replicated) manages metadata, namespace, scheduling, load balancing, and cluster coordination, alongside a **Web UI / API** for dashboarding, metrics, and management.
+  - *Data Plane*: a fleet of **Worker nodes** serving data from a multi-tier cache (Memory → SSD → HDD) with automatic hot-data promotion, eviction, and replication.
+- **Storage Layer** — The durable underbelly: multi-cloud object storage (AWS S3, Azure Blob, Google GCS, OSS, and any S3-compatible store such as MinIO or HDFS). Workers fetch from object storage on cache miss, and persist writes back to object storage for durability.
+
+**Data flow at a glance:** applications reach Curvine through any interface in the Protocol layer; metadata operations are routed to the Master via RPC, while data I/O is served directly by the Workers. On a cache miss, Workers fetch from — and persist back to — the underlying object storage. For Kubernetes workloads, the CSI driver mounts the FUSE file system directly as a PVC, so provisioning is just a `mkdir` on the shared namespace — millisecond-level, with no cloud control-plane API calls.
 
 ## 🚀 Core Features
 
@@ -68,20 +83,6 @@ For more detailed information, please refer to:
 - **Case 5 — OLAP Query Acceleration**: Accelerating compute-storage separated OLAP engines with a hot data cache.
 - **Case 6 — Multi-Cloud Data Caching**: A unified cache layer across multi-cloud object storage backends.
 
-## 🏗️ Architecture Design
-
-Curvine is a high-performance distributed cache file system built in Rust. It layers a distributed POSIX file system over cloud object storage, exposing full POSIX semantics upward while using object storage as the durable persistence layer downward. The architecture is organized into four cooperating layers, each color-coded in the diagram below:
-
-![curvine-architecture](images/curvine-architecture.png)
-
-- **Access Layer** — The workloads that use Curvine: AI Agent Pods (10,000+ stateful workloads), AI/big-data engines (training, inference, OLAP), and the native `cv` CLI.
-- **Protocol & Interface Layer** — Multiple access paths so existing tools work unmodified: POSIX FUSE (`curvine-fuse`), an S3-compatible gateway, an HDFS/UFS adapter, Java/Python/Rust SDKs, and a native Kubernetes CSI driver for PVC provisioning.
-- **Curvine Cluster Core** — The heart of the system, split into a **Control Plane** and a **Data Plane**:
-  - *Control Plane*: the **Master node** (Raft-replicated) manages metadata, namespace, scheduling, load balancing, and cluster coordination, alongside a **Web UI / API** for dashboarding, metrics, and management.
-  - *Data Plane*: a fleet of **Worker nodes** serving data from a multi-tier cache (Memory → SSD → HDD) with automatic hot-data promotion, eviction, and replication.
-- **Storage Layer** — The durable underbelly: multi-cloud object storage (AWS S3, Azure Blob, Google GCS, OSS, and any S3-compatible store such as MinIO or HDFS). Workers transparently persist on cache miss and read back on demand.
-
-**Data flow at a glance:** applications reach Curvine through any interface in the Protocol layer; metadata operations are routed to the Master via RPC, while data I/O is served directly by the Workers. On a cache miss, Workers fetch from — and persist back to — the underlying object storage. For Kubernetes workloads, the CSI driver mounts the FUSE file system directly as a PVC, so provisioning is just a `mkdir` on the shared namespace — millisecond-level, with no cloud control-plane API calls.
 
 ## 📊 Performance
 
@@ -141,3 +142,9 @@ Please read Curvine [Contribute guidelines](CONTRIBUTING.md)
 
 ## 📜 License
 Curvine is licensed under the ​**​[Apache License 2.0](LICENSE)​**.
+
+<a href="https://github.com/CurvineIO/curvine/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=CurvineIO/curvine" />
+</a>
+
+Made with [contrib.rocks](https://contrib.rocks/).

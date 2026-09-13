@@ -117,6 +117,60 @@ impl FsDir {
         self.op_id.next()
     }
 
+    /// Rebuild the absolute path of an inode by walking parent_id links.
+    ///
+    /// Used when an RPC addresses a file by inode id: the caller-supplied path may be
+    /// stale after rename, but journal / FileStatus / UFS export still need the current path.
+    pub fn get_inode_path(&self, inode_id: i64) -> FsResult<String> {
+        if inode_id == ROOT_INODE_ID {
+            return Ok("/".to_string());
+        }
+
+        let mut current_id = inode_id;
+        let mut components = Vec::new();
+        let mut visited = Vec::new();
+
+        while current_id != ROOT_INODE_ID {
+            if visited.contains(&current_id) {
+                return err_box!("Cycle detected while resolving inode path {}", inode_id);
+            }
+            visited.push(current_id);
+
+            let inode_view = match self.store.get_inode(current_id, None)? {
+                Some(inode_view) => inode_view,
+                None => {
+                    return err_ext!(FsError::file_not_found(format!(
+                        "inode_id={} (missing ancestor {})",
+                        inode_id, current_id
+                    )));
+                }
+            };
+
+            match &inode_view {
+                File(f) => {
+                    components.push(f.name.clone());
+                    current_id = f.parent_id();
+                }
+                Dir(d) => {
+                    components.push(d.name.clone());
+                    current_id = d.parent_id();
+                }
+                FileEntry(e) => {
+                    // Top-level inode CF should not store FileEntry rows; a truncated
+                    // name-only path would be unsafe for UFS mount selection.
+                    return err_box!(
+                        "Cannot resolve path for inode {}: unexpected FileEntry '{}'",
+                        inode_id,
+                        e.name
+                    );
+                }
+            }
+        }
+
+        components.reverse();
+        Ok(format!("/{}", components.join("/")))
+    }
+
     pub fn update_op_id(&self, op_id: u64) {
         if op_id > self.op_id.get() {
             self.op_id.set(op_id);
@@ -240,8 +294,16 @@ impl FsDir {
         let child = target.as_ref();
         let child_name = inp.name();
 
-        // Handle different types of nodes
-        parent.update_mtime(mtime);
+        // Handle different types of nodes.
+        // An already-expired parent TTL must keep its mtime: the checker can
+        // delete child files first, and bumping mtime would un-expire the
+        // directory for the rest of the same cleanup pass.
+        // Evaluate expiry at this delete's `mtime` so journal replay matches the
+        // leader. `expiration_ms` can fail (e.g. FileEntry); never fail the delete.
+        match parent.as_ref().expiration_ms() {
+            Ok(Some(exp)) if mtime > exp => {}
+            _ => parent.update_mtime(mtime),
+        }
 
         let del_res = match child {
             File(f) => {
@@ -1312,13 +1374,22 @@ impl FsDir {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
+        self.resize_inode(inp.path(), &mut inode, opts)
+    }
+
+    pub fn resize_inode(
+        &mut self,
+        audit_path: &str,
+        inode: &mut InodePtr,
+        opts: FileAllocOpts,
+    ) -> FsResult<DeleteResult> {
         let file = inode.as_file_mut()?;
 
         if file.len == opts.len {
             return Ok(DeleteResult::new());
         }
         let del_blocks = file.resize(opts.clone())?;
-        debug!("resize file {} success, opts: {:?}", inp.path(), opts);
+        debug!("resize file {} success, opts: {:?}", audit_path, opts);
 
         file.complete(file.len, &[], "", true)?;
         let mut del_res = DeleteResult::new();
@@ -1331,7 +1402,7 @@ impl FsDir {
 
         self.store.apply_complete_file(inode.as_ref(), &[])?;
         self.journal_writer
-            .log_complete_file(self, inp.path(), inode.as_file_ref()?, vec![])?;
+            .log_complete_file(self, audit_path, inode.as_file_ref()?, vec![])?;
 
         Ok(del_res)
     }
@@ -1343,6 +1414,16 @@ impl FsDir {
         workers: &[WorkerAddress],
     ) -> FsResult<ExtendedBlock> {
         let mut inode = try_option!(inp.get_last_inode(), "File {} not exists", inp.path());
+        self.assign_worker_inode(inp.path(), &mut inode, block_id, workers)
+    }
+
+    pub fn assign_worker_inode(
+        &mut self,
+        audit_path: &str,
+        inode: &mut InodePtr,
+        block_id: i64,
+        workers: &[WorkerAddress],
+    ) -> FsResult<ExtendedBlock> {
         let file = inode.as_file_mut()?;
 
         let block = file.search_block_mut_check(block_id)?;
@@ -1358,7 +1439,7 @@ impl FsDir {
         if res {
             self.store.apply_new_block(inode.as_ref(), &[])?;
             self.journal_writer
-                .log_add_block(self, inp.path(), inode.as_file_ref()?, vec![])?;
+                .log_add_block(self, audit_path, inode.as_file_ref()?, vec![])?;
         }
 
         Ok(block)

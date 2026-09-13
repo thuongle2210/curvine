@@ -479,10 +479,18 @@ impl MasterFilesystem {
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
+        self.file_status_by_id(path, None)
+    }
+
+    pub fn file_status_by_id<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+    ) -> FsResult<FileStatus> {
+        let path = path.as_ref();
         let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-        let status = fs_dir.file_status(&inp)?;
-        Ok(status)
+        let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        Ok(inode.to_file_status(path)?)
     }
 
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
@@ -1179,7 +1187,14 @@ impl MasterFilesystem {
             info.block_num += worker.block_num;
 
             match worker.status {
-                WorkerStatus::Live => info.live_workers.push(worker.clone()),
+                WorkerStatus::Live => {
+                    info.live_workers.push(worker.clone());
+                    // Only Live workers are eligible for new allocations, so the
+                    // allocatable view mirrors the allocation policy. Failed
+                    // storage dirs are already excluded from worker.capacity.
+                    info.allocatable_capacity += worker.capacity;
+                    info.allocatable_available += worker.available;
+                }
                 WorkerStatus::Blacklist => info.blacklist_workers.push(worker.clone()),
                 WorkerStatus::Decommission => info.decommission_workers.push(worker.clone()),
                 _ => (),
@@ -1700,6 +1715,15 @@ impl MasterFilesystem {
     }
 
     pub fn resize<T: AsRef<str>>(&self, path: T, opts: FileAllocOpts) -> FsResult<FileBlocks> {
+        self.resize_by_id(path, None, opts)
+    }
+
+    pub fn resize_by_id<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        opts: FileAllocOpts,
+    ) -> FsResult<FileBlocks> {
         opts.validate()?;
 
         let path = path.as_ref();
@@ -1711,14 +1735,14 @@ impl MasterFilesystem {
         } else {
             self.worker_manager.read().available_bytes()
         };
+
         let (del_res, inode_id) = {
             let mut fs_dir = self.fs_dir.write();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-            let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
+            let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
             let file = inode.as_file_ref()?;
             Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
             let inode_id = inode.id();
-            let del_res = fs_dir.resize(&inp, opts)?;
+            let del_res = fs_dir.resize_inode(path, &mut inode, opts)?;
             (del_res, inode_id)
         };
 
@@ -1726,15 +1750,13 @@ impl MasterFilesystem {
             self.worker_manager.write().remove_blocks(&del_res);
         }
 
-        let blocks = self.get_block_locations(path)?;
-        if blocks.status.id != inode_id {
-            return err_box!(
-                "Path {} resolved to different inode after resize, expected {}, got {}",
-                path,
-                inode_id,
-                blocks.status.id
-            );
-        }
+        let blocks = {
+            let fs_dir = self.fs_dir.read();
+            let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
+            let file = inode.as_file_ref()?;
+            let locs = self.get_block_locs(path, &fs_dir, file)?;
+            FileBlocks::new(inode.to_file_status(path)?, locs)
+        };
 
         Ok(blocks)
     }
@@ -1746,16 +1768,28 @@ impl MasterFilesystem {
         client_addr: ClientAddress,
         exclude_workers: Vec<u32>,
     ) -> FsResult<LocatedBlock> {
+        self.assign_worker_by_id(path, None, block, client_addr, exclude_workers)
+    }
+
+    pub fn assign_worker_by_id<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        block: ExtendedBlock,
+        client_addr: ClientAddress,
+        exclude_workers: Vec<u32>,
+    ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
 
-        let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
+        let choose_workers =
+            self.choose_worker_for_file(inode.as_file_ref()?, client_addr, exclude_workers)?;
         let has_spdk = {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
-        let block = fs_dir.assign_worker(inp, block.id, &choose_workers)?;
+        let block = fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers)?;
 
         Ok(LocatedBlock {
             block,
@@ -1879,5 +1913,232 @@ mod tests {
             "expected path in error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn get_inode_path_follows_parent_links() {
+        let fs = test_fs("get-inode-path");
+        let status = fs.create("/dir/file.log", true).unwrap();
+        let sync_fs_dir = fs.fs_dir();
+        let fs_dir = sync_fs_dir.read();
+        assert_eq!(fs_dir.get_inode_path(status.id).unwrap(), "/dir/file.log");
+    }
+
+    #[test]
+    fn get_inode_path_after_rename_returns_new_path() {
+        let fs = test_fs("get-inode-path-rename");
+        let status = fs.create("/dir/old.log", true).unwrap();
+        fs.rename("/dir/old.log", "/dir/new.log", RenameFlags::empty())
+            .unwrap();
+
+        let sync_fs_dir = fs.fs_dir();
+        let fs_dir = sync_fs_dir.read();
+        assert_eq!(fs_dir.get_inode_path(status.id).unwrap(), "/dir/new.log");
+    }
+
+    #[test]
+    fn file_status_by_id_after_rename_resolves_inode_keeps_request_path() {
+        // By-id status resolves the inode (id/name) but keeps the request path.
+        let fs = test_fs("file-status-by-id-stale-path");
+        let created = fs.create("/a/old.log", true).unwrap();
+        fs.rename("/a/old.log", "/a/new.log", RenameFlags::empty())
+            .unwrap();
+
+        let status = fs
+            .file_status_by_id("/a/old.log", Some(created.id))
+            .unwrap();
+        assert_eq!(status.id, created.id);
+        assert_eq!(status.path, "/a/old.log");
+        assert_eq!(status.name, "new.log");
+
+        // Path-based status still requires the live path.
+        let by_path = fs.file_status("/a/new.log").unwrap();
+        assert_eq!(by_path.id, created.id);
+        assert_eq!(by_path.path, "/a/new.log");
+
+        // Write path still journals/returns the request path (no hot-path rebuild).
+        let blocks = fs
+            .resize_by_id(
+                "/a/old.log",
+                Some(created.id),
+                FileAllocOpts::with_truncate(128),
+            )
+            .unwrap();
+        assert_eq!(blocks.status.id, created.id);
+        assert_eq!(blocks.status.path, "/a/old.log");
+        assert_eq!(blocks.status.name, "new.log");
+        assert_eq!(blocks.status.len, 128);
+    }
+
+    #[test]
+    fn file_status_by_id_missing_inode_returns_file_not_found() {
+        let fs = test_fs("file-status-missing-inode");
+        let missing_id = 9_999_999_i64;
+        let err = fs
+            .file_status_by_id("/missing.log", Some(missing_id))
+            .unwrap_err();
+        assert_file_not_found_roundtrip(&err);
+        assert!(
+            err.to_string()
+                .contains(&format!("inode_id={}", missing_id)),
+            "expected inode_id in error context, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn complete_file_by_id_keeps_request_path() {
+        let fs = test_fs("complete-by-id-stale-path");
+        let created = fs.create("/b/old.log", true).unwrap();
+        fs.rename("/b/old.log", "/b/new.log", RenameFlags::empty())
+            .unwrap();
+
+        let blocks = fs
+            .complete_file(
+                "/b/old.log",
+                Some(created.id),
+                64,
+                vec![],
+                "test-client",
+                true,
+                None,
+            )
+            .unwrap()
+            .expect("only_flush should return FileBlocks");
+
+        assert_eq!(blocks.status.id, created.id);
+        assert_eq!(blocks.status.path, "/b/old.log");
+        assert_eq!(blocks.status.name, "new.log");
+    }
+
+    fn worker_with_status(
+        id: u32,
+        status: WorkerStatus,
+        capacity: i64,
+        available: i64,
+    ) -> WorkerInfo {
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: id,
+                ..Default::default()
+            },
+            1,
+        );
+        worker.status = status;
+        worker.capacity = capacity;
+        worker.available = available;
+        worker
+    }
+
+    #[test]
+    fn filesystem_info_allocatable_only_counts_live_workers() {
+        // See issue #1460: statfs must report capacity eligible for new writes,
+        // i.e. only Live workers. Blacklist/Decommission workers must not
+        // contribute to the allocatable view (they still count toward the total
+        // physical capacity).
+        let fs = test_fs("allocatable-live-only");
+        fs.add_test_worker(worker_with_status(1, WorkerStatus::Live, 1000, 800));
+        fs.add_test_worker(worker_with_status(2, WorkerStatus::Blacklist, 2000, 1500));
+        fs.add_test_worker(worker_with_status(
+            3,
+            WorkerStatus::Decommission,
+            3000,
+            2500,
+        ));
+
+        let info = fs.filesystem_info().unwrap();
+
+        // Total physical capacity across all non-lost worker states.
+        assert_eq!(info.capacity, 6000, "total capacity should sum all workers");
+        assert_eq!(
+            info.available, 4800,
+            "total available should sum all workers"
+        );
+        assert_eq!(info.live_workers.len(), 1);
+        assert_eq!(info.blacklist_workers.len(), 1);
+        assert_eq!(info.decommission_workers.len(), 1);
+
+        // Allocatable view mirrors allocation eligibility: Live workers only.
+        assert_eq!(
+            info.allocatable_capacity, 1000,
+            "allocatable capacity must be Live workers only"
+        );
+        assert_eq!(
+            info.allocatable_available, 800,
+            "allocatable available must be Live workers only"
+        );
+    }
+
+    #[test]
+    fn filesystem_info_allocatable_excludes_failed_storage_dirs() {
+        // A Live worker with a healthy dir plus a failed dir: add_storage already
+        // skips failed dirs, so neither total nor allocatable capacity should
+        // include the failed dir's bytes.
+        let fs = test_fs("allocatable-excludes-failed");
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 10,
+                ..Default::default()
+            },
+            1,
+        );
+        worker.status = WorkerStatus::Live;
+        worker.add_storage(StorageInfo {
+            dir_id: 1,
+            storage_id: "healthy".into(),
+            failed: false,
+            capacity: 1000,
+            available: 800,
+            ..Default::default()
+        });
+        worker.add_storage(StorageInfo {
+            dir_id: 2,
+            storage_id: "failed".into(),
+            failed: true,
+            capacity: 500,
+            available: 400,
+            ..Default::default()
+        });
+        fs.add_test_worker(worker);
+
+        let info = fs.filesystem_info().unwrap();
+
+        assert_eq!(
+            info.capacity, 1000,
+            "failed dir must not count toward total"
+        );
+        assert_eq!(info.available, 800);
+        assert_eq!(info.allocatable_capacity, 1000);
+        assert_eq!(info.allocatable_available, 800);
+    }
+
+    #[test]
+    fn filesystem_info_allocatable_excludes_lost_workers() {
+        // Lost workers live in a separate map and must not contribute to either
+        // the total or the allocatable view. Insert a lost worker directly into
+        // the lost map (add_test_worker only touches the live map) and assert its
+        // capacity never leaks into aggregation.
+        let fs = test_fs("allocatable-excludes-lost");
+        fs.add_test_worker(worker_with_status(1, WorkerStatus::Live, 1000, 800));
+        fs.worker_manager
+            .write()
+            .worker_map
+            .lost_workers
+            .insert(99, worker_with_status(99, WorkerStatus::Lost, 9999, 9999));
+
+        let info = fs.filesystem_info().unwrap();
+
+        // The lost worker is reported but its bytes stay out of both views.
+        assert_eq!(info.lost_workers.len(), 1);
+        assert_eq!(
+            info.capacity, 1000,
+            "lost worker capacity must not leak into total"
+        );
+        assert_eq!(info.available, 800);
+        assert_eq!(
+            info.allocatable_capacity, 1000,
+            "lost worker capacity must not leak into allocatable"
+        );
+        assert_eq!(info.allocatable_available, 800);
     }
 }

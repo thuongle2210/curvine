@@ -14,6 +14,7 @@ How to use skills:
 
 Usage notes:
 - For Curvine project workflow tasks, prefer the cv-* skills listed in <available_skills> below
+- When exploring or locating code, read and follow [cv-codegraph](.agents/skills/cv-codegraph/SKILL.md) — prefer CodeGraph (`codegraph_explore` MCP or `codegraph explore` CLI) when `.codegraph/` exists or the MCP tool is available; **Read source files directly** after local edits or when explore reports stale index sync
 - User-installed global skills (e.g. ~/.cursor/skills/, ~/.claude/skills/) remain available when the agent tool exposes them
 - Do not invent or invoke project skills that are not listed in <available_skills>
 - Do not invoke a skill that is already loaded in your context
@@ -27,6 +28,12 @@ Usage notes:
 <skill>
 <name>cv-add-skills</name>
 <description>Add or update Curvine cv-* project skills under .agents/skills/, following naming and layout conventions, and sync the AGENTS.md registry. Use when creating a new cv skill, updating an existing cv skill structure, or registering skills after changes.</description>
+<location>project</location>
+</skill>
+
+<skill>
+<name>cv-codegraph</name>
+<description>Use CodeGraph for Curvine code exploration when the MCP tool or local index is already available; prefer it over repo-wide grep when locating or understanding code. Human one-time setup covers CLI install, MCP wiring, and indexing. Use when exploring the codebase, tracing call paths, or finding symbols.</description>
 <location>project</location>
 </skill>
 
@@ -56,7 +63,7 @@ Usage notes:
 
 <skill>
 <name>cv-submit-pr-review</name>
-<description>Perform a direct code review of a Curvine PR by reading the diff and changed files, analyzing correctness, safety, design, and performance impact on critical paths (data read/write, RPC message communication, metadata operations), and producing structured findings. Use when user asks to review a PR's code, do a code review, or check a PR before merge.</description>
+<description>Perform a direct code review of a Curvine PR against live base/head by reconstructing intent, reading tests first, mapping dirty crates, and checking correctness, safety, lifecycle, contracts, and performance on data I/O, RPC, and metadata paths. Use when user asks to review a PR's code, do a code review, or check a PR before merge.</description>
 <location>project</location>
 </skill>
 
@@ -75,6 +82,12 @@ Usage notes:
 <skill>
 <name>cv-tasks-breakdown</name>
 <description>Break a design or implementation plan into small, dependency-ordered tasks with test coverage per task, commit-sized deliverables, and sub-issue tracking. Use when user asks to decompose a plan, split a large feature, create a task breakdown, or prepare incremental commits for a complex change.</description>
+<location>project</location>
+</skill>
+
+<skill>
+<name>cv-test-report</name>
+<description>Publish Curvine full-chain daily test reports to the Hextra Hugo site at CurvineIO/test-reports, using a standard Markdown template with no environment or secret leakage. Use when the user asks to publish a test report, convert harness output to Markdown, or update CurvineIO/test-reports.</description>
 <location>project</location>
 </skill>
 

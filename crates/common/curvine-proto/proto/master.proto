@@ -104,6 +104,7 @@ message FreeResponse {
 
 message GetFileStatusRequest {
     required string path = 1;
+    optional int64 inode_id = 2;
 }
 
 message GetFileStatusResponse {
@@ -259,6 +260,11 @@ message GetFilesystemInfoResponse {
     repeated WorkerInfoProto decommission_workers = 13;
     repeated WorkerInfoProto lost_workers = 14;
 
+    // Capacity/available eligible for new writes (Live workers only). Absent
+    // on legacy masters; clients fall back to `capacity`/`available`.
+    optional int64 allocatable_capacity = 15 [default = 0];
+    optional int64 allocatable_available = 16 [default = 0];
+
     // Default compatibility contract offered by this master (handshake).
     // Cross-cutting protocol metadata on the reserved 1000+ range; legacy
     // masters omit it and clients treat the absence as a legacy peer.
@@ -334,6 +340,7 @@ message MetricsReportResponse {
 message FileResizeRequest {
     required string path = 1;
     required FileAllocOptsProto opts = 2;
+    optional int64 inode_id = 3;
 }
 
 message FileResizeResponse {
@@ -345,6 +352,7 @@ message AssignWorkerRequest {
     required ExtendedBlockProto block = 2;
     repeated uint32 exclude_workers = 3;
     required ClientAddressProto client_address = 4;
+    optional int64 inode_id = 5;
 }
 
 message AssignWorkerResponse {

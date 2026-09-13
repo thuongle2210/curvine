@@ -14,7 +14,6 @@
 
 package io.curvine;
 
-import io.curvine.bench.Utils;
 import io.curvine.proto.GetFilesystemInfoResponse;
 import io.curvine.proto.WorkerInfoProto;
 import org.apache.commons.lang3.StringUtils;
@@ -24,7 +23,10 @@ public class CurvineFsStat extends FsStatus {
     private final GetFilesystemInfoResponse info;
 
     public CurvineFsStat(GetFilesystemInfoResponse info) {
-        super(info.getCapacity(), info.getFsUsed(), info.getAvailable());
+        // super(...) must be the first statement, so the allocatable fallback
+        // and used derivation live in static helpers below. See the comment on
+        // allocatableCapacity/allocatableAvailable for the rationale.
+        super(allocatableCapacity(info), allocatableUsed(info), allocatableRemaining(info));
         this.info = info;
     }
 
@@ -57,12 +59,12 @@ public class CurvineFsStat extends FsStatus {
             builder.append("\n");
         }
 
-        builder.append(String.format("%20s: %s\n", "capacity", Utils.bytesToString(info.getCapacity())));
+        builder.append(String.format("%20s: %s\n", "capacity", CurvineJavaUtils.bytesToString(info.getCapacity())));
 
         String available = String.format(
                 "%20s: %s (%.2f%%)\n",
                 "available",
-                Utils.bytesToString(info.getAvailable()),
+                CurvineJavaUtils.bytesToString(info.getAvailable()),
                 getPercent(info.getAvailable(), info.getCapacity())
         );
         builder.append(available);
@@ -70,12 +72,25 @@ public class CurvineFsStat extends FsStatus {
         String used = String.format(
                 "%20s: %s (%.2f%%)\n",
                 "fs_used",
-                Utils.bytesToString(info.getFsUsed()),
+                CurvineJavaUtils.bytesToString(info.getFsUsed()),
                 getPercent(info.getFsUsed(), info.getCapacity())
         );
         builder.append(used);
 
-        builder.append(String.format("%20s: %s\n", "non_fs_used", Utils.bytesToString(info.getNonFsUsed())));
+        // Allocatable (writable) view: capacity/available eligible for new
+        // writes (Live workers only). Absent on legacy masters, so guard with
+        // hasAllocatableCapacity() to avoid printing a misleading 0.
+        if (info.hasAllocatableCapacity()) {
+            builder.append(String.format("%20s: %s\n", "allocatable_capacity", CurvineJavaUtils.bytesToString(info.getAllocatableCapacity())));
+            builder.append(String.format(
+                    "%20s: %s (%.2f%%)\n",
+                    "allocatable_available",
+                    CurvineJavaUtils.bytesToString(info.getAllocatableAvailable()),
+                    getPercent(info.getAllocatableAvailable(), info.getAllocatableCapacity())
+            ));
+        }
+
+        builder.append(String.format("%20s: %s\n", "non_fs_used", CurvineJavaUtils.bytesToString(info.getNonFsUsed())));
         builder.append(String.format("%20s: %s\n", "live_worker_num", info.getLiveWorkersCount()));
         builder.append(String.format("%20s: %s\n", "lost_worker_num", info.getLostWorkersCount()));
         builder.append(String.format("%20s: %s\n", "inode_dir_num", info.getInodeDirNum()));
@@ -94,8 +109,8 @@ public class CurvineFsStat extends FsStatus {
                     "%s:%s,%s/%s (%.2f%%)",
                     worker.getAddress().getHostname(),
                     worker.getAddress().getRpcPort(),
-                    Utils.bytesToString(worker.getAvailable()),
-                    Utils.bytesToString(worker.getCapacity()),
+                    CurvineJavaUtils.bytesToString(worker.getAvailable()),
+                    CurvineJavaUtils.bytesToString(worker.getCapacity()),
                     getPercent(worker.getAvailable(), worker.getCapacity())
             );
 
@@ -137,7 +152,7 @@ public class CurvineFsStat extends FsStatus {
                     "%s:%s  %s",
                     worker.getAddress().getHostname(),
                     worker.getAddress().getRpcPort(),
-                    Utils.bytesToString(worker.getCapacity())
+                    CurvineJavaUtils.bytesToString(worker.getCapacity())
             );
             builder.append(String.format("%s\n", str));
         }
@@ -153,7 +168,7 @@ public class CurvineFsStat extends FsStatus {
                     "%s:%s  %s",
                     worker.getAddress().getHostname(),
                     worker.getAddress().getRpcPort(),
-                    Utils.bytesToString(worker.getFsUsed())
+                    CurvineJavaUtils.bytesToString(worker.getFsUsed())
             );
             builder.append(String.format("%s\n", str));
         }
@@ -169,11 +184,40 @@ public class CurvineFsStat extends FsStatus {
                     "%s:%s  %s",
                     worker.getAddress().getHostname(),
                     worker.getAddress().getRpcPort(),
-                    Utils.bytesToString(worker.getAvailable())
+                    CurvineJavaUtils.bytesToString(worker.getAvailable())
             );
             builder.append(String.format("%s\n", str));
         }
 
         return builder.toString();
+    }
+
+    // The allocatable (writable) view: capacity/available eligible for new
+    // writes (Live workers only). Legacy masters omit tags 15/16; protobuf
+    // returns 0 for an absent optional int64 with default=0, so we must guard
+    // with hasAllocatableCapacity()/hasAllocatableAvailable() and fall back to
+    // the aggregate totals — otherwise a new client against an old master
+    // would report zero free space.
+    //
+    // Used is derived as Capacity - Remaining rather than info.getFsUsed()
+    // (which sums every non-lost worker, including Blacklist/Decommission).
+    // Capacity/Remaining are Live-only, so deriving Used keeps the FsStatus
+    // triple self-consistent (Used == Capacity - Remaining) even when
+    // non-writable workers still hold data — otherwise getUsed() could
+    // exceed getCapacity() - getRemaining() and report a misleading ratio.
+    // The master-reported total fs_used is still surfaced in simple().
+    // These are static so they can run before super(...) completes.
+    private static long allocatableCapacity(GetFilesystemInfoResponse info) {
+        return info.hasAllocatableCapacity() ? info.getAllocatableCapacity() : info.getCapacity();
+    }
+
+    private static long allocatableRemaining(GetFilesystemInfoResponse info) {
+        return info.hasAllocatableAvailable() ? info.getAllocatableAvailable() : info.getAvailable();
+    }
+
+    private static long allocatableUsed(GetFilesystemInfoResponse info) {
+        long capacity = allocatableCapacity(info);
+        long remaining = allocatableRemaining(info);
+        return Math.max(0, capacity - remaining);
     }
 }
