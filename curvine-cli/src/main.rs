@@ -263,6 +263,8 @@ mod tests {
             "/data",
             "--detail",
             "--policy-mismatch",
+            "--list-page-size",
+            "512",
         ])
         .expect("fsck command should parse");
 
@@ -272,6 +274,22 @@ mod tests {
         assert_eq!(command.path, "/data");
         assert!(command.detail);
         assert!(command.policy_mismatch);
+        assert_eq!(command.list_page_size, 512);
+    }
+
+    #[test]
+    fn fsck_list_page_size_defaults_and_rejects_zero() {
+        let args = CurvineArgs::try_parse_from(["curvine", "fsck", "/data"])
+            .expect("default fsck command should parse");
+        let Some(Commands::Fsck(command)) = args.command else {
+            panic!("expected fsck command");
+        };
+        assert_eq!(command.list_page_size, 256);
+
+        assert!(CurvineArgs::try_parse_from(
+            ["curvine", "fsck", "/data", "--list-page-size", "0",]
+        )
+        .is_err());
     }
 
     #[test]

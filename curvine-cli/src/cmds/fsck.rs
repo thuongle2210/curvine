@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 use std::sync::Arc;
 
-const LIST_PAGE_SIZE: usize = 256;
+const DEFAULT_LIST_PAGE_SIZE: usize = 256;
 
 #[derive(Parser, Debug)]
 pub struct FsckCommand {
@@ -22,6 +22,24 @@ pub struct FsckCommand {
     /// Show only blocks whose actual storage type differs from file policy
     #[clap(long)]
     pub policy_mismatch: bool,
+
+    /// Maximum directory entries requested per listing RPC
+    #[clap(
+        long,
+        default_value_t = DEFAULT_LIST_PAGE_SIZE,
+        value_parser = parse_positive_usize
+    )]
+    pub list_page_size: usize,
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| "must be a positive integer".to_string())?;
+    if value == 0 {
+        return Err("must be greater than 0".to_string());
+    }
+    Ok(value)
 }
 
 #[derive(Default)]
@@ -140,7 +158,7 @@ impl FsckCommand {
                     .list_options(
                         &path,
                         ListOptions {
-                            limit: Some(LIST_PAGE_SIZE),
+                            limit: Some(self.list_page_size),
                             start_after: start_after.clone(),
                         },
                     )
@@ -156,7 +174,7 @@ impl FsckCommand {
                     }
                 }
 
-                if entry_count < LIST_PAGE_SIZE {
+                if entry_count < self.list_page_size {
                     break;
                 }
             }
