@@ -138,11 +138,6 @@ impl WorkerMetrics {
             env.publish_metrics();
         }
 
-        #[cfg(feature = "spdk")]
-        if let Some(env) = curvine_storage_spdk::SpdkEnv::global_including_shutdown() {
-            env.publish_metrics();
-        }
-
         Metrics::text_output()
     }
 }
