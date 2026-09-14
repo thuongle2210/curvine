@@ -12,7 +12,9 @@ use std::sync::Arc;
 fn single_file_writers_persist_actual_storage_type() -> CommonResult<()> {
     let testing = Testing::builder().workers(1).build()?;
     let cluster = testing.start_cluster()?;
-    let conf = testing.get_active_cluster_conf()?;
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.storage_type = StorageType::Mem;
+    conf.client.storage_type_str = "mem".to_string();
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let local_fs = testing.get_fs(Some(rt.clone()), Some(conf.clone()))?;
 
@@ -24,6 +26,10 @@ fn single_file_writers_persist_actual_storage_type() -> CommonResult<()> {
     rt.block_on(async move {
         assert_actual_disk_location(&local_fs, &master_fs, "/actual-storage/local.data").await?;
         assert_actual_disk_location(&remote_fs, &master_fs, "/actual-storage/remote.data").await?;
+        assert_batch_actual_disk_locations(&local_fs, &master_fs, "/actual-storage/local-batch")
+            .await?;
+        assert_batch_actual_disk_locations(&remote_fs, &master_fs, "/actual-storage/remote-batch")
+            .await?;
         Ok(())
     })
 }
@@ -128,5 +134,34 @@ async fn assert_actual_disk_location(
         blocks.block_locs[0].locs[0].worker_id
     );
     assert_eq!(locations[0].storage_type, StorageType::Disk);
+    Ok(())
+}
+
+async fn assert_batch_actual_disk_locations(
+    fs: &CurvineFileSystem,
+    master_fs: &MasterFilesystem,
+    prefix: &str,
+) -> CommonResult<()> {
+    let paths = [
+        Path::from_str(format!("{prefix}-1.data"))?,
+        Path::from_str(format!("{prefix}-2.data"))?,
+    ];
+    fs.write_batch_string(&[
+        (paths[0].clone(), "batch-actual-storage-1"),
+        (paths[1].clone(), "batch-actual-storage-2"),
+    ])
+    .await?;
+
+    for path in &paths {
+        let blocks = fs.get_block_locations(path).await?;
+        assert_eq!(blocks.status.storage_policy.storage_type, StorageType::Mem);
+        assert_eq!(blocks.block_locs.len(), 1);
+        let locations = master_fs
+            .fs_dir
+            .read()
+            .get_block_locations(blocks.block_locs[0].block.id)?;
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].storage_type, StorageType::Disk);
+    }
     Ok(())
 }
