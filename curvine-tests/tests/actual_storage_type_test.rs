@@ -44,7 +44,7 @@ fn replicas_on_different_workers_persist_each_actual_storage_type() -> CommonRes
                 .worker
                 .data_dir
                 .iter()
-                .map(|path| format!("[{storage_type}:256MB]{path}"))
+                .map(|path| format!("[{storage_type}:512MB]{path}"))
                 .collect();
         })
         .build()?;
@@ -54,6 +54,8 @@ fn replicas_on_different_workers_persist_each_actual_storage_type() -> CommonRes
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.replicas = 2;
     conf.client.short_circuit = false;
+    conf.client.storage_type = StorageType::Mem;
+    conf.client.storage_type_str = "mem".to_string();
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
     let master_fs = cluster.get_active_master_fs();
@@ -100,6 +102,9 @@ fn replicas_on_different_workers_persist_each_actual_storage_type() -> CommonRes
             .collect::<HashMap<_, _>>();
 
         assert_eq!(actual_types, expected_types);
+
+        assert_batch_actual_worker_types(&fs, &master_fs, mem_worker_port, disk_worker_port)
+            .await?;
         Ok(())
     })
 }
@@ -162,6 +167,55 @@ async fn assert_batch_actual_disk_locations(
             .get_block_locations(blocks.block_locs[0].block.id)?;
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].storage_type, StorageType::Disk);
+    }
+    Ok(())
+}
+
+async fn assert_batch_actual_worker_types(
+    fs: &CurvineFileSystem,
+    master_fs: &MasterFilesystem,
+    mem_worker_port: u32,
+    disk_worker_port: u32,
+) -> CommonResult<()> {
+    let paths = [
+        Path::from_str("/actual-storage/mixed-batch-1.data")?,
+        Path::from_str("/actual-storage/mixed-batch-2.data")?,
+    ];
+    fs.write_batch_string(&[
+        (paths[0].clone(), "mixed-batch-storage-1"),
+        (paths[1].clone(), "mixed-batch-storage-2"),
+    ])
+    .await?;
+
+    for path in &paths {
+        let blocks = fs.get_block_locations(path).await?;
+        assert_eq!(blocks.status.storage_policy.storage_type, StorageType::Mem);
+        assert_eq!(blocks.block_locs.len(), 1);
+        assert_eq!(blocks.block_locs[0].locs.len(), 2);
+
+        let actual_types = master_fs
+            .fs_dir
+            .read()
+            .get_block_locations(blocks.block_locs[0].block.id)?
+            .into_iter()
+            .map(|location| (location.worker_id, location.storage_type))
+            .collect::<HashMap<_, _>>();
+        let expected_types = blocks.block_locs[0]
+            .locs
+            .iter()
+            .map(|address| {
+                let storage_type = if address.rpc_port == mem_worker_port {
+                    StorageType::Mem
+                } else if address.rpc_port == disk_worker_port {
+                    StorageType::Disk
+                } else {
+                    panic!("unexpected worker RPC port: {}", address.rpc_port);
+                };
+                (address.worker_id, storage_type)
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(actual_types, expected_types);
     }
     Ok(())
 }
