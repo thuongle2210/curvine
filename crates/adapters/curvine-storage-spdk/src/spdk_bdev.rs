@@ -536,6 +536,8 @@ impl SpdkBdev {
             bdev_inflight: self.inflight.clone(),
         };
         if self.io_channel.poller_tx.send(req).is_err() {
+            self.inflight
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
             return err_box!("SPDK poller thread is gone");
         }
         if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
@@ -721,7 +723,6 @@ impl Drop for SpdkBdev {
                 // Poison pointers so DmaBuf::drop is a no-op.
                 self.read_buf.ptr = std::ptr::null_mut();
                 self.write_buf.ptr = std::ptr::null_mut();
-                // TODO: leak qpair and handle on timeout because reusing a qpair with orphaned callbacks causes use after free.
                 break;
             }
             if !logged {
@@ -736,20 +737,15 @@ impl Drop for SpdkBdev {
 
         // Return qpair to pool and release handle.
         if let Some(env) = crate::spdk_env::SpdkEnv::global_including_shutdown() {
-            // Unregister qpair from poller before returning it to pool to avoid use-after-free
-            let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
-            if unregistered {
-                env.release_qpair(self.ctrlr, self.io_channel.qpair);
-            } else {
-                error!(
-                    "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
-                    self.name
-                );
-            }
+            env.retire_qpair(self.ctrlr, self.io_channel.qpair);
             env.release_handle();
         } else {
-            unsafe {
-                crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair);
+            let rc = unsafe { crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair) };
+            if rc != 0 {
+                error!(
+                    "failed to free SPDK qpair {:p}: rc={}",
+                    self.io_channel.qpair, rc
+                );
             }
         }
         debug!(
