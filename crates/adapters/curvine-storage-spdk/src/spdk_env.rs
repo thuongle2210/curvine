@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 pub(crate) struct CtrlQpairState {
     active: AtomicUsize,
     max_active: usize,
+    accepting: AtomicBool,
 }
 
 impl CtrlQpairState {
@@ -34,6 +35,7 @@ impl CtrlQpairState {
         Self {
             active: AtomicUsize::new(0),
             max_active,
+            accepting: AtomicBool::new(true),
         }
     }
 }
@@ -143,6 +145,9 @@ impl QpairPool {
     pub(crate) fn try_reserve(&self, ctrlr_ptr: usize) -> QpairReserveResult {
         let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = state.get(&ctrlr_ptr) {
+            if !s.accepting.load(Ordering::Acquire) {
+                return QpairReserveResult::Unregistered;
+            }
             loop {
                 let cur = s.active.load(Ordering::Acquire);
                 if cur >= s.max_active {
@@ -188,6 +193,73 @@ impl QpairPool {
                 ctrlr_ptr as *const ()
             );
         }
+    }
+
+    fn begin_controller_retire(&self, ctrlr_ptr: usize) -> CommonResult<()> {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        let ctrl = state.get(&ctrlr_ptr).ok_or_else(|| {
+            err_msg!(
+                "QpairPool: controller {:p} is not registered",
+                ctrlr_ptr as *const ()
+            )
+        })?;
+        ctrl.accepting.store(false, Ordering::Release);
+        self.notify.notify_all();
+        Ok(())
+    }
+
+    fn drain_controller(&self, ctrlr_ptr: usize) -> bool {
+        let qpairs = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&ctrlr_ptr)
+            .unwrap_or_default();
+        self.total_cached.fetch_sub(qpairs.len(), Ordering::AcqRel);
+        let mut failed = Vec::new();
+        for qpair in qpairs {
+            if unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) } != 0 {
+                failed.push(qpair);
+            }
+        }
+        if failed.is_empty() {
+            return true;
+        }
+        self.total_cached.fetch_add(failed.len(), Ordering::AcqRel);
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(ctrlr_ptr)
+            .or_default()
+            .extend(failed);
+        false
+    }
+
+    fn finish_controller_remove(&self, ctrlr_ptr: usize) -> CommonResult<()> {
+        if self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&ctrlr_ptr)
+            .is_some_and(|qpairs| !qpairs.is_empty())
+        {
+            return err_box!("QpairPool: controller still has cached qpairs");
+        }
+        let mut state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        let ctrl = state.get(&ctrlr_ptr).ok_or_else(|| {
+            err_msg!(
+                "QpairPool: controller {:p} is not registered",
+                ctrlr_ptr as *const ()
+            )
+        })?;
+        if ctrl.active.load(Ordering::Acquire) != 0 {
+            return err_box!("QpairPool: controller still has active qpair reservations");
+        }
+        let limit = ctrl.max_active;
+        state.remove(&ctrlr_ptr);
+        self.total_limit.fetch_sub(limit, Ordering::AcqRel);
+        self.notify.notify_all();
+        Ok(())
     }
 
     /// Acquire qpair - returns cached or allocates new
@@ -357,8 +429,21 @@ impl QpairPool {
         let key = ctrlr as usize;
         let release_result = {
             let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let accepting = self
+                .ctrl_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&key)
+                .is_some_and(|state| state.accepting.load(Ordering::Acquire));
             let stack = pool.entry(key).or_default();
-            if stack.len() >= self.max_per_ctrlr {
+            if !accepting {
+                drop(pool);
+                let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
+                if rc != 0 {
+                    return false;
+                }
+                "freed_retired"
+            } else if stack.len() >= self.max_per_ctrlr {
                 // Pool full — free immediately to bound controller-side memory.
                 drop(pool); // release lock before FFI call
                 let rc = unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) };
@@ -504,9 +589,33 @@ pub struct BdevInfo {
     pub block_size: u32, // typically 512 or 4096
     pub num_blocks: u64,
     pub target_endpoint: String,
-    pub ctrlr: usize,       // raw pointer for SpdkBdev
-    pub ns: usize,          // raw pointer for SpdkBdev
-    pub io_timeout_ms: u64, // per-target I/O timeout in ms
+    pub(crate) ctrlr: usize, // raw pointer for SpdkBdev
+    pub(crate) ns: usize,    // raw pointer for SpdkBdev
+    pub io_timeout_ms: u64,  // per-target I/O timeout in ms
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControllerState {
+    Active = 0,
+    Detaching = 1,
+    Detached = 2,
+}
+
+struct ControllerEntry {
+    target_idx: usize,
+    ctrlr: usize,
+    state: AtomicU8,
+}
+
+impl ControllerEntry {
+    fn state(&self) -> ControllerState {
+        match self.state.load(Ordering::Acquire) {
+            0 => ControllerState::Active,
+            1 => ControllerState::Detaching,
+            _ => ControllerState::Detached,
+        }
+    }
 }
 
 impl Display for BdevInfo {
@@ -526,12 +635,14 @@ pub struct SpdkEnv {
     conf: SpdkConf,
     state: AtomicU8,
     bdevs: Vec<BdevInfo>, // populated during init(), immutable after
+    controllers: Vec<ControllerEntry>,
     open_handles: AtomicUsize,
     qpair_pool: QpairPool,
     poller: Mutex<Option<SpdkPoller>>,
     retired_qpairs: Arc<RetiredQpairRegistry>,
     deferred_qpairs: Mutex<HashMap<usize, usize>>,
     shutdown_complete: AtomicBool,
+    lifecycle: Mutex<()>,
 }
 
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
@@ -554,12 +665,14 @@ impl SpdkEnv {
             conf,
             state: AtomicU8::new(SpdkEnvState::Created as u8),
             bdevs: Vec::new(),
+            controllers: Vec::new(),
             open_handles: AtomicUsize::new(0),
             qpair_pool,
             poller: Mutex::new(None),
             retired_qpairs: RetiredQpairRegistry::new(),
             deferred_qpairs: Mutex::new(HashMap::new()),
             shutdown_complete: AtomicBool::new(false),
+            lifecycle: Mutex::new(()),
         })
     }
 
@@ -680,6 +793,11 @@ impl SpdkEnv {
                         );
                         self.qpair_pool
                             .register_limit(first.ctrlr, actual_io_queues);
+                        self.controllers.push(ControllerEntry {
+                            target_idx: i,
+                            ctrlr: first.ctrlr,
+                            state: AtomicU8::new(ControllerState::Active as u8),
+                        });
                     }
                     all_bdevs.extend(bdevs);
                 }
@@ -744,6 +862,10 @@ impl SpdkEnv {
 
     /// Shutdown: detach controllers, free hugepages
     pub fn shutdown(&self) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // CAS Initialized => ShutDown, reject new opens after transition
         let prev = self.state.compare_exchange(
             SpdkEnvState::Initialized as u8,
@@ -853,22 +975,36 @@ impl SpdkEnv {
 
     /// Names of all discovered bdevs.
     pub fn bdev_names(&self) -> Vec<String> {
-        self.bdevs.iter().map(|b| b.name.clone()).collect()
+        self.active_bdevs().map(|b| b.name.clone()).collect()
     }
 
     /// All discovered bdev metadata.
-    pub fn bdevs(&self) -> &[BdevInfo] {
-        &self.bdevs
+    pub fn bdevs(&self) -> Vec<BdevInfo> {
+        self.active_bdevs().cloned().collect()
+    }
+
+    /// Number of bdevs currently available for new opens.
+    pub fn active_bdev_count(&self) -> usize {
+        self.active_bdevs().count()
     }
 
     /// Look up a bdev by name.
-    pub fn get_bdev(&self, name: &str) -> Option<&BdevInfo> {
-        self.bdevs.iter().find(|b| b.name == name)
+    pub fn get_bdev(&self, name: &str) -> Option<BdevInfo> {
+        self.active_bdevs().find(|b| b.name == name).cloned()
     }
 
     /// Total capacity across all bdevs, in bytes.
     pub fn total_capacity(&self) -> u64 {
-        self.bdevs.iter().map(|b| b.size_bytes).sum()
+        self.active_bdevs().map(|b| b.size_bytes).sum()
+    }
+
+    fn active_bdevs(&self) -> impl Iterator<Item = &BdevInfo> {
+        self.bdevs.iter().filter(|bdev| {
+            self.controllers
+                .iter()
+                .find(|entry| entry.ctrlr == bdev.ctrlr)
+                .is_some_and(|entry| entry.state() == ControllerState::Active)
+        })
     }
 
     /// Number of live `SpdkBdev` handles.
@@ -918,6 +1054,10 @@ impl SpdkEnv {
     // Handle tracking, which is used by SpdkBdev open/drop
     /// Register SpdkBdev handle. Returns Err if not Initialized.
     pub fn acquire_handle(&self) -> CommonResult<()> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Increment first so shutdown() sees us in the drain loop.
         self.open_handles.fetch_add(1, Ordering::AcqRel);
         // Now verify the state — if shutdown already won the CAS, undo.
@@ -973,12 +1113,28 @@ impl SpdkEnv {
     /// Resolve qpairs whose unregister acknowledgement timed out. A qpair stays
     /// deferred until the poller publishes its durable retirement record.
     pub fn resolve_deferred_qpairs(&self) {
+        self.resolve_deferred_qpairs_matching(None);
+    }
+
+    fn resolve_deferred_qpairs_for(&self, ctrlr_key: usize) {
+        self.resolve_deferred_qpairs_matching(Some(ctrlr_key));
+    }
+
+    fn resolve_deferred_qpairs_matching(&self, ctrlr_filter: Option<usize>) {
         let deferred: Vec<(usize, usize)> = {
             let mut deferred = self
                 .deferred_qpairs
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            deferred.drain().collect()
+            let selected: Vec<_> = deferred
+                .iter()
+                .filter(|(_, ctrlr)| ctrlr_filter.is_none_or(|filter| **ctrlr == filter))
+                .map(|(&qpair, &ctrlr)| (qpair, ctrlr))
+                .collect();
+            for (qpair, _) in &selected {
+                deferred.remove(qpair);
+            }
+            selected
         };
 
         for (qpair_key, ctrlr_key) in deferred {
@@ -1007,6 +1163,121 @@ impl SpdkEnv {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
+    }
+
+    fn deferred_qpair_count_for(&self, ctrlr_key: usize) -> usize {
+        self.deferred_qpairs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|&&ctrlr| ctrlr == ctrlr_key)
+            .count()
+    }
+
+    /// Detach an idle target without allowing any controller or qpair pointer to
+    /// outlive SPDK ownership. The operation is conservative by design: no SPDK
+    /// handle may be open anywhere while a runtime detach is in progress.
+    pub fn detach_target(&self, target_idx: usize) -> CommonResult<()> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.state() != SpdkEnvState::Initialized {
+            return err_box!(
+                "cannot detach SPDK target in state {} (expected Initialized)",
+                self.state()
+            );
+        }
+
+        let controller = self
+            .controllers
+            .iter()
+            .find(|entry| entry.target_idx == target_idx)
+            .ok_or_else(|| err_msg!("SPDK target index {} is not attached", target_idx))?;
+        match controller.state() {
+            ControllerState::Detached => return Ok(()),
+            ControllerState::Detaching => {}
+            ControllerState::Active => {
+                Self::validate_detach_preconditions(
+                    target_idx,
+                    self.open_handles.load(Ordering::Acquire),
+                )?;
+                controller
+                    .state
+                    .store(ControllerState::Detaching as u8, Ordering::Release);
+            }
+        }
+
+        let ctrlr_key = controller.ctrlr;
+        let ctrlr = ctrlr_key as *mut spdk_ffi::spdk_nvme_ctrlr;
+        self.qpair_pool.begin_controller_retire(ctrlr_key)?;
+        self.resolve_deferred_qpairs_for(ctrlr_key);
+        if self.deferred_qpair_count_for(ctrlr_key) != 0 {
+            return err_box!(
+                "SPDK target {} still has deferred qpairs; detach can be retried after cleanup",
+                target_idx
+            );
+        }
+        if self.qpair_pool.controller_stats(ctrlr_key).0 != 0 {
+            return err_box!(
+                "SPDK target {} still has active qpair reservations",
+                target_idx
+            );
+        }
+
+        if !self.qpair_pool.drain_controller(ctrlr_key) {
+            return err_box!(
+                "failed to free cached qpairs for SPDK target {}",
+                target_idx
+            );
+        }
+        let unregister_result = {
+            let poller = self
+                .poller
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(poller) = poller.as_ref() else {
+                return err_box!("SPDK poller is not running; refusing runtime detach");
+            };
+            poller.unregister_ctrlr(CtrlHandle(ctrlr))
+        };
+        match unregister_result {
+            UnregisterResult::Acked => {}
+            result => {
+                return err_box!(
+                    "poller did not acknowledge SPDK target {} removal: {:?}",
+                    target_idx,
+                    result
+                );
+            }
+        }
+        let rc = unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
+        if rc != 0 {
+            return err_box!(
+                "spdk_nvme_detach failed for target {}: rc={}",
+                target_idx,
+                rc
+            );
+        }
+        // All removal preconditions were checked before detach while lifecycle
+        // serialization prevented new reservations. This is now bookkeeping only.
+        self.qpair_pool.finish_controller_remove(ctrlr_key)?;
+        controller
+            .state
+            .store(ControllerState::Detached as u8, Ordering::Release);
+        info!("Detached SPDK target {} (ctrlr={:p})", target_idx, ctrlr);
+        Ok(())
+    }
+
+    fn validate_detach_preconditions(target_idx: usize, open_handles: usize) -> CommonResult<()> {
+        if open_handles != 0 {
+            return err_box!(
+                "cannot detach SPDK target {} while {} handle(s) are open",
+                target_idx,
+                open_handles
+            );
+        }
+        Ok(())
     }
 
     /// Transfer a qpair out of a closing bdev. On unregister timeout, ownership
@@ -1255,6 +1526,14 @@ impl SpdkEnv {
             if bdev.ctrlr == 0 || !detached.insert(bdev.ctrlr) {
                 continue; // skip null or already-detached controllers
             }
+            if self
+                .controllers
+                .iter()
+                .find(|entry| entry.ctrlr == bdev.ctrlr)
+                .is_some_and(|entry| entry.state() == ControllerState::Detached)
+            {
+                continue;
+            }
             let ctrlr = bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
             info!(
                 "Detaching NVMe controller for target '{}' (ctrlr={:p})",
@@ -1266,6 +1545,14 @@ impl SpdkEnv {
                     "spdk_nvme_detach failed for '{}', rc={}",
                     bdev.target_endpoint, rc
                 );
+            } else if let Some(entry) = self
+                .controllers
+                .iter()
+                .find(|entry| entry.ctrlr == bdev.ctrlr)
+            {
+                entry
+                    .state
+                    .store(ControllerState::Detached as u8, Ordering::Release);
             }
         }
         info!("Detached {} NVMe controller(s)", detached.len());
@@ -1430,6 +1717,80 @@ mod test {
         assert_eq!(p.try_reserve(ctrlr as usize), QpairReserveResult::Reserved);
 
         assert_eq!(p.try_reserve(0x2000), QpairReserveResult::Unregistered);
+    }
+
+    #[test]
+    fn retiring_controller_rejects_new_reservations() {
+        let p = QpairPool::new();
+        p.register_limit(0x1000, 2);
+        p.register_limit(0x2000, 2);
+
+        p.begin_controller_retire(0x1000).unwrap();
+
+        assert_eq!(p.try_reserve(0x1000), QpairReserveResult::Unregistered);
+        assert_eq!(p.try_reserve(0x2000), QpairReserveResult::Reserved);
+    }
+
+    #[test]
+    fn controller_remove_requires_zero_active_reservations() {
+        let p = QpairPool::new();
+        p.register_limit(0x1000, 2);
+        assert_eq!(p.try_reserve(0x1000), QpairReserveResult::Reserved);
+        p.begin_controller_retire(0x1000).unwrap();
+
+        assert!(p.finish_controller_remove(0x1000).is_err());
+        assert_eq!(p.controller_stats(0x1000), (1, 2));
+    }
+
+    #[test]
+    fn controller_remove_updates_limit_without_touching_other_controller() {
+        let p = QpairPool::new();
+        p.register_limit(0x1000, 2);
+        p.register_limit(0x2000, 3);
+        p.begin_controller_retire(0x1000).unwrap();
+
+        p.finish_controller_remove(0x1000).unwrap();
+
+        assert_eq!(p.controller_stats(0x1000), (0, 0));
+        assert_eq!(p.controller_stats(0x2000), (0, 3));
+        assert_eq!(p.total_limit.load(Ordering::Acquire), 3);
+        assert_eq!(p.try_reserve(0x1000), QpairReserveResult::Unregistered);
+        assert_eq!(p.try_reserve(0x2000), QpairReserveResult::Reserved);
+    }
+
+    #[test]
+    fn detached_controller_is_hidden_from_bdev_metadata() {
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        env.bdevs.push(BdevInfo {
+            name: "nvme-a".into(),
+            size_bytes: 1024,
+            block_size: 512,
+            num_blocks: 2,
+            target_endpoint: "tcp://a".into(),
+            ctrlr: 0x1000,
+            ns: 0x2000,
+            io_timeout_ms: 1000,
+        });
+        env.controllers.push(ControllerEntry {
+            target_idx: 0,
+            ctrlr: 0x1000,
+            state: AtomicU8::new(ControllerState::Detached as u8),
+        });
+
+        assert!(env.bdev_names().is_empty());
+        assert_eq!(env.active_bdev_count(), 0);
+        assert!(env.get_bdev("nvme-a").is_none());
+        assert_eq!(env.total_capacity(), 0);
+    }
+
+    #[test]
+    fn detach_preflight_rejects_open_handles() {
+        let err = SpdkEnv::validate_detach_preconditions(1, 2)
+            .expect_err("open handles must block detach")
+            .to_string();
+        assert!(err.contains("target 1"));
+        assert!(err.contains("2 handle"));
+        assert!(SpdkEnv::validate_detach_preconditions(1, 0).is_ok());
     }
 
     #[test]
