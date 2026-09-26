@@ -554,8 +554,48 @@ impl VfsDataset {
             self.restore_removed_block(removed);
             return Err(e);
         }
+        info!(
+            "releasing quarantined SPDK block {} at offset {} size {}",
+            id,
+            removed.meta.bdev_offset,
+            removed.meta.physical_bytes()
+        );
         removed.release();
         Ok(removed.meta)
+    }
+
+    /// Release a quarantined SPDK extent after an external cleanup proof shows
+    /// no queued or submitted command can still write to the physical range.
+    pub fn release_quarantined_block(&mut self, id: i64) -> CommonResult<BlockMeta> {
+        let removed = self.remove_block_state_by_id(id)?;
+        if removed.meta.state() != &BlockState::Quarantined {
+            let state = *removed.meta.state();
+            self.restore_removed_block(removed);
+            return err_box!(
+                "block {} is {:?}, expected Quarantined for quarantine release",
+                id,
+                state
+            );
+        }
+        if removed.meta.storage_type() != StorageType::SpdkDisk {
+            self.restore_removed_block(removed);
+            return err_box!("block {} is not an SPDK block", id);
+        }
+
+        if let Err(e) = removed.deallocate() {
+            self.restore_removed_block(removed);
+            return Err(e);
+        }
+        removed.release();
+        Ok(removed.meta)
+    }
+
+    pub fn quarantined_blocks(&self) -> Vec<BlockMeta> {
+        self.meta
+            .all_blocks()
+            .into_iter()
+            .filter(|meta| meta.state() == &BlockState::Quarantined)
+            .collect()
     }
 
     pub fn layout_for(&self, meta: &BlockMeta) -> CommonResult<(BlockLayoutKind, Arc<VfsDir>)> {
@@ -777,6 +817,12 @@ impl Dataset for VfsDataset {
         if let Some(committed) = self.committed_rewrites.remove(&block.id) {
             self.meta.put(committed);
             meta.state = BlockState::Quarantined;
+            warn!(
+                "quarantining uncertain SPDK rewrite block {} at offset {} size {}",
+                meta.id(),
+                meta.bdev_offset,
+                meta.physical_bytes()
+            );
             self.meta.put(meta);
             return Ok(());
         }
@@ -784,6 +830,12 @@ impl Dataset for VfsDataset {
         // Keep the bdev allocation reserved: a late write may still target this
         // physical range after the client-visible operation has failed.
         meta.state = BlockState::Quarantined;
+        warn!(
+            "quarantining uncertain SPDK block {} at offset {} size {}",
+            meta.id(),
+            meta.bdev_offset,
+            meta.physical_bytes()
+        );
         self.meta.put(meta);
         Ok(())
     }
@@ -1537,6 +1589,94 @@ mod test {
             "quarantined offset must not be reused"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_quarantine_release_requires_quarantined_state() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+
+        assert!(ds.release_quarantined_block(1).is_err());
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().allocated_count(), 1);
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().free_list_size(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_release_quarantined_block_frees_offset() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block1)?;
+        ds.abort_block_uncertain(&block1)?;
+
+        let released = ds.release_quarantined_block(1)?;
+        assert_eq!(released.state(), &BlockState::Quarantined);
+        assert!(ds.get_block(1).is_none());
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().allocated_count(), 0);
+        assert_eq!(
+            ds.offset_alloc_for_dir(1).unwrap().free_list_entries(),
+            vec![(0, 4096)]
+        );
+
+        let block2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let meta2 = ds.open_block(&block2)?;
+        assert_eq!(meta2.bdev_offset, 0, "released quarantine can be reused");
+
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_quarantine_survives_restart_and_blocks_reuse() -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_restart";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let state = spdk_state();
+        let block1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+
+        {
+            let mut ds = VfsDataset::new(
+                "t",
+                DirList::new(vec![spdk_dir(1, state.clone())])?,
+                Some(store.clone()),
+            )?;
+            ds.open_block(&block1)?;
+            ds.abort_block_uncertain(&block1)?;
+            assert_eq!(ds.quarantined_blocks().len(), 1);
+        }
+
+        let restart_state = spdk_state();
+        let mut restarted = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, restart_state.clone())])?,
+            Some(store.clone()),
+        )?;
+        assert!(
+            restarted.get_readable_block(1).is_none(),
+            "quarantined block must not be readable after restart"
+        );
+        let quarantined = restarted.quarantined_blocks();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].state(), &BlockState::Quarantined);
+        assert_eq!(quarantined[0].bdev_offset, 0);
+        assert_eq!(restart_state.offset_alloc.allocated_count(), 1);
+        assert_eq!(restart_state.offset_alloc.free_list_size(), 0);
+
+        let block2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let meta2 = restarted.open_block(&block2)?;
+        assert_eq!(meta2.bdev_offset, 4096);
+
+        restarted.release_quarantined_block(1)?;
+        assert_eq!(
+            restart_state.offset_alloc.free_list_entries(),
+            vec![(0, 4096)]
+        );
+
+        drop(restarted);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
         Ok(())
     }
 

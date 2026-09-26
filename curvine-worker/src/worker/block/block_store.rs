@@ -241,6 +241,18 @@ impl BlockStore {
         })
     }
 
+    pub fn release_quarantined_block(&self, block_id: i64) -> CommonResult<BlockMeta> {
+        let _block_lock = self.block_lock(block_id, "release_quarantine");
+        self.with_dataset_write("release_quarantine", |state| {
+            state.release_quarantined_block(block_id)
+        })
+    }
+
+    pub fn quarantined_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
+        let state = self.read()?;
+        Ok(state.quarantined_blocks())
+    }
+
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
         let state = self.read()?;
         let b = state
