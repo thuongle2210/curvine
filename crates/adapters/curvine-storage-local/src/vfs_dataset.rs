@@ -17,7 +17,7 @@ use crate::{
     BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
     SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
-use crate::{BlockMeta, BlockState};
+use crate::{BlockMeta, BlockState, QuarantineReleaseProof};
 use curvine_config::{ClusterConf, WorkerDataDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
@@ -567,6 +567,16 @@ impl VfsDataset {
     /// Release a quarantined SPDK extent after an external cleanup proof shows
     /// no queued or submitted command can still write to the physical range.
     pub fn release_quarantined_block(&mut self, id: i64) -> CommonResult<BlockMeta> {
+        let meta = self.get_block_check(id)?.clone();
+        let proof = QuarantineReleaseProof::new(id, meta.bdev_offset, meta.physical_bytes());
+        self.release_quarantined_block_with_proof(proof)
+    }
+
+    pub fn release_quarantined_block_with_proof(
+        &mut self,
+        proof: QuarantineReleaseProof,
+    ) -> CommonResult<BlockMeta> {
+        let id = proof.block_id;
         let removed = self.remove_block_state_by_id(id)?;
         if removed.meta.state() != &BlockState::Quarantined {
             let state = *removed.meta.state();
@@ -580,6 +590,21 @@ impl VfsDataset {
         if removed.meta.storage_type() != StorageType::SpdkDisk {
             self.restore_removed_block(removed);
             return err_box!("block {} is not an SPDK block", id);
+        }
+        if removed.meta.bdev_offset != proof.bdev_offset
+            || removed.meta.physical_bytes() != proof.size
+        {
+            let actual_offset = removed.meta.bdev_offset;
+            let actual_size = removed.meta.physical_bytes();
+            self.restore_removed_block(removed);
+            return err_box!(
+                "quarantine release proof mismatch for block {}: proof offset={}, size={}, actual offset={}, size={}",
+                id,
+                proof.bdev_offset,
+                proof.size,
+                actual_offset,
+                actual_size
+            );
         }
 
         if let Err(e) = removed.deallocate() {
@@ -856,7 +881,7 @@ mod test {
         BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion,
         VfsDataset, VfsDir,
     };
-    use crate::{BlockMeta, BlockState};
+    use crate::{BlockMeta, BlockState, QuarantineReleaseProof};
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_io::DataSlice;
@@ -1624,6 +1649,38 @@ mod test {
         let block2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
         let meta2 = ds.open_block(&block2)?;
         assert_eq!(meta2.bdev_offset, 0, "released quarantine can be reused");
+
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_release_quarantine_requires_matching_physical_proof() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let meta = ds.open_block(&block)?;
+        ds.abort_block_uncertain(&block)?;
+
+        let wrong_offset = QuarantineReleaseProof::new(1, meta.bdev_offset + 4096, meta.actual_len);
+        assert!(ds
+            .release_quarantined_block_with_proof(wrong_offset)
+            .is_err());
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().allocated_count(), 1);
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().free_list_size(), 0);
+        assert_eq!(ds.quarantined_blocks().len(), 1);
+
+        let wrong_size = QuarantineReleaseProof::new(1, meta.bdev_offset, meta.actual_len + 4096);
+        assert!(ds.release_quarantined_block_with_proof(wrong_size).is_err());
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().allocated_count(), 1);
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().free_list_size(), 0);
+        assert_eq!(ds.quarantined_blocks().len(), 1);
+
+        let proof = QuarantineReleaseProof::new(1, meta.bdev_offset, meta.actual_len);
+        let released = ds.release_quarantined_block_with_proof(proof)?;
+        assert_eq!(released.id(), 1);
+        assert_eq!(
+            ds.offset_alloc_for_dir(1).unwrap().free_list_entries(),
+            vec![(0, 4096)]
+        );
 
         Ok(())
     }

@@ -63,6 +63,23 @@ pub struct BlockMeta {
     pub bdev_offset: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineReleaseProof {
+    pub block_id: i64,
+    pub bdev_offset: i64,
+    pub size: i64,
+}
+
+impl QuarantineReleaseProof {
+    pub fn new(block_id: i64, bdev_offset: i64, size: i64) -> Self {
+        Self {
+            block_id,
+            bdev_offset,
+            size,
+        }
+    }
+}
+
 impl BlockMeta {
     pub fn new(id: i64, block_size: i64, dir: &VfsDir) -> Self {
         Self {
