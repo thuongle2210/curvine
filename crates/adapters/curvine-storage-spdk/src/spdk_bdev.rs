@@ -367,7 +367,7 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
-                if rc == -libc::EIO {
+                if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                     self.io_channel.qpair_dead.store(true, Ordering::Release);
                 }
                 return err_box!(
@@ -450,7 +450,7 @@ impl SpdkBdev {
                 let rc = completion.wait(self.io_timeout_ms * 1000);
 
                 if rc != 0 {
-                    if rc == -libc::EIO {
+                    if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                         self.io_channel.qpair_dead.store(true, Ordering::Release);
                     }
                     return err_box!(
@@ -500,7 +500,7 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
-                if rc == -libc::EIO {
+                if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                     self.io_channel.qpair_dead.store(true, Ordering::Release);
                 }
                 return err_box!(
@@ -551,7 +551,7 @@ impl SpdkBdev {
         }
         let rc = completion.wait(self.io_timeout_ms * 1000);
         if rc != 0 {
-            if rc == -libc::EIO {
+            if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                 self.io_channel.qpair_dead.store(true, Ordering::Release);
             }
             return err_box!(
@@ -699,7 +699,22 @@ impl Display for SpdkBdev {
 
 impl Drop for SpdkBdev {
     fn drop(&mut self) {
-        // Wait for in-flight I/O.
+        // Retire the qpair first. Successful teardown reclaims stale callback
+        // contexts, which is what releases DMA refs after force-completion.
+        let env = crate::spdk_env::SpdkEnv::global_including_shutdown();
+        if let Some(env) = env {
+            env.retire_qpair(self.ctrlr, self.io_channel.qpair);
+        } else {
+            let rc = unsafe { crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair) };
+            if rc != 0 {
+                error!(
+                    "failed to free SPDK qpair {:p}: rc={}",
+                    self.io_channel.qpair, rc
+                );
+            }
+        }
+
+        // Wait until SPDK no longer owns any DMA buffer from this bdev.
         let max_wait = if self.io_timeout_ms > 0 {
             std::time::Duration::from_millis(self.io_timeout_ms * 2)
         } else {
@@ -735,21 +750,12 @@ impl Drop for SpdkBdev {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        // Return qpair to pool and release handle.
-        if let Some(env) = crate::spdk_env::SpdkEnv::global_including_shutdown() {
-            env.retire_qpair(self.ctrlr, self.io_channel.qpair);
+        if let Some(env) = env {
             env.release_handle();
-        } else {
-            let rc = unsafe { crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair) };
-            if rc != 0 {
-                error!(
-                    "failed to free SPDK qpair {:p}: rc={}",
-                    self.io_channel.qpair, rc
-                );
-            }
         }
+
         debug!(
-            "SpdkBdev '{}' closed (qpair returned to pool, DMA buffers freed)",
+            "SpdkBdev '{}' closed (qpair retired, DMA buffers released or leaked)",
             self.name
         );
     }
