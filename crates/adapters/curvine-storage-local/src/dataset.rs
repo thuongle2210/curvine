@@ -64,6 +64,11 @@ pub trait Dataset {
     // Cancel a block
     fn abort_block(&mut self, block: &ExtendedBlock) -> CommonResult<()>;
 
+    // Cancel a block whose backing writes may still complete later.
+    fn abort_block_uncertain(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
+        self.abort_block(block)
+    }
+
     // Delete a block.
     fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()>;
 

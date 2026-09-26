@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout};
-use crate::{BlockMeta, BlockState};
+use crate::BlockMeta;
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
@@ -125,15 +125,10 @@ impl BlockLayout for BdevLayout {
             }
 
             alloc_entries.push((record.block_id, record.offset, record.size));
-            let state = if record.finalized {
-                BlockState::Finalized
-            } else {
-                BlockState::Recovering
-            };
             blocks.push(BlockMeta {
                 id: record.block_id,
                 len: record.len,
-                state,
+                state: record.state,
                 dir_id: dir.id(),
                 storage_type: dir.storage_type(),
                 actual_len: record.size,

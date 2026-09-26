@@ -29,6 +29,7 @@ pub enum BlockState {
     Recovering = 2,
     Allocating = 3,
     Finalizing = 4,
+    Quarantined = 5,
 }
 
 impl BlockState {
@@ -167,7 +168,10 @@ impl BlockMeta {
     }
 
     pub fn is_transitioning(&self) -> bool {
-        matches!(self.state, BlockState::Allocating | BlockState::Finalizing)
+        matches!(
+            self.state,
+            BlockState::Allocating | BlockState::Finalizing | BlockState::Quarantined
+        )
     }
 
     pub fn dir_id(&self) -> u32 {

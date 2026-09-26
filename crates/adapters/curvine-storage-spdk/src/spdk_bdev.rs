@@ -146,6 +146,7 @@ pub struct SpdkBdev {
     /// I/O timeout in milliseconds. 0 = no timeout.
     io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    uncertain_writes: bool,
 }
 
 // SAFETY: owns qpair and DMA buffers exclusively
@@ -251,7 +252,14 @@ impl SpdkBdev {
                 ctrlr,
                 io_timeout_ms,
                 inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                uncertain_writes: false,
             })
+        }
+    }
+
+    fn mark_qpair_dead_on_terminal_handle_error(&mut self, rc: i32) {
+        if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
+            self.io_channel.qpair_dead.store(true, Ordering::Release);
         }
     }
 
@@ -367,9 +375,7 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
-                if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
-                    self.io_channel.qpair_dead.store(true, Ordering::Release);
-                }
+                self.mark_qpair_dead_on_terminal_handle_error(rc);
                 return err_box!(
                     "NVMe read failed on '{}' at offset={}: {}",
                     self.name,
@@ -450,9 +456,8 @@ impl SpdkBdev {
                 let rc = completion.wait(self.io_timeout_ms * 1000);
 
                 if rc != 0 {
-                    if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
-                        self.io_channel.qpair_dead.store(true, Ordering::Release);
-                    }
+                    self.mark_qpair_dead_on_terminal_handle_error(rc);
+                    self.uncertain_writes = true;
                     return err_box!(
                         "Read-modify-write: read failed on '{}' at offset={}: {}",
                         self.name,
@@ -500,9 +505,8 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
-                if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
-                    self.io_channel.qpair_dead.store(true, Ordering::Release);
-                }
+                self.mark_qpair_dead_on_terminal_handle_error(rc);
+                self.uncertain_writes = true;
                 return err_box!(
                     "NVMe write failed on '{}' at offset={}, len={}: {}",
                     self.name,
@@ -518,7 +522,7 @@ impl SpdkBdev {
         Ok(())
     }
 
-    fn spdk_flush(&self) -> IOResult<()> {
+    fn spdk_flush(&mut self) -> IOResult<()> {
         if self.io_channel.qpair_dead.load(Ordering::Acquire) {
             return err_box!("SPDK qpair is dead, device unreachable");
         }
@@ -551,9 +555,8 @@ impl SpdkBdev {
         }
         let rc = completion.wait(self.io_timeout_ms * 1000);
         if rc != 0 {
-            if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
-                self.io_channel.qpair_dead.store(true, Ordering::Release);
-            }
+            self.mark_qpair_dead_on_terminal_handle_error(rc);
+            self.uncertain_writes = true;
             return err_box!(
                 "NVMe flush failed on '{}': {}",
                 self.name,
@@ -684,6 +687,10 @@ impl BlockIO for SpdkBdev {
             self.name,
             self.size
         )
+    }
+
+    fn has_uncertain_writes(&self) -> bool {
+        self.uncertain_writes
     }
 }
 

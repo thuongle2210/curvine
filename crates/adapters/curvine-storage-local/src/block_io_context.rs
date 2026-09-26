@@ -30,6 +30,7 @@ pub struct BlockWriteContext {
     device_base: i64,
     block_size: i64,
     block_pos: i64,
+    uncertain_writes: bool,
 }
 
 impl BlockWriteContext {
@@ -59,6 +60,7 @@ impl BlockWriteContext {
             device_base,
             block_size,
             block_pos: initial_off,
+            uncertain_writes: false,
         })
     }
 
@@ -107,13 +109,24 @@ impl BlockWriteContext {
                 self.block_size
             );
         }
-        try_err!(self.device.write_region(region));
+        if let Err(err) = self.device.write_region(region) {
+            if self.device.has_uncertain_writes() {
+                self.uncertain_writes = true;
+            }
+            return Err(err);
+        }
         self.block_pos = write_end;
         Ok(())
     }
 
     pub fn flush(&mut self) -> IOResult<()> {
-        self.device.flush()
+        if let Err(err) = self.device.flush() {
+            if self.device.has_uncertain_writes() {
+                self.uncertain_writes = true;
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Callers must gate on `supports_resize()`; see `WriteHandler::resize`.
@@ -142,6 +155,10 @@ impl BlockWriteContext {
 
     pub fn device_len(&self) -> i64 {
         self.device.len()
+    }
+
+    pub fn has_uncertain_writes(&self) -> bool {
+        self.uncertain_writes || self.device.has_uncertain_writes()
     }
 }
 

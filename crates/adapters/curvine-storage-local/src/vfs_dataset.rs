@@ -271,7 +271,7 @@ impl VfsDataset {
                 self.committed_rewrites
                     .get(&meta.id())
                     .cloned()
-                    .or_else(|| (meta.state() != &BlockState::Allocating).then_some(meta))
+                    .or_else(|| (!meta.is_transitioning()).then_some(meta))
             })
             .collect()
     }
@@ -281,7 +281,7 @@ impl VfsDataset {
             return Some(committed);
         }
         let meta = self.meta.get(id)?;
-        (meta.state() != &BlockState::Allocating).then_some(meta)
+        (!meta.is_transitioning()).then_some(meta)
     }
 
     pub fn reserve_file_open(
@@ -543,6 +543,13 @@ impl VfsDataset {
 
     pub(crate) fn remove_block_by_id(&mut self, id: i64) -> CommonResult<BlockMeta> {
         let removed = self.remove_block_state_by_id(id)?;
+        if removed.meta.state() == &BlockState::Quarantined {
+            self.restore_removed_block(removed);
+            return err_box!(
+                "block {} is quarantined and cannot be released without cleanup proof",
+                id
+            );
+        }
         if let Err(e) = removed.deallocate() {
             self.restore_removed_block(removed);
             return Err(e);
@@ -755,6 +762,29 @@ impl Dataset for VfsDataset {
         }
 
         self.remove_block_by_id(block.id)?;
+        Ok(())
+    }
+
+    fn abort_block_uncertain(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
+        let Some(mut meta) = self.meta.get(block.id).cloned() else {
+            return Ok(());
+        };
+
+        if meta.storage_type() != StorageType::SpdkDisk {
+            return self.abort_block(block);
+        }
+
+        if let Some(committed) = self.committed_rewrites.remove(&block.id) {
+            self.meta.put(committed);
+            meta.state = BlockState::Quarantined;
+            self.meta.put(meta);
+            return Ok(());
+        }
+
+        // Keep the bdev allocation reserved: a late write may still target this
+        // physical range after the client-visible operation has failed.
+        meta.state = BlockState::Quarantined;
+        self.meta.put(meta);
         Ok(())
     }
 
@@ -1479,6 +1509,37 @@ mod test {
 
         Ok(())
     }
+
+    #[test]
+    fn spdk_uncertain_abort_quarantines_offset() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let meta1 = ds.open_block(&block1)?;
+        assert_eq!(meta1.bdev_offset, 0);
+
+        ds.abort_block_uncertain(&block1)?;
+        let quarantined = ds.get_block(1).expect("quarantined block metadata remains");
+        assert_eq!(quarantined.state(), &BlockState::Quarantined);
+        assert_eq!(quarantined.bdev_offset, 0);
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().free_list_size(), 0);
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().allocated_count(), 1);
+
+        assert!(
+            ds.abort_block(&block1).is_err(),
+            "normal abort must not release a quarantined extent"
+        );
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().free_list_size(), 0);
+
+        let block2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let meta2 = ds.open_block(&block2)?;
+        assert_eq!(
+            meta2.bdev_offset, 4096,
+            "quarantined offset must not be reused"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn spdk_create_abort_interleaved() -> CommonResult<()> {
         let mut ds = spdk_dataset()?;

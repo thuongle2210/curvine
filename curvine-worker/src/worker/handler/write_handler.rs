@@ -248,39 +248,67 @@ impl WriteHandler {
     }
 
     pub fn write(&mut self, msg: &Message) -> FsResult<Message> {
-        let file = try_option_mut!(self.file);
-        let context = try_option_mut!(self.context);
-        Self::check_context(context, msg)?;
+        let mut uncertain_abort_block = None;
+        let mut write_result: FsResult<()> = Ok(());
 
-        let mut need_flush = false;
-        if msg.header_len() > 0 {
-            let header: DataHeaderProto = msg.parse_header()?;
-            need_flush = Self::handle_data_header(file, context, header)?;
+        {
+            let file = try_option_mut!(self.file);
+            let context = try_option_mut!(self.context);
+            Self::check_context(context, msg)?;
+
+            let mut need_flush = false;
+            if msg.header_len() > 0 {
+                let header: DataHeaderProto = msg.parse_header()?;
+                need_flush = Self::handle_data_header(file, context, header)?;
+            }
+
+            let data_len = msg.data_len() as i64;
+            if data_len > 0 {
+                let spend = TimeSpent::new();
+                if let Err(write_err) = file.write_region(&msg.data) {
+                    if file.has_uncertain_writes() {
+                        uncertain_abort_block = Some(context.block.clone());
+                    }
+                    write_result = Err(write_err.into());
+                } else {
+                    let used = spend.used_us();
+                    if used >= self.io_slow_us {
+                        warn!(
+                            "Slow write data from disk cost: {}us (threshold={}us), path: {} ",
+                            used,
+                            self.io_slow_us,
+                            file.path()
+                        );
+                    }
+                    self.metrics.write_bytes.inc_by(msg.data_len() as i64);
+                    self.metrics.write_time_us.inc_by(used as i64);
+                    self.metrics.write_count.inc();
+                }
+            }
+
+            if write_result.is_ok() && need_flush {
+                if let Err(flush_err) = file.flush() {
+                    if file.has_uncertain_writes() {
+                        uncertain_abort_block = Some(context.block.clone());
+                    }
+                    write_result = Err(flush_err.into());
+                }
+            }
         }
 
-        let data_len = msg.data_len() as i64;
-        if data_len > 0 {
-            let spend = TimeSpent::new();
-            file.write_region(&msg.data)?;
-
-            let used = spend.used_us();
-            if used >= self.io_slow_us {
-                warn!(
-                    "Slow write data from disk cost: {}us (threshold={}us), path: {} ",
-                    used,
-                    self.io_slow_us,
-                    file.path()
+        if let Some(block) = uncertain_abort_block {
+            self.file.take();
+            self.context.take();
+            if let Err(abort_err) = self.abort_after_uncertain_write(&block) {
+                log::warn!(
+                    "failed to quarantine block {} after uncertain write error: {}",
+                    block.id,
+                    abort_err
                 );
             }
-            self.metrics.write_bytes.inc_by(msg.data_len() as i64);
-            self.metrics.write_time_us.inc_by(used as i64);
-            self.metrics.write_count.inc();
         }
 
-        if need_flush {
-            file.flush()?;
-        }
-
+        write_result?;
         Ok(msg.success())
     }
 
@@ -290,6 +318,11 @@ impl WriteHandler {
         } else {
             self.store.abort_block(block)?;
         }
+        Ok(())
+    }
+
+    fn abort_after_uncertain_write(&self, block: &ExtendedBlock) -> FsResult<()> {
+        self.store.abort_block_uncertain(block)?;
         Ok(())
     }
 
@@ -310,8 +343,14 @@ impl WriteHandler {
         let file = self.file.take();
         if let Some(mut file) = file {
             if let Err(flush_err) = file.flush() {
+                let uncertain = file.has_uncertain_writes();
                 drop(file);
-                if let Err(abort_err) = self.store.abort_block(&context.block) {
+                let abort_result = if uncertain {
+                    self.store.abort_block_uncertain(&context.block)
+                } else {
+                    self.store.abort_block(&context.block)
+                };
+                if let Err(abort_err) = abort_result {
                     log::warn!(
                         "failed to abort block {} after flush error: {}",
                         context.block.id,
@@ -376,7 +415,7 @@ mod tests {
     use crate::worker::block::BlockStore;
     use crate::worker::handler::WriteContext;
     use crate::worker::storage::BlockWriteContext;
-    use crate::worker::Worker;
+    use crate::worker::WorkerMetrics;
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_error::{FsError, FsResult};
     use curvine_io::{BlockIO, DataSlice};
@@ -422,6 +461,10 @@ mod tests {
             ..ClusterConf::default()
         };
         BlockStore::new("test", &conf).map_err(FsError::from)
+    }
+
+    fn test_metrics(store: &BlockStore) -> FsResult<&'static WorkerMetrics> {
+        Ok(Box::leak(Box::new(WorkerMetrics::new(store.clone())?)))
     }
 
     struct RecordingBlockIO {
@@ -580,6 +623,7 @@ mod tests {
         };
 
         let store = create_test_store("flush-order")?;
+        let metrics = test_metrics(&store)?;
 
         let mut handler = WriteHandler {
             store,
@@ -587,7 +631,7 @@ mod tests {
             file: Some(file),
             is_commit: false,
             io_slow_us: 0,
-            metrics: Worker::get_metrics()?,
+            metrics,
             client_addr: "test".to_string(),
         };
 
@@ -637,6 +681,7 @@ mod tests {
         };
 
         let store = create_test_store("flush-error")?;
+        let metrics = test_metrics(&store)?;
 
         let mut handler = WriteHandler {
             store,
@@ -644,7 +689,7 @@ mod tests {
             file: Some(file),
             is_commit: false,
             io_slow_us: 0,
-            metrics: Worker::get_metrics()?,
+            metrics,
             client_addr: "test".to_string(),
         };
 

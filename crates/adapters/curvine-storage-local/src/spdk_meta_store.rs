@@ -1,14 +1,16 @@
 //! RocksDB-backed SPDK block metadata.
 use crate::meta_store::BlockMetaStore;
-use crate::BlockMeta;
-/// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) = 29B.
+use crate::{BlockMeta, BlockState};
+/// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) | state(1B).
+/// Older 29-byte records without state decode from finalized.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_rocksdb::{DBConf, DBEngine};
 use log::{info, warn};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";
-const VALUE_SIZE: usize = 29;
+const VALUE_SIZE: usize = 30;
+const LEGACY_VALUE_SIZE: usize = 29;
 pub struct SpdkMetaStore {
     db: DBEngine,
 }
@@ -20,6 +22,7 @@ pub struct SpdkBlockRecord {
     pub size: i64,
     pub len: i64,
     pub finalized: bool,
+    pub state: BlockState,
 }
 impl SpdkMetaStore {
     pub fn open(dir: &str, format: bool) -> CommonResult<Self> {
@@ -37,8 +40,25 @@ impl SpdkMetaStore {
         len: i64,
         finalized: bool,
     ) -> CommonResult<()> {
+        let state = if finalized {
+            BlockState::Finalized
+        } else {
+            BlockState::Recovering
+        };
+        self.put_with_state(block_id, dir_id, offset, size, len, state)
+    }
+
+    pub fn put_with_state(
+        &self,
+        block_id: i64,
+        dir_id: u32,
+        offset: i64,
+        size: i64,
+        len: i64,
+        state: BlockState,
+    ) -> CommonResult<()> {
         let key = Self::encode_key(block_id);
-        let value = Self::encode_value(dir_id, offset, size, len, finalized);
+        let value = Self::encode_value(dir_id, offset, size, len, state);
         self.db.put_cf(CF_SPDK_BLOCKS, key, value)
     }
     pub fn delete(&self, block_id: i64) -> CommonResult<()> {
@@ -95,46 +115,70 @@ impl SpdkMetaStore {
         offset: i64,
         size: i64,
         len: i64,
-        finalized: bool,
+        state: BlockState,
     ) -> [u8; VALUE_SIZE] {
         let mut buf = [0u8; VALUE_SIZE];
         BigEndian::write_u32(&mut buf[0..4], dir_id);
         BigEndian::write_i64(&mut buf[4..12], offset);
         BigEndian::write_i64(&mut buf[12..20], size);
         BigEndian::write_i64(&mut buf[20..28], len);
-        buf[28] = if finalized { 1 } else { 0 };
+        buf[28] = if state == BlockState::Finalized { 1 } else { 0 };
+        buf[29] = state as u8;
         buf
     }
+
+    fn decode_state(finalized: bool, bytes: &[u8]) -> CommonResult<BlockState> {
+        if bytes.len() <= LEGACY_VALUE_SIZE {
+            return Ok(if finalized {
+                BlockState::Finalized
+            } else {
+                BlockState::Recovering
+            });
+        }
+        match bytes[29] {
+            0 => Ok(BlockState::Finalized),
+            1 => Ok(BlockState::Writing),
+            2 => Ok(BlockState::Recovering),
+            3 => Ok(BlockState::Allocating),
+            4 => Ok(BlockState::Finalizing),
+            5 => Ok(BlockState::Quarantined),
+            value => err_box!("SpdkMetaStore: unknown block state byte {}", value),
+        }
+    }
+
     #[inline]
     fn decode_value(block_id: i64, bytes: &[u8]) -> CommonResult<SpdkBlockRecord> {
-        if bytes.len() < VALUE_SIZE {
+        if bytes.len() < LEGACY_VALUE_SIZE {
             return err_box!(
                 "SpdkMetaStore: value too short for block {} ({} < {})",
                 block_id,
                 bytes.len(),
-                VALUE_SIZE
+                LEGACY_VALUE_SIZE
             );
         }
+        let finalized = bytes[28] != 0;
+        let state = Self::decode_state(finalized, bytes)?;
         Ok(SpdkBlockRecord {
             block_id,
             dir_id: BigEndian::read_u32(&bytes[0..4]),
             offset: BigEndian::read_i64(&bytes[4..12]),
             size: BigEndian::read_i64(&bytes[12..20]),
             len: BigEndian::read_i64(&bytes[20..28]),
-            finalized: bytes[28] != 0,
+            finalized,
+            state,
         })
     }
 }
 
 impl BlockMetaStore for SpdkMetaStore {
     fn put_block_meta(&self, meta: &BlockMeta) -> CommonResult<()> {
-        self.put(
+        self.put_with_state(
             meta.id(),
             meta.dir_id(),
             meta.bdev_offset,
             meta.actual_len,
             meta.len(),
-            meta.is_final(),
+            *meta.state(),
         )
     }
 
@@ -158,6 +202,7 @@ mod test {
         let r = store.get(1).unwrap().unwrap();
         assert_eq!(r.offset, 0);
         assert!(r.finalized);
+        assert_eq!(r.state, BlockState::Finalized);
         store.delete(1).unwrap();
         assert!(store.get(1).unwrap().is_none());
     }
@@ -196,5 +241,16 @@ mod test {
         }
         let s = SpdkMetaStore::open(&dir, false).unwrap();
         assert_eq!(s.scan_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn quarantined_state_roundtrip() {
+        let store = SpdkMetaStore::open(&test_dir("quarantine"), true).unwrap();
+        store
+            .put_with_state(1, 1, 0, 4096, 4096, BlockState::Quarantined)
+            .unwrap();
+        let record = store.get(1).unwrap().unwrap();
+        assert!(!record.finalized);
+        assert_eq!(record.state, BlockState::Quarantined);
     }
 }

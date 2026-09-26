@@ -234,6 +234,13 @@ impl BlockStore {
         self.with_dataset_write("abort", |state| state.abort_block(block))
     }
 
+    pub fn abort_block_uncertain(&self, block: &ExtendedBlock) -> CommonResult<()> {
+        let _block_lock = self.block_lock(block.id, "abort_uncertain");
+        self.with_dataset_write("abort_uncertain", |state| {
+            state.abort_block_uncertain(block)
+        })
+    }
+
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
         let state = self.read()?;
         let b = state
