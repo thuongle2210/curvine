@@ -178,6 +178,23 @@ impl BlockLayout for BdevLayout {
             if record.dir_id != dir.id() {
                 continue;
             }
+            if record.state == crate::BlockState::Writing {
+                warn!(
+                    "SPDK dir {} recovered in-progress generation for block {} generation {}; marking quarantined",
+                    dir.id(),
+                    record.block_id,
+                    record.generation
+                );
+                store.put_generation(
+                    record.block_id,
+                    record.generation,
+                    record.dir_id,
+                    record.offset,
+                    record.size,
+                    record.len,
+                    crate::BlockState::Quarantined,
+                )?;
+            }
             let Some(key) = BdevOffsetAllocator::generation_key(record.block_id, record.generation)
             else {
                 warn!(

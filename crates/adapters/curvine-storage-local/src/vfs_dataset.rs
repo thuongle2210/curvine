@@ -2285,6 +2285,39 @@ mod test {
     }
 
     #[test]
+    fn spdk_restart_quarantines_in_progress_staging_generation() -> CommonResult<()> {
+        let path = "../testing/spdk_restart_staging_generation";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        store.put(1, 1, 0, 4096, 4096, true)?;
+        store.put_generation(1, 1, 1, 4096, 4096, 4096, BlockState::Writing)?;
+
+        let restart_state = spdk_state();
+        let mut restarted = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, restart_state.clone())])?,
+            Some(store.clone()),
+        )?;
+        let recovered = store
+            .get_generation(1, 1)?
+            .expect("staging generation should remain persisted");
+        assert_eq!(recovered.state, BlockState::Quarantined);
+        assert_eq!(restarted.get_readable_block(1).unwrap().bdev_offset, 0);
+
+        let next = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let next_meta = restarted.open_block(&next)?;
+        assert_eq!(
+            next_meta.bdev_offset, 8192,
+            "published X and quarantined staging Y must both occupy allocator space"
+        );
+
+        drop(restarted);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
     fn spdk_create_abort_interleaved() -> CommonResult<()> {
         let mut ds = spdk_dataset()?;
         let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
