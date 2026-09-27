@@ -106,6 +106,19 @@ impl BlockLayoutKind {
     ) -> Self {
         Self::Bdev(BdevLayout::new(spdk_meta).with_terminal_event_tx(tx))
     }
+
+    #[cfg(feature = "spdk")]
+    pub fn copy_spdk_extent(
+        &self,
+        dir: &VfsDir,
+        src: &BlockMeta,
+        dst: &BlockMeta,
+    ) -> CommonResult<()> {
+        match self {
+            Self::Bdev(layout) => layout.copy_extent(dir, src, dst),
+            Self::File(_) => err_box!("copy_spdk_extent called for non-SPDK layout"),
+        }
+    }
 }
 
 #[derive(Clone)]

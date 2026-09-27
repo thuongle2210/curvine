@@ -56,6 +56,22 @@ impl BdevLayout {
             IOError::from(format!("SPDK dir {} has no bdev name assigned", dir.id()))
         })
     }
+
+    #[cfg(feature = "spdk")]
+    pub fn copy_extent(&self, dir: &VfsDir, src: &BlockMeta, dst: &BlockMeta) -> CommonResult<()> {
+        const COPY_CHUNK: i32 = 1024 * 1024;
+        let mut reader = self.open_reader(dir, src, 0, src.len())?;
+        let mut writer = self.open_writer(dir, dst, 0)?;
+        let mut remaining = src.physical_bytes();
+        while remaining > 0 {
+            let len = remaining.min(COPY_CHUNK as i64) as i32;
+            let data = reader.read_region(false, len)?;
+            writer.write_region(&data)?;
+            remaining -= len as i64;
+        }
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 impl BlockLayout for BdevLayout {

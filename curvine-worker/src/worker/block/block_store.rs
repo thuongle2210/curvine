@@ -204,6 +204,41 @@ impl BlockStore {
 
     pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "open");
+        #[cfg(feature = "spdk")]
+        {
+            let spdk_reservation = self
+                .with_dataset_write("open", |state| state.reserve_spdk_rewrite_generation(block))?;
+            if let Some(reservation) = spdk_reservation {
+                let copy_result = {
+                    let state = self.read()?;
+                    let (layout, dir) = state.layout_for(&reservation.published)?;
+                    let started = Instant::now();
+                    let result =
+                        layout.copy_spdk_extent(&dir, &reservation.published, &reservation.staging);
+                    self.observe_file_layout_operation("spdk_rewrite_copy", started.elapsed());
+                    result
+                };
+                return match copy_result {
+                    Ok(()) => self.with_dataset_write("open", |state| {
+                        state.complete_spdk_rewrite_open(&reservation)
+                    }),
+                    Err(error) => {
+                        if let Err(rollback) = self.with_dataset_write("open", |state| {
+                            state.rollback_spdk_rewrite_generation(&reservation)
+                        }) {
+                            log::error!(
+                                "failed to roll back SPDK rewrite reservation for block {} after {}: {}",
+                                block.id,
+                                error,
+                                rollback
+                            );
+                        }
+                        Err(error)
+                    }
+                };
+            }
+        }
+
         let reservation =
             self.with_dataset_write("open", |state| state.reserve_file_open(block))?;
 

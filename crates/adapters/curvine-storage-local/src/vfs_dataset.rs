@@ -546,6 +546,23 @@ impl VfsDataset {
         Ok(())
     }
 
+    pub fn complete_spdk_rewrite_open(
+        &mut self,
+        reservation: &SpdkRewriteReservation,
+    ) -> CommonResult<BlockMeta> {
+        let current = self.get_block_check(reservation.staging.id())?;
+        if current.id() != reservation.staging.id()
+            || current.bdev_offset != reservation.published.bdev_offset
+        {
+            return err_box!(
+                "SPDK rewrite reservation for block {} changed before completion",
+                reservation.staging.id()
+            );
+        }
+        self.meta.put_memory_only(reservation.staging.clone());
+        Ok(reservation.staging.clone())
+    }
+
     pub fn publish_file_finalize(
         &mut self,
         reservation: &FileFinalizeReservation,
