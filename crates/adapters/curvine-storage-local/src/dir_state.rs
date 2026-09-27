@@ -65,7 +65,7 @@ struct OffsetAllocInner {
     free_list: BTreeMap<i64, i64>,
 }
 impl BdevOffsetAllocator {
-    fn generation_key(block_id: i64, generation: i64) -> Option<i64> {
+    pub fn generation_key(block_id: i64, generation: i64) -> Option<i64> {
         if generation == 0 {
             return Some(block_id);
         }

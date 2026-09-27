@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout};
-use crate::{BlockMeta, ExtentKey, ExtentPinRegistry};
+use crate::{BdevOffsetAllocator, BlockMeta, ExtentKey, ExtentPinRegistry};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
@@ -171,6 +171,22 @@ impl BlockLayout for BdevLayout {
                 actual_len: record.size,
                 bdev_offset: record.offset,
             });
+        }
+        for record in store.scan_generations()? {
+            if record.dir_id != dir.id() {
+                continue;
+            }
+            let Some(key) = BdevOffsetAllocator::generation_key(record.block_id, record.generation)
+            else {
+                warn!(
+                    "SPDK dir {} skipped invalid generation key for block {} generation {}",
+                    dir.id(),
+                    record.block_id,
+                    record.generation
+                );
+                continue;
+            };
+            alloc_entries.push((key, record.offset, record.size));
         }
         dir.state.offset_alloc.restore(&alloc_entries);
 
