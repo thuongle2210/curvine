@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::layout::FileFinalizePlan;
+use crate::meta_store::BlockMetaStore;
 use crate::{
     BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
     SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
@@ -941,15 +942,41 @@ impl Dataset for VfsDataset {
     }
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        if self
-            .committed_rewrites
-            .get(&block.id)
-            .is_some_and(|meta| meta.storage_type() == StorageType::SpdkDisk)
-        {
-            return err_box!(
-                "committed SPDK rewrite publish is not implemented yet for block {}",
-                block.id
-            );
+        if let Some(committed) = self.committed_rewrites.get(&block.id).cloned() {
+            if committed.storage_type() == StorageType::SpdkDisk {
+                let staging = self.get_block_check(block.id)?.clone();
+                if staging.state() != &BlockState::Writing {
+                    return err_box!(
+                        "block {} status incorrect, expected {:?}, actual: {:?}",
+                        staging.id(),
+                        BlockState::Writing,
+                        staging.state()
+                    );
+                }
+                let dir = self.find_dir(staging.dir_id())?;
+                let final_meta = BlockMeta::with_final_spdk(&staging, block.len);
+                let Some(store) = self.meta.spdk_store() else {
+                    return err_box!("SPDK metadata store is not available for rewrite publish");
+                };
+                store.put_generation(
+                    committed.id(),
+                    -1,
+                    committed.dir_id(),
+                    committed.bdev_offset,
+                    committed.physical_bytes(),
+                    committed.len(),
+                    BlockState::Quarantined,
+                )?;
+                store.put_block_meta(&final_meta)?;
+                store.delete_generation(staging.id(), 1)?;
+                dir.state
+                    .offset_alloc
+                    .publish_generation(block.id, 1, -1)
+                    .map_err(|e| curvine_core_error::err_msg!(e))?;
+                self.committed_rewrites.remove(&block.id);
+                self.meta.put_memory_only(final_meta.clone());
+                return Ok(final_meta);
+            }
         }
 
         // Keep the meta borrow scoped before mutating the meta store and dir accounting.
@@ -2109,8 +2136,8 @@ mod test {
     }
 
     #[test]
-    fn spdk_rewrite_finalize_is_blocked_until_publish_support_exists() -> CommonResult<()> {
-        let path = "../testing/spdk_rewrite_finalize_blocked";
+    fn spdk_rewrite_finalize_publishes_staging_and_retires_old_extent() -> CommonResult<()> {
+        let path = "../testing/spdk_rewrite_finalize_publish";
         let _ = std::fs::remove_dir_all(path);
         let store = Arc::new(SpdkMetaStore::open(path, true)?);
         let state = spdk_state();
@@ -2124,13 +2151,18 @@ mod test {
         ds.finalize_block(&block)?;
         ds.open_block(&block)?;
 
-        let error = ds.finalize_block(&block).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("committed SPDK rewrite publish is not implemented"),
-            "unexpected error: {error}"
-        );
+        let published = ds.finalize_block(&block)?;
+        assert_eq!(published.bdev_offset, 4096);
+        assert!(published.is_final());
+        assert_eq!(ds.get_readable_block(1).unwrap().bdev_offset, 4096);
+        assert_eq!(store.get(1)?.unwrap().offset, 4096);
+        assert!(store.get_generation(1, 1)?.is_none());
+        let retired = store
+            .get_generation(1, -1)?
+            .expect("old extent retained as retired generation");
+        assert_eq!(retired.offset, 0);
+        assert_eq!(retired.state, BlockState::Quarantined);
+        assert!(state.offset_alloc.free_list_entries().is_empty());
         drop(ds);
         drop(store);
         let _ = std::fs::remove_dir_all(path);

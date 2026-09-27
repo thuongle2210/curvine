@@ -175,6 +175,32 @@ impl BdevOffsetAllocator {
         };
         self.free(key)
     }
+
+    pub fn publish_generation(
+        &self,
+        block_id: i64,
+        generation: i64,
+        retired_generation: i64,
+    ) -> Result<(), String> {
+        let generation_key = Self::generation_key(block_id, generation).ok_or_else(|| {
+            format!("invalid generation key for block {block_id} generation {generation}")
+        })?;
+        let retired_key = Self::generation_key(block_id, retired_generation).ok_or_else(|| {
+            format!("invalid retired key for block {block_id} generation {retired_generation}")
+        })?;
+        let mut inner = self.lock_inner();
+        let current = inner
+            .map
+            .remove(&block_id)
+            .ok_or_else(|| format!("block {block_id} has no published allocation"))?;
+        let staging = inner
+            .map
+            .remove(&generation_key)
+            .ok_or_else(|| format!("block {block_id} generation {generation} has no allocation"))?;
+        inner.map.insert(retired_key, current);
+        inner.map.insert(block_id, staging);
+        Ok(())
+    }
     /// Get offset for allocated block.
     pub fn get(&self, block_id: i64) -> Option<i64> {
         let inner = self.lock_inner();
