@@ -28,7 +28,6 @@ use indexmap::map::Values;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "spdk")]
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -244,6 +243,10 @@ impl VfsDataset {
             tx,
             self.extent_pins.clone(),
         );
+    }
+
+    pub fn set_extent_pin_drain_sender(&self, tx: mpsc::Sender<ExtentKey>) {
+        self.extent_pins.set_drain_sender(tx);
     }
 
     // Initialize.

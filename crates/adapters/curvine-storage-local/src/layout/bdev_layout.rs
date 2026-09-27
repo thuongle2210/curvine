@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout};
-use crate::{BdevOffsetAllocator, BlockMeta, ExtentKey, ExtentPinRegistry};
+#[cfg(feature = "spdk")]
+use crate::ExtentKey;
+use crate::{BdevOffsetAllocator, BlockMeta, ExtentPinRegistry};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;

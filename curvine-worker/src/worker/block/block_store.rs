@@ -22,7 +22,6 @@ use curvine_core_error::{CommonError, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
-#[cfg(feature = "spdk")]
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -49,6 +48,11 @@ impl BlockStore {
             dataset.set_spdk_terminal_event_sender(tx);
             Some(rx)
         };
+        let pin_drain_rx = {
+            let (tx, rx) = mpsc::channel();
+            dataset.set_extent_pin_drain_sender(tx);
+            rx
+        };
         let block_store = BlockStore {
             state: Arc::new(RwLock::new(dataset)),
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
@@ -59,8 +63,29 @@ impl BlockStore {
         if let Some(rx) = terminal_event_rx {
             block_store.spawn_spdk_terminal_cleanup(rx);
         }
+        block_store.spawn_extent_pin_drain_cleanup(pin_drain_rx);
 
         Ok(block_store)
+    }
+
+    fn spawn_extent_pin_drain_cleanup(&self, rx: mpsc::Receiver<curvine_storage_local::ExtentKey>) {
+        let store = self.clone();
+        std::thread::Builder::new()
+            .name("extent-pin-drain-cleanup".to_string())
+            .spawn(move || {
+                while let Ok(key) = rx.recv() {
+                    if let Err(err) = store.reclaim_retired_spdk_generation(key.block_id, -1) {
+                        log::debug!(
+                            "retired SPDK reclaim after pin drain skipped for block {} offset {} size {}: {}",
+                            key.block_id,
+                            key.bdev_offset,
+                            key.size,
+                            err
+                        );
+                    }
+                }
+            })
+            .expect("failed to spawn extent pin drain cleanup thread");
     }
 
     #[cfg(feature = "spdk")]
