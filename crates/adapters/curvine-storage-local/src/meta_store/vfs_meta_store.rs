@@ -42,6 +42,10 @@ impl VfsMetaStore {
         self.mem.put(meta)
     }
 
+    pub fn put_memory_only(&mut self, meta: BlockMeta) -> Option<BlockMeta> {
+        self.mem.put(meta)
+    }
+
     pub fn try_put(&mut self, meta: BlockMeta) -> CommonResult<Option<BlockMeta>> {
         self.try_persist_spdk_put(&meta)?;
         Ok(self.mem.put(meta))

@@ -854,6 +854,14 @@ impl Dataset for VfsDataset {
         match self.meta.get(block.id).cloned() {
             Some(meta) => {
                 if meta.is_active() {
+                    if meta.storage_type() == StorageType::SpdkDisk && meta.is_final() {
+                        let reservation = self
+                            .reserve_spdk_rewrite_generation(block)?
+                            .expect("finalized SPDK block must create rewrite reservation");
+                        self.meta.put_memory_only(reservation.staging.clone());
+                        return Ok(reservation.staging);
+                    }
+
                     let dir = self.find_dir(meta.dir_id())?;
                     let layout = self.layouts.get(meta.storage_type());
                     let preserves_committed =
@@ -916,6 +924,17 @@ impl Dataset for VfsDataset {
     }
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        if self
+            .committed_rewrites
+            .get(&block.id)
+            .is_some_and(|meta| meta.storage_type() == StorageType::SpdkDisk)
+        {
+            return err_box!(
+                "committed SPDK rewrite publish is not implemented yet for block {}",
+                block.id
+            );
+        }
+
         // Keep the meta borrow scoped before mutating the meta store and dir accounting.
         let (dir_id, reserved_bytes, final_bytes, final_meta) = {
             let meta = self.get_block_check(block.id)?;
@@ -976,6 +995,30 @@ impl Dataset for VfsDataset {
         };
 
         if let Some(committed) = self.committed_rewrites.get(&block.id).cloned() {
+            if committed.storage_type() == StorageType::SpdkDisk {
+                let Some(meta) = self.meta.get(block.id).cloned() else {
+                    return Ok(());
+                };
+                let dir = self
+                    .dir_list
+                    .get_dir(meta.dir_id())
+                    .ok_or_else(|| {
+                        curvine_core_error::err_msg!(format!(
+                            "No storage directory found: {:?}",
+                            meta.dir_id()
+                        ))
+                    })?
+                    .clone();
+                let reservation = SpdkRewriteReservation {
+                    published: committed.clone(),
+                    staging: meta,
+                    generation: 1,
+                    dir,
+                };
+                self.rollback_spdk_rewrite_generation(&reservation)?;
+                self.meta.put(committed);
+                return Ok(());
+            }
             let (layout, dir) = self.layout_for(&meta)?;
             layout.deallocate(&dir, &meta)?;
             layout.release(&dir, &meta);
@@ -2001,6 +2044,76 @@ mod test {
         assert_eq!(store.get(1)?.unwrap().offset, 0);
         assert_eq!(state.offset_alloc.free_list_entries(), vec![(4096, 4096)]);
 
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_open_finalized_rewrite_returns_staging_and_keeps_published_readable() -> CommonResult<()>
+    {
+        let path = "../testing/spdk_open_finalized_rewrite";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let state = spdk_state();
+        let mut ds = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, state.clone())])?,
+            Some(store.clone()),
+        )?;
+
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let writing = ds.open_block(&block)?;
+        assert_eq!(writing.bdev_offset, 0);
+        let published = ds.finalize_block(&block)?;
+        assert_eq!(published.bdev_offset, 0);
+
+        let staging = ds.open_block(&block)?;
+        assert_eq!(staging.state(), &BlockState::Writing);
+        assert_eq!(staging.bdev_offset, 4096);
+        assert_eq!(ds.get_readable_block(1).unwrap().bdev_offset, 0);
+        assert_eq!(
+            store.get(1)?.unwrap().offset,
+            0,
+            "legacy published metadata stays on X"
+        );
+        assert_eq!(store.get_generation(1, 1)?.unwrap().offset, 4096);
+
+        ds.abort_block(&block)?;
+        assert_eq!(ds.get_readable_block(1).unwrap().bdev_offset, 0);
+        assert!(store.get_generation(1, 1)?.is_none());
+        assert_eq!(state.offset_alloc.free_list_entries(), vec![(4096, 4096)]);
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_rewrite_finalize_is_blocked_until_publish_support_exists() -> CommonResult<()> {
+        let path = "../testing/spdk_rewrite_finalize_blocked";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let state = spdk_state();
+        let mut ds = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, state.clone())])?,
+            Some(store.clone()),
+        )?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.finalize_block(&block)?;
+        ds.open_block(&block)?;
+
+        let error = ds.finalize_block(&block).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("committed SPDK rewrite publish is not implemented"),
+            "unexpected error: {error}"
+        );
         drop(ds);
         drop(store);
         let _ = std::fs::remove_dir_all(path);
