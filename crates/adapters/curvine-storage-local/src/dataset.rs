@@ -48,6 +48,12 @@ pub trait Dataset {
     fn num_blocks_to_delete(&self) -> usize;
     fn increment_blocks_to_delete(&self);
     fn decrement_blocks_to_delete(&self);
+    fn quarantined_block_count(&self) -> usize {
+        0
+    }
+    fn quarantined_bytes(&self) -> i64 {
+        0
+    }
 
     fn available_str(&self) -> String {
         ByteUnit::byte_to_string(self.available() as u64)

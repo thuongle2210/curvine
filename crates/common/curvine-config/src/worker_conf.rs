@@ -147,6 +147,10 @@ pub struct WorkerConf {
     /// consume space after the worker samples the device.
     pub free_ratio: f64,
 
+    /// Maximum total bytes of SPDK extents allowed to remain quarantined before
+    /// rejecting new SPDK block allocations. `0` disables the guard.
+    pub spdk_quarantine_limit: String,
+
     pub data_dir: Vec<String>,
 
     pub io_slow_threshold: String,
@@ -205,6 +209,12 @@ impl WorkerConf {
         let dur = DurationUnit::from_str(&self.io_timeout).unwrap();
         dur.as_millis()
     }
+
+    pub fn spdk_quarantine_limit_bytes(&self) -> u64 {
+        ByteUnit::from_str(&self.spdk_quarantine_limit)
+            .map(|unit| unit.as_byte())
+            .unwrap_or(0)
+    }
 }
 
 impl Default for WorkerConf {
@@ -216,6 +226,7 @@ impl Default for WorkerConf {
             web_port: ClusterConf::DEFAULT_WORKER_WEB_PORT,
             dir_reserved: "0".to_string(),
             free_ratio: 0.0,
+            spdk_quarantine_limit: "0".to_string(),
             data_dir: vec![],
             io_slow_threshold: "300ms".to_string(),
             io_threads: 32,
@@ -280,5 +291,22 @@ data_dir = ["[SSD]/data/data1"]
 "#;
         let conf: WorkerConf = toml::from_str(toml).unwrap();
         assert_eq!(conf.free_ratio, 0.0);
+    }
+
+    #[test]
+    fn spdk_quarantine_limit_defaults_to_disabled() {
+        assert_eq!(WorkerConf::default().spdk_quarantine_limit, "0");
+        assert_eq!(WorkerConf::default().spdk_quarantine_limit_bytes(), 0);
+    }
+
+    #[test]
+    fn spdk_quarantine_limit_parses_from_toml() {
+        let toml = r#"
+dir_reserved = "0"
+spdk_quarantine_limit = "64MB"
+data_dir = ["[SSD]/data/data1"]
+"#;
+        let conf: WorkerConf = toml::from_str(toml).unwrap();
+        assert_eq!(conf.spdk_quarantine_limit_bytes(), 64 * 1024 * 1024);
     }
 }

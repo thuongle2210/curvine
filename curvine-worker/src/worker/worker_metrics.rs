@@ -43,6 +43,8 @@ pub struct WorkerMetrics {
     pub(crate) num_blocks: Gauge,
     pub(crate) store_total_disks: Gauge,
     pub(crate) num_blocks_to_delete: Gauge,
+    pub(crate) spdk_quarantined_blocks: Gauge,
+    pub(crate) spdk_quarantined_bytes: Gauge,
 
     /// Per-directory free-space ratio (0.1 = 10%). Pre-reserved, pre-guard.
     pub(crate) disk_free_ratio: GaugeVec,
@@ -96,6 +98,14 @@ impl WorkerMetrics {
                 "num_blocks_to_delete",
                 "Number of blocks pending deletion on the worker",
             )?,
+            spdk_quarantined_blocks: m::new_gauge(
+                "spdk_quarantined_blocks",
+                "Number of SPDK block extents quarantined after uncertain writes",
+            )?,
+            spdk_quarantined_bytes: m::new_gauge(
+                "spdk_quarantined_bytes",
+                "Total bytes reserved by quarantined SPDK extents",
+            )?,
 
             disk_free_ratio: m::new_gauge_vec(
                 "disk_free_ratio",
@@ -120,6 +130,9 @@ impl WorkerMetrics {
         self.num_blocks.set(state.num_blocks() as i64);
         self.num_blocks_to_delete
             .set(state.num_blocks_to_delete() as i64);
+        self.spdk_quarantined_blocks
+            .set(state.quarantined_block_count() as i64);
+        self.spdk_quarantined_bytes.set(state.quarantined_bytes());
 
         self.storage_failed.set(state.failed_storage_count() as i64);
 
