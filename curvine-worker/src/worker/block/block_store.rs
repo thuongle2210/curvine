@@ -374,6 +374,17 @@ impl BlockStore {
         })
     }
 
+    pub fn reclaim_retired_spdk_generation(
+        &self,
+        block_id: i64,
+        generation: i64,
+    ) -> CommonResult<()> {
+        let _block_lock = self.block_lock(block_id, "reclaim_retired_spdk");
+        self.with_dataset_write("reclaim_retired_spdk", |state| {
+            state.reclaim_retired_spdk_generation(block_id, generation)
+        })
+    }
+
     pub fn quarantined_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
         let state = self.read()?;
         Ok(state.quarantined_blocks())

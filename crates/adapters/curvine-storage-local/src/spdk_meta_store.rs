@@ -227,6 +227,7 @@ impl SpdkMetaStore {
             3 => Ok(BlockState::Allocating),
             4 => Ok(BlockState::Finalizing),
             5 => Ok(BlockState::Quarantined),
+            6 => Ok(BlockState::Retired),
             value => err_box!("SpdkMetaStore: unknown block state byte {}", value),
         }
     }
@@ -339,6 +340,16 @@ mod test {
         let record = store.get(1).unwrap().unwrap();
         assert!(!record.finalized);
         assert_eq!(record.state, BlockState::Quarantined);
+    }
+
+    #[test]
+    fn retired_state_roundtrip() {
+        let store = SpdkMetaStore::open(&test_dir("retired"), true).unwrap();
+        store
+            .put_with_state(1, 1, 0, 4096, 4096, BlockState::Retired)
+            .unwrap();
+        let record = store.get(1).unwrap().unwrap();
+        assert_eq!(record.state, BlockState::Retired);
     }
 
     #[test]

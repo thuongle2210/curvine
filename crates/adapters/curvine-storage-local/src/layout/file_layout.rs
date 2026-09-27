@@ -72,7 +72,8 @@ impl FileLayout {
             | BlockState::Recovering
             | BlockState::Allocating
             | BlockState::Finalizing
-            | BlockState::Quarantined => Self::staging_dir(dir),
+            | BlockState::Quarantined
+            | BlockState::Retired => Self::staging_dir(dir),
         };
 
         if path.exists() {

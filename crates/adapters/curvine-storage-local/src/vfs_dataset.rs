@@ -965,7 +965,7 @@ impl Dataset for VfsDataset {
                     committed.bdev_offset,
                     committed.physical_bytes(),
                     committed.len(),
-                    BlockState::Quarantined,
+                    BlockState::Retired,
                 )?;
                 store.put_block_meta(&final_meta)?;
                 store.delete_generation(staging.id(), 1)?;
@@ -973,6 +973,8 @@ impl Dataset for VfsDataset {
                     .offset_alloc
                     .publish_generation(block.id, 1, -1)
                     .map_err(|e| curvine_core_error::err_msg!(e))?;
+                dir.release_space(false, final_meta.physical_bytes());
+                dir.reserve_space(true, final_meta.physical_bytes());
                 self.committed_rewrites.remove(&block.id);
                 self.meta.put_memory_only(final_meta.clone());
                 return Ok(final_meta);
@@ -1074,6 +1076,34 @@ impl Dataset for VfsDataset {
         }
 
         self.remove_block_by_id(block.id)?;
+        Ok(())
+    }
+
+    fn reclaim_retired_spdk_generation(
+        &mut self,
+        block_id: i64,
+        generation: i64,
+    ) -> CommonResult<()> {
+        let Some(store) = self.meta.spdk_store() else {
+            return err_box!("SPDK metadata store is not available for retired reclaim");
+        };
+        let Some(record) = store.get_generation(block_id, generation)? else {
+            return Ok(());
+        };
+        if record.state != BlockState::Retired {
+            return err_box!(
+                "SPDK block {} generation {} is {:?}, expected Retired",
+                block_id,
+                generation,
+                record.state
+            );
+        }
+        let dir = self.dir_list.get_dir(record.dir_id).ok_or_else(|| {
+            curvine_core_error::err_msg!(format!("No storage directory found: {:?}", record.dir_id))
+        })?;
+        store.delete_generation(block_id, generation)?;
+        dir.state.offset_alloc.free_generation(block_id, generation);
+        dir.release_space(true, record.size);
         Ok(())
     }
 
@@ -2161,8 +2191,12 @@ mod test {
             .get_generation(1, -1)?
             .expect("old extent retained as retired generation");
         assert_eq!(retired.offset, 0);
-        assert_eq!(retired.state, BlockState::Quarantined);
+        assert_eq!(retired.state, BlockState::Retired);
         assert!(state.offset_alloc.free_list_entries().is_empty());
+
+        ds.reclaim_retired_spdk_generation(1, -1)?;
+        assert!(store.get_generation(1, -1)?.is_none());
+        assert_eq!(state.offset_alloc.free_list_entries(), vec![(0, 4096)]);
         drop(ds);
         drop(store);
         let _ = std::fs::remove_dir_all(path);
