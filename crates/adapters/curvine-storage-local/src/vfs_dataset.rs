@@ -19,7 +19,9 @@ use crate::{
     ExtentPinRegistry, FileLayout, SpdkMetaStore, StorageRequest, StorageVersion, VfsDir,
     VfsMetaStore,
 };
-use crate::{BlockMeta, BlockState, QuarantineReleaseProof};
+use crate::{
+    BlockMeta, BlockState, QuarantineReleaseProof, SPDK_RETIRED_GENERATION, SPDK_STAGING_GENERATION,
+};
 use curvine_config::{ClusterConf, WorkerDataDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
@@ -492,7 +494,7 @@ impl VfsDataset {
                 ))
             })?
             .clone();
-        let generation = 1;
+        let generation = SPDK_STAGING_GENERATION;
         let size = published.physical_bytes().max(block.len);
         let offset = dir
             .state
@@ -971,7 +973,7 @@ impl Dataset for VfsDataset {
                 };
                 store.put_generation(
                     committed.id(),
-                    -1,
+                    SPDK_RETIRED_GENERATION,
                     committed.dir_id(),
                     committed.bdev_offset,
                     committed.physical_bytes(),
@@ -979,10 +981,10 @@ impl Dataset for VfsDataset {
                     BlockState::Retired,
                 )?;
                 store.put_block_meta(&final_meta)?;
-                store.delete_generation(staging.id(), 1)?;
+                store.delete_generation(staging.id(), SPDK_STAGING_GENERATION)?;
                 dir.state
                     .offset_alloc
-                    .publish_generation(block.id, 1, -1)
+                    .publish_generation(block.id, SPDK_STAGING_GENERATION, SPDK_RETIRED_GENERATION)
                     .map_err(|e| curvine_core_error::err_msg!(e))?;
                 dir.release_space(false, final_meta.physical_bytes());
                 dir.reserve_space(true, final_meta.physical_bytes());
@@ -1069,7 +1071,7 @@ impl Dataset for VfsDataset {
                 let reservation = SpdkRewriteReservation {
                     published: committed.clone(),
                     staging: meta,
-                    generation: 1,
+                    generation: SPDK_STAGING_GENERATION,
                     dir,
                 };
                 self.rollback_spdk_rewrite_generation(&reservation)?;
@@ -1180,7 +1182,10 @@ mod test {
         BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion,
         VfsDataset, VfsDir,
     };
-    use crate::{BlockMeta, BlockState, ExtentKey, QuarantineReleaseProof};
+    use crate::{
+        BlockMeta, BlockState, ExtentKey, QuarantineReleaseProof, SPDK_RETIRED_GENERATION,
+        SPDK_STAGING_GENERATION,
+    };
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_io::DataSlice;
@@ -2103,11 +2108,11 @@ mod test {
             .expect("finalized SPDK block should reserve staging generation");
         assert_eq!(reservation.published.bdev_offset, 0);
         assert_eq!(reservation.staging.bdev_offset, 4096);
-        assert_eq!(reservation.generation, 1);
+        assert_eq!(reservation.generation, SPDK_STAGING_GENERATION);
         assert_eq!(ds.get_block(1).unwrap().bdev_offset, 0);
 
         let generation = store
-            .get_generation(1, 1)?
+            .get_generation(1, SPDK_STAGING_GENERATION)?
             .expect("staging generation persisted");
         assert_eq!(generation.offset, 4096);
         assert_eq!(generation.state, BlockState::Writing);
@@ -2137,7 +2142,7 @@ mod test {
         let reservation = ds.reserve_spdk_rewrite_generation(&block)?.unwrap();
 
         ds.rollback_spdk_rewrite_generation(&reservation)?;
-        assert!(store.get_generation(1, 1)?.is_none());
+        assert!(store.get_generation(1, SPDK_STAGING_GENERATION)?.is_none());
         assert_eq!(store.get(1)?.unwrap().offset, 0);
         assert_eq!(state.offset_alloc.free_list_entries(), vec![(4096, 4096)]);
 
@@ -2175,11 +2180,17 @@ mod test {
             0,
             "legacy published metadata stays on X"
         );
-        assert_eq!(store.get_generation(1, 1)?.unwrap().offset, 4096);
+        assert_eq!(
+            store
+                .get_generation(1, SPDK_STAGING_GENERATION)?
+                .unwrap()
+                .offset,
+            4096
+        );
 
         ds.abort_block(&block)?;
         assert_eq!(ds.get_readable_block(1).unwrap().bdev_offset, 0);
-        assert!(store.get_generation(1, 1)?.is_none());
+        assert!(store.get_generation(1, SPDK_STAGING_GENERATION)?.is_none());
         assert_eq!(state.offset_alloc.free_list_entries(), vec![(4096, 4096)]);
 
         drop(ds);
@@ -2209,9 +2220,9 @@ mod test {
         assert!(published.is_final());
         assert_eq!(ds.get_readable_block(1).unwrap().bdev_offset, 4096);
         assert_eq!(store.get(1)?.unwrap().offset, 4096);
-        assert!(store.get_generation(1, 1)?.is_none());
+        assert!(store.get_generation(1, SPDK_STAGING_GENERATION)?.is_none());
         let retired = store
-            .get_generation(1, -1)?
+            .get_generation(1, SPDK_RETIRED_GENERATION)?
             .expect("old extent retained as retired generation");
         assert_eq!(retired.offset, 0);
         assert_eq!(retired.state, BlockState::Retired);
@@ -2222,12 +2233,14 @@ mod test {
             bdev_offset: 0,
             size: 4096,
         });
-        assert!(ds.reclaim_retired_spdk_generation(1, -1).is_err());
-        assert!(store.get_generation(1, -1)?.is_some());
+        assert!(ds
+            .reclaim_retired_spdk_generation(1, SPDK_RETIRED_GENERATION)
+            .is_err());
+        assert!(store.get_generation(1, SPDK_RETIRED_GENERATION)?.is_some());
         drop(pin);
 
-        ds.reclaim_retired_spdk_generation(1, -1)?;
-        assert!(store.get_generation(1, -1)?.is_none());
+        ds.reclaim_retired_spdk_generation(1, SPDK_RETIRED_GENERATION)?;
+        assert!(store.get_generation(1, SPDK_RETIRED_GENERATION)?.is_none());
         assert_eq!(state.offset_alloc.free_list_entries(), vec![(0, 4096)]);
         drop(ds);
         drop(store);
@@ -2253,7 +2266,7 @@ mod test {
             ds.finalize_block(&block)?;
             ds.open_block(&block)?;
             ds.finalize_block(&block)?;
-            assert!(store.get_generation(1, -1)?.is_some());
+            assert!(store.get_generation(1, SPDK_RETIRED_GENERATION)?.is_some());
         }
 
         let restart_state = spdk_state();
@@ -2271,8 +2284,8 @@ mod test {
             "retired X and current Y must both occupy allocator space after restart"
         );
 
-        restarted.reclaim_retired_spdk_generation(1, -1)?;
-        assert!(store.get_generation(1, -1)?.is_none());
+        restarted.reclaim_retired_spdk_generation(1, SPDK_RETIRED_GENERATION)?;
+        assert!(store.get_generation(1, SPDK_RETIRED_GENERATION)?.is_none());
         assert_eq!(
             restart_state.offset_alloc.free_list_entries(),
             vec![(0, 4096)]
@@ -2290,7 +2303,15 @@ mod test {
         let _ = std::fs::remove_dir_all(path);
         let store = Arc::new(SpdkMetaStore::open(path, true)?);
         store.put(1, 1, 0, 4096, 4096, true)?;
-        store.put_generation(1, 1, 1, 4096, 4096, 4096, BlockState::Writing)?;
+        store.put_generation(
+            1,
+            SPDK_STAGING_GENERATION,
+            1,
+            4096,
+            4096,
+            4096,
+            BlockState::Writing,
+        )?;
 
         let restart_state = spdk_state();
         let mut restarted = VfsDataset::new(
@@ -2299,7 +2320,7 @@ mod test {
             Some(store.clone()),
         )?;
         let recovered = store
-            .get_generation(1, 1)?
+            .get_generation(1, SPDK_STAGING_GENERATION)?
             .expect("staging generation should remain persisted");
         assert_eq!(recovered.state, BlockState::Quarantined);
         assert_eq!(restarted.get_readable_block(1).unwrap().bdev_offset, 0);

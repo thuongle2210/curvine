@@ -37,7 +37,9 @@ mod extent_pin;
 pub use self::extent_pin::{ExtentKey, ExtentPinGuard, ExtentPinRegistry};
 
 mod spdk_meta_store;
-pub use self::spdk_meta_store::SpdkMetaStore;
+pub use self::spdk_meta_store::{
+    SpdkMetaStore, SPDK_LEGACY_GENERATION, SPDK_RETIRED_GENERATION, SPDK_STAGING_GENERATION,
+};
 
 mod meta_store;
 pub use self::meta_store::*;

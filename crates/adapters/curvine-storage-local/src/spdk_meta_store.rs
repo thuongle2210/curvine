@@ -13,6 +13,14 @@ const CF_SPDK_BLOCKS: &str = "spdk_blocks";
 const VALUE_SIZE: usize = 30;
 const LEGACY_VALUE_SIZE: usize = 29;
 const GENERATION_KEY_PREFIX: u8 = 0xff;
+pub const SPDK_LEGACY_GENERATION: i64 = 0;
+/// Full-replacement staging extent for committed SPDK rewrites. Curvine does
+/// not track per-sector overrides; a rewrite builds a complete replacement
+/// extent and publishes that whole extent atomically.
+pub const SPDK_STAGING_GENERATION: i64 = 1;
+/// Previous published extent retained after a committed SPDK rewrite publish.
+/// It is reclaimed only after reader pins and old commands have drained.
+pub const SPDK_RETIRED_GENERATION: i64 = -1;
 pub struct SpdkMetaStore {
     db: DBEngine,
 }
