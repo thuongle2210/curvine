@@ -1,7 +1,8 @@
 //! RocksDB-backed SPDK block metadata.
 use crate::meta_store::BlockMetaStore;
 use crate::{BlockMeta, BlockState};
-/// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) | state(1B).
+/// Legacy key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) | state(1B).
+/// Generation key: 0xff | block_id (8B) | generation (8B). Same value shape plus generation in record.
 /// Older 29-byte records without state decode from finalized.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};
@@ -11,12 +12,14 @@ use log::{info, warn};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";
 const VALUE_SIZE: usize = 30;
 const LEGACY_VALUE_SIZE: usize = 29;
+const GENERATION_KEY_PREFIX: u8 = 0xff;
 pub struct SpdkMetaStore {
     db: DBEngine,
 }
 #[derive(Debug, Clone)]
 pub struct SpdkBlockRecord {
     pub block_id: i64,
+    pub generation: i64,
     pub dir_id: u32,
     pub offset: i64,
     pub size: i64,
@@ -61,6 +64,39 @@ impl SpdkMetaStore {
         let value = Self::encode_value(dir_id, offset, size, len, state);
         self.db.put_cf(CF_SPDK_BLOCKS, key, value)
     }
+
+    pub fn put_generation(
+        &self,
+        block_id: i64,
+        generation: i64,
+        dir_id: u32,
+        offset: i64,
+        size: i64,
+        len: i64,
+        state: BlockState,
+    ) -> CommonResult<()> {
+        let key = Self::encode_generation_key(block_id, generation);
+        let value = Self::encode_value(dir_id, offset, size, len, state);
+        self.db.put_cf(CF_SPDK_BLOCKS, key, value)
+    }
+
+    pub fn delete_generation(&self, block_id: i64, generation: i64) -> CommonResult<()> {
+        let key = Self::encode_generation_key(block_id, generation);
+        self.db.delete_cf(CF_SPDK_BLOCKS, key)
+    }
+
+    pub fn get_generation(
+        &self,
+        block_id: i64,
+        generation: i64,
+    ) -> CommonResult<Option<SpdkBlockRecord>> {
+        let key = Self::encode_generation_key(block_id, generation);
+        match self.db.get_cf(CF_SPDK_BLOCKS, key)? {
+            None => Ok(None),
+            Some(v) => Ok(Some(Self::decode_value(block_id, generation, &v)?)),
+        }
+    }
+
     pub fn delete(&self, block_id: i64) -> CommonResult<()> {
         let key = Self::encode_key(block_id);
         self.db.delete_cf(CF_SPDK_BLOCKS, key)
@@ -70,7 +106,7 @@ impl SpdkMetaStore {
         match self.db.get_cf(CF_SPDK_BLOCKS, key)? {
             None => Ok(None),
             Some(v) => {
-                let rec = Self::decode_value(block_id, &v)?;
+                let rec = Self::decode_value(block_id, 0, &v)?;
                 Ok(Some(rec))
             }
         }
@@ -83,6 +119,9 @@ impl SpdkMetaStore {
                 Ok(kv) => kv,
                 Err(e) => return err_box!("RocksDB scan error: {}", e),
             };
+            if key_bytes.first().copied() == Some(GENERATION_KEY_PREFIX) {
+                continue;
+            }
             if key_bytes.len() < 8 {
                 warn!(
                     "SpdkMetaStore: skipping short key ({} bytes)",
@@ -91,7 +130,7 @@ impl SpdkMetaStore {
                 continue;
             }
             let block_id = BigEndian::read_i64(&key_bytes);
-            match Self::decode_value(block_id, &val_bytes) {
+            match Self::decode_value(block_id, 0, &val_bytes) {
                 Ok(rec) => records.push(rec),
                 Err(e) => {
                     warn!(
@@ -103,12 +142,58 @@ impl SpdkMetaStore {
         }
         Ok(records)
     }
+
+    pub fn scan_generations(&self) -> CommonResult<Vec<SpdkBlockRecord>> {
+        let iter = self.db.scan(CF_SPDK_BLOCKS)?;
+        let mut records = Vec::new();
+        for item in iter {
+            let (key_bytes, val_bytes) = match item {
+                Ok(kv) => kv,
+                Err(e) => return err_box!("RocksDB scan error: {}", e),
+            };
+            let Some((block_id, generation)) = Self::decode_generation_key(&key_bytes) else {
+                continue;
+            };
+            match Self::decode_value(block_id, generation, &val_bytes) {
+                Ok(rec) => records.push(rec),
+                Err(e) => {
+                    warn!(
+                        "SpdkMetaStore: skipping corrupt generation record for block {} generation {}: {}",
+                        block_id, generation, e
+                    );
+                }
+            }
+        }
+        Ok(records)
+    }
+
     #[inline]
     fn encode_key(block_id: i64) -> [u8; 8] {
         let mut buf = [0u8; 8];
         BigEndian::write_i64(&mut buf, block_id);
         buf
     }
+
+    #[inline]
+    fn encode_generation_key(block_id: i64, generation: i64) -> [u8; 17] {
+        let mut buf = [0u8; 17];
+        buf[0] = GENERATION_KEY_PREFIX;
+        BigEndian::write_i64(&mut buf[1..9], block_id);
+        BigEndian::write_i64(&mut buf[9..17], generation);
+        buf
+    }
+
+    #[inline]
+    fn decode_generation_key(bytes: &[u8]) -> Option<(i64, i64)> {
+        if bytes.len() != 17 || bytes[0] != GENERATION_KEY_PREFIX {
+            return None;
+        }
+        Some((
+            BigEndian::read_i64(&bytes[1..9]),
+            BigEndian::read_i64(&bytes[9..17]),
+        ))
+    }
+
     #[inline]
     fn encode_value(
         dir_id: u32,
@@ -147,7 +232,7 @@ impl SpdkMetaStore {
     }
 
     #[inline]
-    fn decode_value(block_id: i64, bytes: &[u8]) -> CommonResult<SpdkBlockRecord> {
+    fn decode_value(block_id: i64, generation: i64, bytes: &[u8]) -> CommonResult<SpdkBlockRecord> {
         if bytes.len() < LEGACY_VALUE_SIZE {
             return err_box!(
                 "SpdkMetaStore: value too short for block {} ({} < {})",
@@ -160,6 +245,7 @@ impl SpdkMetaStore {
         let state = Self::decode_state(finalized, bytes)?;
         Ok(SpdkBlockRecord {
             block_id,
+            generation,
             dir_id: BigEndian::read_u32(&bytes[0..4]),
             offset: BigEndian::read_i64(&bytes[4..12]),
             size: BigEndian::read_i64(&bytes[12..20]),
@@ -201,6 +287,7 @@ mod test {
         store.put(2, 1, 4096, 8192, 6000, false).unwrap();
         let r = store.get(1).unwrap().unwrap();
         assert_eq!(r.offset, 0);
+        assert_eq!(r.generation, 0);
         assert!(r.finalized);
         assert_eq!(r.state, BlockState::Finalized);
         store.delete(1).unwrap();
@@ -252,5 +339,58 @@ mod test {
         let record = store.get(1).unwrap().unwrap();
         assert!(!record.finalized);
         assert_eq!(record.state, BlockState::Quarantined);
+    }
+
+    #[test]
+    fn generation_records_allow_multiple_extents_per_block() {
+        let store = SpdkMetaStore::open(&test_dir("generations"), true).unwrap();
+        store
+            .put_generation(1, 7, 1, 0, 4096, 4096, BlockState::Finalized)
+            .unwrap();
+        store
+            .put_generation(1, 8, 1, 4096, 4096, 4096, BlockState::Writing)
+            .unwrap();
+
+        let gen7 = store.get_generation(1, 7).unwrap().unwrap();
+        let gen8 = store.get_generation(1, 8).unwrap().unwrap();
+        assert_eq!(gen7.block_id, 1);
+        assert_eq!(gen7.generation, 7);
+        assert_eq!(gen7.offset, 0);
+        assert_eq!(gen7.state, BlockState::Finalized);
+        assert_eq!(gen8.generation, 8);
+        assert_eq!(gen8.offset, 4096);
+        assert_eq!(gen8.state, BlockState::Writing);
+    }
+
+    #[test]
+    fn generation_scan_is_separate_from_legacy_scan() {
+        let store = SpdkMetaStore::open(&test_dir("generation_scan"), true).unwrap();
+        store.put(1, 1, 0, 4096, 4096, true).unwrap();
+        store
+            .put_generation(1, 2, 1, 4096, 4096, 4096, BlockState::Writing)
+            .unwrap();
+
+        let legacy = store.scan_all().unwrap();
+        let generations = store.scan_generations().unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].generation, 0);
+        assert_eq!(generations.len(), 1);
+        assert_eq!(generations[0].block_id, 1);
+        assert_eq!(generations[0].generation, 2);
+    }
+
+    #[test]
+    fn delete_generation_removes_only_that_generation() {
+        let store = SpdkMetaStore::open(&test_dir("delete_generation"), true).unwrap();
+        store
+            .put_generation(1, 7, 1, 0, 4096, 4096, BlockState::Finalized)
+            .unwrap();
+        store
+            .put_generation(1, 8, 1, 4096, 4096, 4096, BlockState::Writing)
+            .unwrap();
+
+        store.delete_generation(1, 7).unwrap();
+        assert!(store.get_generation(1, 7).unwrap().is_none());
+        assert!(store.get_generation(1, 8).unwrap().is_some());
     }
 }
