@@ -33,4 +33,4 @@ pub use spdk_bdev::SpdkBdev;
 #[cfg(feature = "spdk")]
 pub use spdk_env::{BdevInfo, SpdkEnv, SpdkEnvState};
 #[cfg(feature = "spdk")]
-pub use spdk_poller::{CtrlHandle, PollerConfig};
+pub use spdk_poller::{CtrlHandle, PollerConfig, SpdkCommandTerminalEvent};

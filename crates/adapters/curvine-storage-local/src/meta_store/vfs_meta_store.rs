@@ -57,6 +57,10 @@ impl VfsMetaStore {
         self.mem.values().cloned().collect()
     }
 
+    pub fn spdk_store(&self) -> Option<Arc<SpdkMetaStore>> {
+        self.spdk.clone()
+    }
+
     #[cfg(test)]
     pub fn contains_key(&self, id: i64) -> bool {
         self.mem.contains_key(id)

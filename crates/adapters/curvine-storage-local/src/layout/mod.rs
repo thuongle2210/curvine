@@ -24,7 +24,12 @@ use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
 use curvine_model::{ExtendedBlock, StorageType};
+#[cfg(feature = "spdk")]
+use std::sync::mpsc;
 use std::sync::Arc;
+
+#[cfg(feature = "spdk")]
+use curvine_storage_spdk::SpdkCommandTerminalEvent;
 
 fn validate_open_offset(meta: &BlockMeta, off: i64) -> IOResult<()> {
     if off < 0 || off > meta.len {
@@ -93,6 +98,14 @@ impl BlockLayoutKind {
     fn bdev(spdk_meta: Option<Arc<SpdkMetaStore>>) -> Self {
         Self::Bdev(BdevLayout::new(spdk_meta))
     }
+
+    #[cfg(feature = "spdk")]
+    fn bdev_with_terminal_event_tx(
+        spdk_meta: Option<Arc<SpdkMetaStore>>,
+        tx: mpsc::Sender<SpdkCommandTerminalEvent>,
+    ) -> Self {
+        Self::Bdev(BdevLayout::new(spdk_meta).with_terminal_event_tx(tx))
+    }
 }
 
 #[derive(Clone)]
@@ -106,6 +119,17 @@ impl BlockLayouts {
         Self {
             file: BlockLayoutKind::file(),
             bdev: BlockLayoutKind::bdev(spdk_meta),
+        }
+    }
+
+    #[cfg(feature = "spdk")]
+    pub fn with_terminal_event_tx(
+        spdk_meta: Option<Arc<SpdkMetaStore>>,
+        tx: mpsc::Sender<SpdkCommandTerminalEvent>,
+    ) -> Self {
+        Self {
+            file: BlockLayoutKind::file(),
+            bdev: BlockLayoutKind::bdev_with_terminal_event_tx(spdk_meta, tx),
         }
     }
 

@@ -26,7 +26,12 @@ use indexmap::map::Values;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "spdk")]
+use std::sync::mpsc;
 use std::sync::Arc;
+
+#[cfg(feature = "spdk")]
+use curvine_storage_spdk::SpdkCommandTerminalEvent;
 
 const MAX_FREE_RATIO: f64 = 1.0_f64.next_down();
 
@@ -214,6 +219,11 @@ impl VfsDataset {
         };
 
         Self::new(cluster_id, dir_list, spdk_meta)
+    }
+
+    #[cfg(feature = "spdk")]
+    pub fn set_spdk_terminal_event_sender(&mut self, tx: mpsc::Sender<SpdkCommandTerminalEvent>) {
+        self.layouts = BlockLayouts::with_terminal_event_tx(self.meta.spdk_store(), tx);
     }
 
     // Initialize.

@@ -19,6 +19,7 @@ use curvine_io::IOResult;
 use log::{debug, error, warn};
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 // ---------------------------------------------------------------------------
 // SPDK I/O channel — bridge between Tokio and SPDK reactor
 // ---------------------------------------------------------------------------
@@ -147,6 +148,8 @@ pub struct SpdkBdev {
     io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     uncertain_writes: bool,
+    write_terminal_event: Option<crate::spdk_poller::SpdkCommandTerminalEvent>,
+    terminal_event_tx: Option<mpsc::Sender<crate::spdk_poller::SpdkCommandTerminalEvent>>,
 }
 
 // SAFETY: owns qpair and DMA buffers exclusively
@@ -253,8 +256,19 @@ impl SpdkBdev {
                 io_timeout_ms,
                 inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 uncertain_writes: false,
+                write_terminal_event: None,
+                terminal_event_tx: None,
             })
         }
+    }
+
+    pub fn set_write_terminal_event(
+        &mut self,
+        event: crate::spdk_poller::SpdkCommandTerminalEvent,
+        tx: mpsc::Sender<crate::spdk_poller::SpdkCommandTerminalEvent>,
+    ) {
+        self.write_terminal_event = Some(event);
+        self.terminal_event_tx = Some(tx);
     }
 
     fn mark_qpair_dead_on_terminal_handle_error(&mut self, rc: i32) {
@@ -492,8 +506,8 @@ impl SpdkBdev {
                 },
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
-                terminal_event: None,
-                terminal_event_tx: None,
+                terminal_event: self.write_terminal_event,
+                terminal_event_tx: self.terminal_event_tx.clone(),
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
