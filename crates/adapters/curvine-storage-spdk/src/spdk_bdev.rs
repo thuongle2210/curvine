@@ -358,6 +358,8 @@ impl SpdkBdev {
                 },
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
+                terminal_event: None,
+                terminal_event_tx: None,
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
@@ -438,6 +440,8 @@ impl SpdkBdev {
                     },
                     completion: completion.clone(),
                     bdev_inflight: self.inflight.clone(),
+                    terminal_event: None,
+                    terminal_event_tx: None,
                 };
                 if self.io_channel.poller_tx.send(req).is_err() {
                     self.inflight
@@ -488,6 +492,8 @@ impl SpdkBdev {
                 },
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
+                terminal_event: None,
+                terminal_event_tx: None,
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
@@ -538,6 +544,8 @@ impl SpdkBdev {
             },
             completion: completion.clone(),
             bdev_inflight: self.inflight.clone(),
+            terminal_event: None,
+            terminal_event_tx: None,
         };
         if self.io_channel.poller_tx.send(req).is_err() {
             self.inflight
