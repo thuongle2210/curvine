@@ -15,6 +15,7 @@
 use crate::meta_store::{BlockMetaStore, MemMetaStore};
 use crate::BlockMeta;
 use crate::SpdkMetaStore;
+use curvine_core_error::CommonResult;
 use curvine_model::StorageType;
 use log::warn;
 use std::sync::Arc;
@@ -41,12 +42,25 @@ impl VfsMetaStore {
         self.mem.put(meta)
     }
 
+    pub fn try_put(&mut self, meta: BlockMeta) -> CommonResult<Option<BlockMeta>> {
+        self.try_persist_spdk_put(&meta)?;
+        Ok(self.mem.put(meta))
+    }
+
     pub fn remove(&mut self, id: i64) -> Option<BlockMeta> {
         let meta = self.mem.remove(id);
         if let Some(meta) = meta.as_ref() {
             self.persist_spdk_remove(meta);
         }
         meta
+    }
+
+    pub fn try_remove(&mut self, id: i64) -> CommonResult<Option<BlockMeta>> {
+        let Some(meta) = self.mem.get(id).cloned() else {
+            return Ok(None);
+        };
+        self.try_persist_spdk_remove(&meta)?;
+        Ok(self.mem.remove(id))
     }
 
     pub fn block_count(&self) -> usize {
@@ -78,6 +92,17 @@ impl VfsMetaStore {
         }
     }
 
+    fn try_persist_spdk_put(&self, meta: &BlockMeta) -> CommonResult<()> {
+        if meta.storage_type() != StorageType::SpdkDisk {
+            return Ok(());
+        }
+
+        if let Some(store) = self.spdk.as_ref() {
+            store.put_block_meta(meta)?;
+        }
+        Ok(())
+    }
+
     fn persist_spdk_remove(&self, meta: &BlockMeta) {
         if meta.storage_type() != StorageType::SpdkDisk {
             return;
@@ -88,5 +113,16 @@ impl VfsMetaStore {
                 warn!("SpdkMetaStore delete failed for block {}: {}", meta.id(), e);
             }
         }
+    }
+
+    fn try_persist_spdk_remove(&self, meta: &BlockMeta) -> CommonResult<()> {
+        if meta.storage_type() != StorageType::SpdkDisk {
+            return Ok(());
+        }
+
+        if let Some(store) = self.spdk.as_ref() {
+            store.remove_block_meta(meta)?;
+        }
+        Ok(())
     }
 }

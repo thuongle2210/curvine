@@ -587,10 +587,23 @@ impl VfsDataset {
         proof: QuarantineReleaseProof,
     ) -> CommonResult<BlockMeta> {
         let id = proof.block_id;
-        let removed = self.remove_block_state_by_id(id)?;
+        let meta = match self.meta.get(id).cloned() {
+            None => return err_box!("Not found block {}", id),
+            Some(meta) => meta,
+        };
+        let layout = self.layouts.get(meta.storage_type()).clone();
+        let dir = match self.dir_list.get_dir(meta.dir_id()) {
+            None => return err_box!("No storage directory found: {:?}", meta.dir_id()),
+            Some(dir) => dir.clone(),
+        };
+        let removed = RemovedBlockState {
+            meta,
+            committed: self.committed_rewrites.get(&id).cloned(),
+            layout,
+            dir,
+        };
         if removed.meta.state() != &BlockState::Quarantined {
             let state = *removed.meta.state();
-            self.restore_removed_block(removed);
             return err_box!(
                 "block {} is {:?}, expected Quarantined for quarantine release",
                 id,
@@ -598,7 +611,6 @@ impl VfsDataset {
             );
         }
         if removed.meta.storage_type() != StorageType::SpdkDisk {
-            self.restore_removed_block(removed);
             return err_box!("block {} is not an SPDK block", id);
         }
         if removed.meta.bdev_offset != proof.bdev_offset
@@ -606,7 +618,6 @@ impl VfsDataset {
         {
             let actual_offset = removed.meta.bdev_offset;
             let actual_size = removed.meta.physical_bytes();
-            self.restore_removed_block(removed);
             return err_box!(
                 "quarantine release proof mismatch for block {}: proof offset={}, size={}, actual offset={}, size={}",
                 id,
@@ -618,9 +629,12 @@ impl VfsDataset {
         }
 
         if let Err(e) = removed.deallocate() {
-            self.restore_removed_block(removed);
             return Err(e);
         }
+        self.meta
+            .try_remove(id)?
+            .expect("block metadata must exist after prior lookup");
+        self.committed_rewrites.remove(&id);
         removed.release();
         Ok(removed.meta)
     }
@@ -849,8 +863,7 @@ impl Dataset for VfsDataset {
             return self.abort_block(block);
         }
 
-        if let Some(committed) = self.committed_rewrites.remove(&block.id) {
-            self.meta.put(committed);
+        if self.committed_rewrites.remove(&block.id).is_some() {
             meta.state = BlockState::Quarantined;
             warn!(
                 "quarantining uncertain SPDK rewrite block {} at offset {} size {}",
@@ -858,7 +871,7 @@ impl Dataset for VfsDataset {
                 meta.bdev_offset,
                 meta.physical_bytes()
             );
-            self.meta.put(meta);
+            self.meta.try_put(meta)?;
             return Ok(());
         }
 
@@ -871,7 +884,7 @@ impl Dataset for VfsDataset {
             meta.bdev_offset,
             meta.physical_bytes()
         );
-        self.meta.put(meta);
+        self.meta.try_put(meta)?;
         Ok(())
     }
 
