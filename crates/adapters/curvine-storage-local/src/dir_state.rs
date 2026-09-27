@@ -65,6 +65,14 @@ struct OffsetAllocInner {
     free_list: BTreeMap<i64, i64>,
 }
 impl BdevOffsetAllocator {
+    fn generation_key(block_id: i64, generation: i64) -> Option<i64> {
+        if generation == 0 {
+            return Some(block_id);
+        }
+        let key = i64::MIN.checked_add(block_id.checked_mul(1024)?)?;
+        key.checked_add(generation)
+    }
+
     /// Create a new allocator for a bdev with the given capacity and alignment.
     pub fn new(capacity: i64, align: i64) -> Self {
         Self {
@@ -95,6 +103,22 @@ impl BdevOffsetAllocator {
     /// Allocate bytes for block_id. Returns bdev offset (aligned to block size).
     /// First checks the free-list (first-fit), then falls back to bump cursor.
     pub fn allocate(&self, block_id: i64, size: i64) -> Result<i64, String> {
+        self.allocate_key(block_id, size)
+    }
+
+    pub fn allocate_generation(
+        &self,
+        block_id: i64,
+        generation: i64,
+        size: i64,
+    ) -> Result<i64, String> {
+        let key = Self::generation_key(block_id, generation).ok_or_else(|| {
+            format!("invalid generation key for block {block_id} generation {generation}")
+        })?;
+        self.allocate_key(key, size)
+    }
+
+    fn allocate_key(&self, block_id: i64, size: i64) -> Result<i64, String> {
         let mut inner = self.lock_inner();
         if inner.map.contains_key(&block_id) {
             return Err(format!(
@@ -143,6 +167,13 @@ impl BdevOffsetAllocator {
         inner.cursor = end;
         inner.map.insert(block_id, (offset, aligned_size));
         Ok(offset)
+    }
+
+    pub fn free_generation(&self, block_id: i64, generation: i64) {
+        let Some(key) = Self::generation_key(block_id, generation) else {
+            return;
+        };
+        self.free(key)
     }
     /// Get offset for allocated block.
     pub fn get(&self, block_id: i64) -> Option<i64> {
