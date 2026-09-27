@@ -195,6 +195,7 @@ impl QpairPool {
         }
     }
 
+    /// Stop new qpair reservations for a controller before detach/removal starts.
     fn begin_controller_retire(&self, ctrlr_ptr: usize) -> CommonResult<()> {
         let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         let ctrl = state.get(&ctrlr_ptr).ok_or_else(|| {
@@ -208,6 +209,7 @@ impl QpairPool {
         Ok(())
     }
 
+    /// Free cached idle qpairs for a retiring controller, preserving failures for retry.
     fn drain_controller(&self, ctrlr_ptr: usize) -> bool {
         let qpairs = self
             .inner
@@ -235,6 +237,7 @@ impl QpairPool {
         false
     }
 
+    /// Remove controller accounting once no cached or active qpairs remain.
     fn finish_controller_remove(&self, ctrlr_ptr: usize) -> CommonResult<()> {
         if self
             .inner
@@ -998,6 +1001,7 @@ impl SpdkEnv {
         self.active_bdevs().map(|b| b.size_bytes).sum()
     }
 
+    /// Iterate bdevs whose controller is still active and available for opens.
     fn active_bdevs(&self) -> impl Iterator<Item = &BdevInfo> {
         self.bdevs.iter().filter(|bdev| {
             self.controllers
@@ -1270,6 +1274,7 @@ impl SpdkEnv {
     }
 
     fn validate_detach_preconditions(target_idx: usize, open_handles: usize) -> CommonResult<()> {
+        // Open SpdkBdev handles may still use controller, namespace, or qpair pointers.
         if open_handles != 0 {
             return err_box!(
                 "cannot detach SPDK target {} while {} handle(s) are open",
