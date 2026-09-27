@@ -15,8 +15,9 @@
 use crate::layout::FileFinalizePlan;
 use crate::meta_store::BlockMetaStore;
 use crate::{
-    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
-    SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
+    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, ExtentKey,
+    ExtentPinRegistry, FileLayout, SpdkMetaStore, StorageRequest, StorageVersion, VfsDir,
+    VfsMetaStore,
 };
 use crate::{BlockMeta, BlockState, QuarantineReleaseProof};
 use curvine_config::{ClusterConf, WorkerDataDir};
@@ -70,6 +71,7 @@ pub struct VfsDataset {
     layouts: BlockLayouts,
     num_blocks_to_delete: AtomicUsize,
     spdk_quarantine_limit: i64,
+    extent_pins: Arc<ExtentPinRegistry>,
 }
 
 pub struct RemovedBlockState {
@@ -148,6 +150,7 @@ impl VfsDataset {
             Some(v) => v.version().worker_id,
         };
 
+        let extent_pins = Arc::new(ExtentPinRegistry::default());
         let mut ds = Self {
             cluster_id: cluster_id.to_string(),
             worker_id,
@@ -155,9 +158,10 @@ impl VfsDataset {
             dir_list,
             meta: VfsMetaStore::new(spdk_meta.clone()),
             committed_rewrites: HashMap::new(),
-            layouts: BlockLayouts::new(spdk_meta),
+            layouts: BlockLayouts::with_pin_registry(spdk_meta, extent_pins.clone()),
             num_blocks_to_delete: AtomicUsize::new(0),
             spdk_quarantine_limit: 0,
+            extent_pins,
         };
         ds.initialize()?;
         Ok(ds)
@@ -235,7 +239,11 @@ impl VfsDataset {
 
     #[cfg(feature = "spdk")]
     pub fn set_spdk_terminal_event_sender(&mut self, tx: mpsc::Sender<SpdkCommandTerminalEvent>) {
-        self.layouts = BlockLayouts::with_terminal_event_tx(self.meta.spdk_store(), tx);
+        self.layouts = BlockLayouts::with_terminal_event_tx(
+            self.meta.spdk_store(),
+            tx,
+            self.extent_pins.clone(),
+        );
     }
 
     // Initialize.
@@ -1098,6 +1106,18 @@ impl Dataset for VfsDataset {
                 record.state
             );
         }
+        let key = ExtentKey {
+            block_id,
+            bdev_offset: record.offset,
+            size: record.size,
+        };
+        if self.extent_pins.is_pinned(key) {
+            return err_box!(
+                "SPDK block {} generation {} is still pinned by an active reader",
+                block_id,
+                generation
+            );
+        }
         let dir = self.dir_list.get_dir(record.dir_id).ok_or_else(|| {
             curvine_core_error::err_msg!(format!("No storage directory found: {:?}", record.dir_id))
         })?;
@@ -1157,7 +1177,7 @@ mod test {
         BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion,
         VfsDataset, VfsDir,
     };
-    use crate::{BlockMeta, BlockState, QuarantineReleaseProof};
+    use crate::{BlockMeta, BlockState, ExtentKey, QuarantineReleaseProof};
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_io::DataSlice;
@@ -2193,6 +2213,15 @@ mod test {
         assert_eq!(retired.offset, 0);
         assert_eq!(retired.state, BlockState::Retired);
         assert!(state.offset_alloc.free_list_entries().is_empty());
+
+        let pin = ds.extent_pins.pin(ExtentKey {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        });
+        assert!(ds.reclaim_retired_spdk_generation(1, -1).is_err());
+        assert!(store.get_generation(1, -1)?.is_some());
+        drop(pin);
 
         ds.reclaim_retired_spdk_generation(1, -1)?;
         assert!(store.get_generation(1, -1)?.is_none());

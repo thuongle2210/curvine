@@ -19,7 +19,7 @@ pub use self::bdev_layout::BdevLayout;
 pub(crate) use self::file_layout::FileFinalizePlan;
 pub use self::file_layout::FileLayout;
 
-use crate::BlockMeta;
+use crate::{BlockMeta, ExtentPinRegistry};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
@@ -99,12 +99,24 @@ impl BlockLayoutKind {
         Self::Bdev(BdevLayout::new(spdk_meta))
     }
 
+    fn bdev_with_pin_registry(
+        spdk_meta: Option<Arc<SpdkMetaStore>>,
+        registry: Arc<ExtentPinRegistry>,
+    ) -> Self {
+        Self::Bdev(BdevLayout::new(spdk_meta).with_pin_registry(registry))
+    }
+
     #[cfg(feature = "spdk")]
     fn bdev_with_terminal_event_tx(
         spdk_meta: Option<Arc<SpdkMetaStore>>,
         tx: mpsc::Sender<SpdkCommandTerminalEvent>,
+        registry: Arc<ExtentPinRegistry>,
     ) -> Self {
-        Self::Bdev(BdevLayout::new(spdk_meta).with_terminal_event_tx(tx))
+        Self::Bdev(
+            BdevLayout::new(spdk_meta)
+                .with_pin_registry(registry)
+                .with_terminal_event_tx(tx),
+        )
     }
 
     #[cfg(feature = "spdk")]
@@ -135,14 +147,25 @@ impl BlockLayouts {
         }
     }
 
+    pub fn with_pin_registry(
+        spdk_meta: Option<Arc<SpdkMetaStore>>,
+        registry: Arc<ExtentPinRegistry>,
+    ) -> Self {
+        Self {
+            file: BlockLayoutKind::file(),
+            bdev: BlockLayoutKind::bdev_with_pin_registry(spdk_meta, registry),
+        }
+    }
+
     #[cfg(feature = "spdk")]
     pub fn with_terminal_event_tx(
         spdk_meta: Option<Arc<SpdkMetaStore>>,
         tx: mpsc::Sender<SpdkCommandTerminalEvent>,
+        registry: Arc<ExtentPinRegistry>,
     ) -> Self {
         Self {
             file: BlockLayoutKind::file(),
-            bdev: BlockLayoutKind::bdev_with_terminal_event_tx(spdk_meta, tx),
+            bdev: BlockLayoutKind::bdev_with_terminal_event_tx(spdk_meta, tx, registry),
         }
     }
 

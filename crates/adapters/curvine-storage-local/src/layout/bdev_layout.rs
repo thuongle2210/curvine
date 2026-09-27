@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout};
-use crate::BlockMeta;
+use crate::{BlockMeta, ExtentKey, ExtentPinRegistry};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
@@ -33,6 +33,7 @@ pub struct BdevLayout {
     spdk_meta: Option<Arc<SpdkMetaStore>>,
     #[cfg(feature = "spdk")]
     terminal_event_tx: Option<mpsc::Sender<SpdkCommandTerminalEvent>>,
+    pin_registry: Option<Arc<ExtentPinRegistry>>,
 }
 
 impl BdevLayout {
@@ -41,7 +42,13 @@ impl BdevLayout {
             spdk_meta,
             #[cfg(feature = "spdk")]
             terminal_event_tx: None,
+            pin_registry: None,
         }
+    }
+
+    pub fn with_pin_registry(mut self, registry: Arc<ExtentPinRegistry>) -> Self {
+        self.pin_registry = Some(registry);
+        self
     }
 
     #[cfg(feature = "spdk")]
@@ -261,7 +268,18 @@ impl BlockLayout for BdevLayout {
                 bdev_name, abs_offset, meta.id, base_offset, physical_len, logical_len, max_len
             );
             let bdev = SpdkBdev::open_read(bdev_name, abs_offset, max_len)?;
-            BlockReadContext::with_physical(bdev, base_offset, logical_len, physical_len, off)
+            let reader =
+                BlockReadContext::with_physical(bdev, base_offset, logical_len, physical_len, off)?;
+            if let Some(registry) = self.pin_registry.as_ref() {
+                let guard = registry.pin(ExtentKey {
+                    block_id: meta.id(),
+                    bdev_offset: base_offset,
+                    size: meta.physical_bytes(),
+                });
+                Ok(reader.with_pin_guard(guard))
+            } else {
+                Ok(reader)
+            }
         }
         #[cfg(not(feature = "spdk"))]
         {

@@ -33,6 +33,9 @@ pub use self::version::*;
 mod dir_state;
 pub use self::dir_state::{DirState, DEFAULT_BLOCK_ALIGN};
 
+mod extent_pin;
+pub use self::extent_pin::{ExtentKey, ExtentPinGuard, ExtentPinRegistry};
+
 mod spdk_meta_store;
 pub use self::spdk_meta_store::SpdkMetaStore;
 
