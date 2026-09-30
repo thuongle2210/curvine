@@ -57,6 +57,23 @@ pub enum IoOp {
 // SAFETY: exclusive ownership - blocks until completion.
 unsafe impl Send for IoOp {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpdkCommandTerminalEvent {
+    pub block_id: i64,
+    pub bdev_offset: i64,
+    pub size: i64,
+}
+
+impl SpdkCommandTerminalEvent {
+    pub fn new(block_id: i64, bdev_offset: i64, size: i64) -> Self {
+        Self {
+            block_id,
+            bdev_offset,
+            size,
+        }
+    }
+}
+
 /// Completion state shared between poller callback and waiting handler.
 pub struct IoCompletion {
     inner: Mutex<IoCompletionInner>,
@@ -124,6 +141,8 @@ pub struct IoRequest {
     pub completion: Arc<IoCompletion>,
     /// Per-bdev in-flight counter. Decremented on completion.
     pub bdev_inflight: Arc<AtomicUsize>,
+    pub terminal_event: Option<SpdkCommandTerminalEvent>,
+    pub terminal_event_tx: Option<mpsc::Sender<SpdkCommandTerminalEvent>>,
 }
 
 // SAFETY: exclusive ownership - blocks until completion.
@@ -349,6 +368,8 @@ impl SpdkPoller {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
+            terminal_event: None,
+            terminal_event_tx: None,
         };
         if let Some(tx) = &self.tx {
             if tx.send(req).is_err() {
@@ -375,6 +396,8 @@ impl SpdkPoller {
             op: IoOp::UnregisterCtrlr { ctrlr, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
+            terminal_event: None,
+            terminal_event_tx: None,
         };
         let Some(tx) = &self.tx else {
             return UnregisterResult::Disconnected;
@@ -673,6 +696,9 @@ impl SpdkPoller {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: req.bdev_inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: req.terminal_event,
+            terminal_event_tx: req.terminal_event_tx.clone(),
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: qs_ptr,
             pending_idx,
         });
@@ -862,6 +888,9 @@ struct CallbackCtx {
     async_ctx: spdk_ffi::curvine_async_ctx,
     bdev_inflight: Arc<AtomicUsize>,
     dma_ref_released: AtomicBool,
+    terminal_event: Option<SpdkCommandTerminalEvent>,
+    terminal_event_tx: Option<mpsc::Sender<SpdkCommandTerminalEvent>>,
+    terminal_event_sent: AtomicBool,
     /// Points back to the qpair's QpairState
     qpair_state: *mut QpairState,
     /// Index into QpairState::pending
@@ -872,6 +901,18 @@ impl CallbackCtx {
     fn release_dma_ref(&self) {
         if !self.dma_ref_released.swap(true, Ordering::AcqRel) {
             self.bdev_inflight.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    fn emit_terminal_event(&self) {
+        let Some(event) = self.terminal_event else {
+            return;
+        };
+        let Some(tx) = self.terminal_event_tx.as_ref() else {
+            return;
+        };
+        if !self.terminal_event_sent.swap(true, Ordering::AcqRel) {
+            let _ = tx.send(event);
         }
     }
 }
@@ -886,6 +927,7 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     let ctx = &*(cb_arg as *mut CallbackCtx);
 
     if ctx.completion.complete(status) {
+        ctx.emit_terminal_event();
         let qs = &mut *ctx.qpair_state;
 
         // Defensive: skip swap_remove if pending is empty (underflow guard).
@@ -905,6 +947,7 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
         // Free the CallbackCtx now that accounting is done.
         drop(Box::from_raw(cb_arg as *mut CallbackCtx));
     } else {
+        ctx.emit_terminal_event();
         ctx.release_dma_ref();
     }
 }
@@ -946,6 +989,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_1.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs_dead as *mut QpairState,
             pending_idx: 0,
         }));
@@ -956,6 +1002,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_2.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs_dead as *mut QpairState,
             pending_idx: 1,
         }));
@@ -974,6 +1023,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_3.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs_live as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1047,6 +1099,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: qs_ptr,
             pending_idx: 0,
         });
@@ -1077,6 +1132,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &*qs as *const QpairState as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1117,6 +1175,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1147,6 +1208,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &*qs as *const QpairState as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1174,6 +1238,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         });
@@ -1214,6 +1281,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         });
@@ -1260,6 +1330,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_0.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1270,6 +1343,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_1.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 1,
         }));
@@ -1330,6 +1406,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &*qs as *const QpairState as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1345,6 +1424,114 @@ mod test {
             (*ctx).release_dma_ref();
             drop(Box::from_raw(ctx));
         }
+    }
+
+    #[test]
+    fn poller_callback_hot_path_emits_terminal_event() {
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let completion = IoCompletion::new();
+        let (tx, rx) = mpsc::channel();
+        let event = SpdkCommandTerminalEvent::new(7, 4096, 8192);
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
+            terminal_event: Some(event),
+            terminal_event_tx: Some(tx),
+            terminal_event_sent: AtomicBool::new(false),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs.pending.push(ctx);
+
+        unsafe { poller_callback(ctx as *mut c_void, 0) };
+
+        assert_eq!(completion.wait(0), 0);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(rx.try_recv(), Ok(event));
+        assert!(rx.try_recv().is_err(), "terminal event must emit once");
+    }
+
+    #[test]
+    fn force_complete_does_not_emit_terminal_event() {
+        let completion = IoCompletion::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let (tx, rx) = mpsc::channel();
+        let event = SpdkCommandTerminalEvent::new(7, 4096, 8192);
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
+            terminal_event: Some(event),
+            terminal_event_tx: Some(tx),
+            terminal_event_sent: AtomicBool::new(false),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs.pending.push(ctx);
+        let mut qpair_state = HashMap::new();
+        qpair_state.insert(DEAD, qs);
+
+        SpdkPoller::force_complete_qpair(DEAD, &mut qpair_state);
+
+        assert_eq!(completion.wait(0), -libc::EIO);
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "force-complete is not terminal proof"
+        );
+        if let Some(qs) = qpair_state.get_mut(&DEAD) {
+            qs.reclaim_stale();
+        }
+    }
+
+    #[test]
+    fn poller_callback_late_path_emits_terminal_event_once() {
+        let completion = IoCompletion::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let (tx, rx) = mpsc::channel();
+        let event = SpdkCommandTerminalEvent::new(7, 4096, 8192);
+        let qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+
+        assert!(completion.complete(-libc::EIO));
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
+            terminal_event: Some(event),
+            terminal_event_tx: Some(tx),
+            terminal_event_sent: AtomicBool::new(false),
+            qpair_state: &*qs as *const QpairState as *mut QpairState,
+            pending_idx: 0,
+        }));
+
+        unsafe { poller_callback(ctx as *mut c_void, 0) };
+        unsafe { poller_callback(ctx as *mut c_void, 0) };
+
+        assert_eq!(completion.wait(0), -libc::EIO);
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(rx.try_recv(), Ok(event));
+        assert!(rx.try_recv().is_err(), "late terminal event must emit once");
+        unsafe { drop(Box::from_raw(ctx)) };
     }
 
     #[test]
@@ -1367,6 +1554,9 @@ mod test {
                 async_ctx: unsafe { std::mem::zeroed() },
                 bdev_inflight: inflight[i].clone(),
                 dma_ref_released: AtomicBool::new(false),
+                terminal_event: None,
+                terminal_event_tx: None,
+                terminal_event_sent: AtomicBool::new(false),
                 qpair_state: &mut *qs as *mut QpairState,
                 pending_idx: i,
             }));
@@ -1439,6 +1629,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1487,6 +1680,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_1.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1497,6 +1693,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_2.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 1,
         }));
@@ -1509,6 +1708,8 @@ mod test {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
+            terminal_event: None,
+            terminal_event_tx: None,
         };
 
         SpdkPoller::handle_unregister(&req, &mut qpair_state, &retired);
@@ -1564,6 +1765,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: old_inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: std::ptr::null_mut(),
             pending_idx: 0,
         }));
@@ -1588,6 +1792,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: new_inflight.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1599,6 +1806,8 @@ mod test {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
+            terminal_event: None,
+            terminal_event_tx: None,
         };
 
         SpdkPoller::handle_unregister(&req, &mut qpair_state, &retired);
@@ -1646,6 +1855,8 @@ mod test {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
+            terminal_event: None,
+            terminal_event_tx: None,
         };
 
         SpdkPoller::handle_unregister(&req, &mut qpair_state, &retired);
@@ -1708,6 +1919,8 @@ mod test {
             },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
+            terminal_event: None,
+            terminal_event_tx: None,
         };
 
         SpdkPoller::handle_unregister_ctrlr(&req, &mut active);
@@ -1728,6 +1941,8 @@ mod test {
             },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
+            terminal_event: None,
+            terminal_event_tx: None,
         };
 
         SpdkPoller::handle_unregister_ctrlr(&req, &mut active);
@@ -1755,6 +1970,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_1.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 0,
         }));
@@ -1765,6 +1983,9 @@ mod test {
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight_2.clone(),
             dma_ref_released: AtomicBool::new(false),
+            terminal_event: None,
+            terminal_event_tx: None,
+            terminal_event_sent: AtomicBool::new(false),
             qpair_state: &mut *qs as *mut QpairState,
             pending_idx: 1,
         }));

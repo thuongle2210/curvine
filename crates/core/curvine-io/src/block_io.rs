@@ -36,6 +36,10 @@ pub trait BlockIO: Send {
         false
     }
 
+    fn has_uncertain_writes(&self) -> bool {
+        false
+    }
+
     fn as_local(&self) -> Option<&LocalFile> {
         None
     }

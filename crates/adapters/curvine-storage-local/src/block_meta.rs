@@ -29,6 +29,7 @@ pub enum BlockState {
     Recovering = 2,
     Allocating = 3,
     Finalizing = 4,
+    Quarantined = 5,
 }
 
 impl BlockState {
@@ -60,6 +61,23 @@ pub struct BlockMeta {
     pub actual_len: i64,
     /// SPDK bdev byte offset
     pub bdev_offset: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineReleaseProof {
+    pub block_id: i64,
+    pub bdev_offset: i64,
+    pub size: i64,
+}
+
+impl QuarantineReleaseProof {
+    pub fn new(block_id: i64, bdev_offset: i64, size: i64) -> Self {
+        Self {
+            block_id,
+            bdev_offset,
+            size,
+        }
+    }
 }
 
 impl BlockMeta {
@@ -167,7 +185,10 @@ impl BlockMeta {
     }
 
     pub fn is_transitioning(&self) -> bool {
-        matches!(self.state, BlockState::Allocating | BlockState::Finalizing)
+        matches!(
+            self.state,
+            BlockState::Allocating | BlockState::Finalizing | BlockState::Quarantined
+        )
     }
 
     pub fn dir_id(&self) -> u32 {

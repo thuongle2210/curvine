@@ -342,11 +342,25 @@ impl BatchWriteHandler {
                 contexts.len()
             );
         }
-        for (i, (file, context)) in files.iter_mut().zip(contexts.iter()).enumerate() {
+        for i in 0..files.len() {
+            let context = &contexts[i];
             let expected_req_id = msg.req_id() + i as i64;
             Self::check_context(context, expected_req_id)?;
-            if let Some(file) = file.as_mut() {
-                file.flush()?;
+            if let Some(file) = files[i].as_mut() {
+                if let Err(flush_err) = file.flush() {
+                    let uncertain = file.has_uncertain_writes();
+                    files[i].take();
+                    if uncertain {
+                        if let Err(abort_err) = self.store.abort_block_uncertain(&context.block) {
+                            log::warn!(
+                                "failed to quarantine batch block {} after uncertain flush error: {}",
+                                context.block.id,
+                                abort_err
+                            );
+                        }
+                    }
+                    return Err(flush_err.into());
+                }
             }
         }
 

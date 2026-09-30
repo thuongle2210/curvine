@@ -13,27 +13,41 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout};
-use crate::{BlockMeta, BlockState};
+use crate::BlockMeta;
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
 use curvine_model::ExtendedBlock;
 use log::{info, warn};
+#[cfg(feature = "spdk")]
+use std::sync::mpsc;
 use std::sync::Arc;
 
 #[cfg(feature = "spdk")]
 use curvine_io::IOError;
 #[cfg(feature = "spdk")]
-use curvine_storage_spdk::SpdkBdev;
+use curvine_storage_spdk::{SpdkBdev, SpdkCommandTerminalEvent};
 
 #[derive(Clone)]
 pub struct BdevLayout {
     spdk_meta: Option<Arc<SpdkMetaStore>>,
+    #[cfg(feature = "spdk")]
+    terminal_event_tx: Option<mpsc::Sender<SpdkCommandTerminalEvent>>,
 }
 
 impl BdevLayout {
     pub fn new(spdk_meta: Option<Arc<SpdkMetaStore>>) -> Self {
-        Self { spdk_meta }
+        Self {
+            spdk_meta,
+            #[cfg(feature = "spdk")]
+            terminal_event_tx: None,
+        }
+    }
+
+    #[cfg(feature = "spdk")]
+    pub fn with_terminal_event_tx(mut self, tx: mpsc::Sender<SpdkCommandTerminalEvent>) -> Self {
+        self.terminal_event_tx = Some(tx);
+        self
     }
 
     #[cfg(feature = "spdk")]
@@ -125,15 +139,10 @@ impl BlockLayout for BdevLayout {
             }
 
             alloc_entries.push((record.block_id, record.offset, record.size));
-            let state = if record.finalized {
-                BlockState::Finalized
-            } else {
-                BlockState::Recovering
-            };
             blocks.push(BlockMeta {
                 id: record.block_id,
                 len: record.len,
-                state,
+                state: record.state,
                 dir_id: dir.id(),
                 storage_type: dir.storage_type(),
                 actual_len: record.size,
@@ -180,7 +189,13 @@ impl BlockLayout for BdevLayout {
             if max_len == 0 {
                 return err_box!("Cannot open SPDK writer: no space remaining");
             }
-            let bdev = SpdkBdev::open_write(bdev_name, abs_offset, max_len)?;
+            let mut bdev = SpdkBdev::open_write(bdev_name, abs_offset, max_len)?;
+            if let Some(tx) = self.terminal_event_tx.as_ref() {
+                bdev.set_write_terminal_event(
+                    SpdkCommandTerminalEvent::new(meta.id(), base_offset, meta.physical_bytes()),
+                    tx.clone(),
+                );
+            }
             BlockWriteContext::new(bdev, base_offset, meta.len, off)
         }
         #[cfg(not(feature = "spdk"))]

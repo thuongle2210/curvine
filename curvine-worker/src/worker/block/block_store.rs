@@ -14,15 +14,21 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
-    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset,
+    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset, QuarantineReleaseProof,
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo};
 use parking_lot::{Mutex, MutexGuard};
+use std::collections::HashMap;
+#[cfg(feature = "spdk")]
+use std::sync::mpsc;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
+
+#[cfg(feature = "spdk")]
+use curvine_storage_spdk::SpdkCommandTerminalEvent;
 
 const BLOCK_LOCK_STRIPES: usize = 256;
 
@@ -30,17 +36,88 @@ const BLOCK_LOCK_STRIPES: usize = 256;
 pub struct BlockStore {
     state: Arc<RwLock<BlockDataset>>,
     block_locks: Arc<Vec<Mutex<()>>>,
+    pending_quarantine_proofs: Arc<Mutex<HashMap<i64, QuarantineReleaseProof>>>,
 }
 
 impl BlockStore {
     pub fn new(cluster_id: &str, conf: &ClusterConf) -> CommonResult<Self> {
-        let dataset = BlockDataset::from_conf(cluster_id, conf)?;
+        let mut dataset = BlockDataset::from_conf(cluster_id, conf)?;
+        let pending_quarantine_proofs = Arc::new(Mutex::new(HashMap::new()));
+        #[cfg(feature = "spdk")]
+        let terminal_event_rx = {
+            let (tx, rx) = mpsc::channel();
+            dataset.set_spdk_terminal_event_sender(tx);
+            Some(rx)
+        };
         let block_store = BlockStore {
             state: Arc::new(RwLock::new(dataset)),
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
+            pending_quarantine_proofs,
         };
 
+        #[cfg(feature = "spdk")]
+        if let Some(rx) = terminal_event_rx {
+            block_store.spawn_spdk_terminal_cleanup(rx);
+        }
+
         Ok(block_store)
+    }
+
+    #[cfg(feature = "spdk")]
+    fn spawn_spdk_terminal_cleanup(&self, rx: mpsc::Receiver<SpdkCommandTerminalEvent>) {
+        let store = self.clone();
+        std::thread::Builder::new()
+            .name("spdk-quarantine-cleanup".to_string())
+            .spawn(move || {
+                while let Ok(event) = rx.recv() {
+                    store.handle_spdk_terminal_event(event);
+                }
+            })
+            .expect("failed to spawn SPDK quarantine cleanup thread");
+    }
+
+    #[cfg(feature = "spdk")]
+    pub fn handle_spdk_terminal_event(&self, event: SpdkCommandTerminalEvent) {
+        let proof = QuarantineReleaseProof::new(event.block_id, event.bdev_offset, event.size);
+        match self.release_quarantined_block_with_proof(proof) {
+            Ok(meta) => {
+                self.pending_quarantine_proofs
+                    .lock()
+                    .remove(&event.block_id);
+                log::info!(
+                    "released quarantined SPDK block {} after terminal callback at offset {} size {}",
+                    meta.id(),
+                    meta.bdev_offset,
+                    meta.physical_bytes()
+                );
+            }
+            Err(err) => {
+                log::debug!(
+                    "deferring SPDK terminal proof for block {} offset {} size {}: {}",
+                    event.block_id,
+                    event.bdev_offset,
+                    event.size,
+                    err
+                );
+                self.pending_quarantine_proofs
+                    .lock()
+                    .insert(event.block_id, proof);
+            }
+        }
+    }
+
+    fn retry_pending_quarantine_release(&self, block_id: i64) {
+        let Some(proof) = self
+            .pending_quarantine_proofs
+            .lock()
+            .get(&block_id)
+            .copied()
+        else {
+            return;
+        };
+        if self.release_quarantined_block_with_proof(proof).is_ok() {
+            self.pending_quarantine_proofs.lock().remove(&block_id);
+        }
     }
 
     pub(crate) fn write(&self) -> CommonResult<RwLockWriteGuard<'_, BlockDataset>> {
@@ -232,6 +309,39 @@ impl BlockStore {
     pub fn abort_block(&self, block: &ExtendedBlock) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, "abort");
         self.with_dataset_write("abort", |state| state.abort_block(block))
+    }
+
+    pub fn abort_block_uncertain(&self, block: &ExtendedBlock) -> CommonResult<()> {
+        let _block_lock = self.block_lock(block.id, "abort_uncertain");
+        let result = self.with_dataset_write("abort_uncertain", |state| {
+            state.abort_block_uncertain(block)
+        });
+        if result.is_ok() {
+            self.retry_pending_quarantine_release(block.id);
+        }
+        result
+    }
+
+    pub fn release_quarantined_block(&self, block_id: i64) -> CommonResult<BlockMeta> {
+        let _block_lock = self.block_lock(block_id, "release_quarantine");
+        self.with_dataset_write("release_quarantine", |state| {
+            state.release_quarantined_block(block_id)
+        })
+    }
+
+    pub fn release_quarantined_block_with_proof(
+        &self,
+        proof: QuarantineReleaseProof,
+    ) -> CommonResult<BlockMeta> {
+        let _block_lock = self.block_lock(proof.block_id, "release_quarantine");
+        self.with_dataset_write("release_quarantine", |state| {
+            state.release_quarantined_block_with_proof(proof)
+        })
+    }
+
+    pub fn quarantined_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
+        let state = self.read()?;
+        Ok(state.quarantined_blocks())
     }
 
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {

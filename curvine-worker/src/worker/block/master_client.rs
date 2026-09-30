@@ -123,7 +123,8 @@ impl MasterClient {
                 BlockState::Writing
                 | BlockState::Recovering
                 | BlockState::Allocating
-                | BlockState::Finalizing => BlockReportStatusProto::Writing,
+                | BlockState::Finalizing
+                | BlockState::Quarantined => BlockReportStatusProto::Writing,
             };
             let info = BlockReportInfoProto {
                 id: block.id,

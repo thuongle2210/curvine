@@ -48,6 +48,12 @@ pub trait Dataset {
     fn num_blocks_to_delete(&self) -> usize;
     fn increment_blocks_to_delete(&self);
     fn decrement_blocks_to_delete(&self);
+    fn quarantined_block_count(&self) -> usize {
+        0
+    }
+    fn quarantined_bytes(&self) -> i64 {
+        0
+    }
 
     fn available_str(&self) -> String {
         ByteUnit::byte_to_string(self.available() as u64)
@@ -63,6 +69,11 @@ pub trait Dataset {
 
     // Cancel a block
     fn abort_block(&mut self, block: &ExtendedBlock) -> CommonResult<()>;
+
+    // Cancel a block whose backing writes may still complete later.
+    fn abort_block_uncertain(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
+        self.abort_block(block)
+    }
 
     // Delete a block.
     fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()>;
