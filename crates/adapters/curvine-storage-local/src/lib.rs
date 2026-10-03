@@ -51,6 +51,6 @@ mod block_io_context;
 pub use self::block_io_context::{BlockReadContext, BlockWriteContext};
 
 mod vfs_dataset;
-pub use self::vfs_dataset::VfsDataset;
+pub use self::vfs_dataset::{SpdkRewriteMode, VfsDataset};
 
 pub type BlockDataset = VfsDataset;

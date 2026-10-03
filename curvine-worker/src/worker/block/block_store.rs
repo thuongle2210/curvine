@@ -228,25 +228,53 @@ impl BlockStore {
     }
 
     pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        self.open_block_for_write(block, false)
+            .map(|(meta, _)| meta)
+    }
+
+    pub fn open_block_for_write(
+        &self,
+        block: &ExtendedBlock,
+        _allow_full_overwrite_without_copy: bool,
+    ) -> CommonResult<(BlockMeta, bool)> {
         let _block_lock = self.block_lock(block.id, "open");
         #[cfg(feature = "spdk")]
         {
-            let spdk_reservation = self
-                .with_dataset_write("open", |state| state.reserve_spdk_rewrite_generation(block))?;
+            let spdk_reservation = self.with_dataset_write("open", |state| {
+                state.reserve_spdk_rewrite_generation(block, _allow_full_overwrite_without_copy)
+            })?;
             if let Some(reservation) = spdk_reservation {
-                let copy_result = {
-                    let state = self.read()?;
-                    let (layout, dir) = state.layout_for(&reservation.published)?;
-                    let started = Instant::now();
-                    let result =
-                        layout.copy_spdk_extent(&dir, &reservation.published, &reservation.staging);
-                    self.observe_file_layout_operation("spdk_rewrite_copy", started.elapsed());
-                    result
+                let skipped_copy =
+                    reservation.mode == crate::worker::storage::SpdkRewriteMode::FullOverwrite;
+                let copy_result = if reservation.mode
+                    == crate::worker::storage::SpdkRewriteMode::CopyPreserve
+                {
+                    {
+                        let state = self.read()?;
+                        let (layout, dir) = state.layout_for(&reservation.published)?;
+                        let started = Instant::now();
+                        let result = layout.copy_spdk_extent(
+                            &dir,
+                            &reservation.published,
+                            &reservation.staging,
+                        );
+                        self.observe_file_layout_operation("spdk_rewrite_copy", started.elapsed());
+                        result
+                    }
+                } else {
+                    log::debug!(
+                        "skipping SPDK rewrite copy for full-block overwrite block {} len {}",
+                        block.id,
+                        block.len
+                    );
+                    Ok(())
                 };
                 return match copy_result {
-                    Ok(()) => self.with_dataset_write("open", |state| {
-                        state.complete_spdk_rewrite_open(&reservation)
-                    }),
+                    Ok(()) => self
+                        .with_dataset_write("open", |state| {
+                            state.complete_spdk_rewrite_open(&reservation)
+                        })
+                        .map(|meta| (meta, skipped_copy)),
                     Err(error) => {
                         if let Err(rollback) = self.with_dataset_write("open", |state| {
                             state.rollback_spdk_rewrite_generation(&reservation)
@@ -268,7 +296,9 @@ impl BlockStore {
             self.with_dataset_write("open", |state| state.reserve_file_open(block))?;
 
         let Some(reservation) = reservation else {
-            return self.with_dataset_write("open", |state| state.open_block(block));
+            return self
+                .with_dataset_write("open", |state| state.open_block(block))
+                .map(|meta| (meta, false));
         };
 
         let started = Instant::now();
@@ -276,7 +306,8 @@ impl BlockStore {
         self.observe_file_layout_operation("open", started.elapsed());
         match prepared {
             Ok(meta) => self
-                .with_dataset_write("open", |state| state.complete_file_open(&reservation, meta)),
+                .with_dataset_write("open", |state| state.complete_file_open(&reservation, meta))
+                .map(|meta| (meta, false)),
             Err(error) => {
                 if let Err(rollback) =
                     self.with_dataset_write("open", |state| state.rollback_file_open(&reservation))
