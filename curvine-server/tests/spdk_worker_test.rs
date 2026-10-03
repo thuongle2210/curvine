@@ -67,7 +67,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     let block = ExtendedBlock::new(id, block_size, StorageType::SpdkDisk, FileType::File);
 
     let request = BlockWriteRequest {
-        block: ProtoUtils::extend_block_to_pb(block),
+        block: ProtoUtils::extend_block_to_pb(block.clone()),
         off: 0,
         block_size,
         short_circuit: false,
@@ -118,7 +118,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
 
     let block = ExtendedBlock::new(id, block_size, StorageType::SpdkDisk, FileType::File);
     let complete_request = BlockWriteRequest {
-        block: ProtoUtils::extend_block_to_pb(block),
+        block: ProtoUtils::extend_block_to_pb(block.clone()),
         off: 0,
         block_size,
         short_circuit: false,
@@ -197,6 +197,112 @@ fn spdk_block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     let _: Message = client.rpc(msg)?;
     Ok(check_sum)
 }
+
+fn spdk_block_write_bytes(
+    id: i64,
+    conf: &ClusterConf,
+    block_size: i64,
+    off: i64,
+    data: Vec<u8>,
+) -> CommonResult<()> {
+    let block = ExtendedBlock::new(id, block_size, StorageType::SpdkDisk, FileType::File);
+    let request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(block.clone()),
+        off,
+        block_size,
+        short_circuit: false,
+        client_name: "spdk-test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+        component_info: None,
+    };
+
+    let req_id = Utils::req_id();
+    let client = conf.worker_sync_client()?;
+    let msg = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(-1)
+        .proto_header(request)
+        .build();
+    let _: BlockWriteResponse = client.rpc(msg)?.parse_header()?;
+
+    let msg = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Running)
+        .req_id(req_id)
+        .seq_id(0)
+        .data(Buffer(BytesMut::from(data.as_slice())))
+        .build();
+    let _ = client.rpc(msg)?;
+
+    let complete_request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(block),
+        off,
+        block_size,
+        short_circuit: false,
+        client_name: "spdk-test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+        component_info: None,
+    };
+    let msg = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(complete_request)
+        .build();
+    let _: Message = client.rpc_check(msg)?;
+    Ok(())
+}
+
+fn spdk_block_read_bytes(id: i64, conf: &ClusterConf, len: i64) -> CommonResult<Vec<u8>> {
+    let request = BlockReadRequest {
+        id,
+        off: 0,
+        len,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: false,
+        ..Default::default()
+    };
+    let req_id = Utils::req_id();
+    let client = conf.worker_sync_client()?;
+    let msg = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .req_id(req_id)
+        .seq_id(-1)
+        .request(RequestStatus::Open)
+        .proto_header(request)
+        .build();
+    let _: BlockReadResponse = client.rpc_check(msg)?.parse_header()?;
+
+    let mut out = Vec::with_capacity(len as usize);
+    let mut seq_id = 0;
+    while out.len() < len as usize {
+        let msg = Builder::new()
+            .code(RpcCode::ReadBlock)
+            .req_id(req_id)
+            .seq_id(seq_id)
+            .request(RequestStatus::Running)
+            .build();
+        seq_id += 1;
+        let rep = client.rpc_check(msg)?;
+        if rep.data_len() == 0 {
+            break;
+        }
+        out.extend_from_slice(rep.data_bytes().unwrap());
+    }
+    let msg = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(seq_id)
+        .build();
+    let _: Message = client.rpc(msg)?;
+    Ok(out)
+}
 // =========================================================================
 // Tests
 // =========================================================================
@@ -234,6 +340,7 @@ fn test_spdk_worker_end_to_end() -> CommonResult<()> {
             client_name: "spdk-test".to_string(),
             chunk_size: CHUNK_SIZE,
             pipeline_stream: Vec::new(),
+            component_info: None,
         };
 
         let req_id = Utils::req_id();
@@ -273,6 +380,28 @@ fn test_spdk_worker_end_to_end() -> CommonResult<()> {
             );
         }
         eprintln!("  PASSED (3 blocks written then all read back)");
+    }
+
+    // Sub-test 4: committed partial rewrite stages a complete replacement.
+    eprintln!("--- sub-test: committed partial rewrite preserves unchanged bytes ---");
+    {
+        let block_id = Utils::req_id().abs();
+        let block_size = (CHUNK_SIZE * 4) as i64;
+        let mut expected = vec![b'A'; block_size as usize];
+        spdk_block_write_bytes(block_id, &conf, block_size, 0, expected.clone())?;
+
+        let rewrite_off = CHUNK_SIZE as i64 + 7;
+        let rewrite = vec![b'B'; 100];
+        expected[rewrite_off as usize..rewrite_off as usize + rewrite.len()]
+            .copy_from_slice(&rewrite);
+        spdk_block_write_bytes(block_id, &conf, block_size, rewrite_off, rewrite)?;
+
+        let actual = spdk_block_read_bytes(block_id, &conf, block_size)?;
+        assert_eq!(
+            actual, expected,
+            "partial committed SPDK rewrite corrupted bytes"
+        );
+        eprintln!("  PASSED");
     }
     eprintln!("=== All SPDK sub-tests passed ===");
     Ok(())

@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout};
-use crate::BlockMeta;
+#[cfg(feature = "spdk")]
+use crate::ExtentKey;
+use crate::{BdevOffsetAllocator, BlockMeta, ExtentPinRegistry};
 use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::IOResult;
@@ -33,6 +35,7 @@ pub struct BdevLayout {
     spdk_meta: Option<Arc<SpdkMetaStore>>,
     #[cfg(feature = "spdk")]
     terminal_event_tx: Option<mpsc::Sender<SpdkCommandTerminalEvent>>,
+    pin_registry: Option<Arc<ExtentPinRegistry>>,
 }
 
 impl BdevLayout {
@@ -41,7 +44,13 @@ impl BdevLayout {
             spdk_meta,
             #[cfg(feature = "spdk")]
             terminal_event_tx: None,
+            pin_registry: None,
         }
+    }
+
+    pub fn with_pin_registry(mut self, registry: Arc<ExtentPinRegistry>) -> Self {
+        self.pin_registry = Some(registry);
+        self
     }
 
     #[cfg(feature = "spdk")]
@@ -55,6 +64,22 @@ impl BdevLayout {
         dir.state.bdev_name.as_deref().ok_or_else(|| {
             IOError::from(format!("SPDK dir {} has no bdev name assigned", dir.id()))
         })
+    }
+
+    #[cfg(feature = "spdk")]
+    pub fn copy_extent(&self, dir: &VfsDir, src: &BlockMeta, dst: &BlockMeta) -> CommonResult<()> {
+        const COPY_CHUNK: i32 = 1024 * 1024;
+        let mut reader = self.open_reader(dir, src, 0, src.len())?;
+        let mut writer = self.open_writer(dir, dst, 0)?;
+        let mut remaining = src.physical_bytes();
+        while remaining > 0 {
+            let len = remaining.min(COPY_CHUNK as i64) as i32;
+            let data = reader.read_region(false, len)?;
+            writer.write_region(&data)?;
+            remaining -= len as i64;
+        }
+        writer.flush()?;
+        Ok(())
     }
 }
 
@@ -148,6 +173,39 @@ impl BlockLayout for BdevLayout {
                 actual_len: record.size,
                 bdev_offset: record.offset,
             });
+        }
+        for record in store.scan_generations()? {
+            if record.dir_id != dir.id() {
+                continue;
+            }
+            if record.state == crate::BlockState::Writing {
+                warn!(
+                    "SPDK dir {} recovered in-progress generation for block {} generation {}; marking quarantined",
+                    dir.id(),
+                    record.block_id,
+                    record.generation
+                );
+                store.put_generation(
+                    record.block_id,
+                    record.generation,
+                    record.dir_id,
+                    record.offset,
+                    record.size,
+                    record.len,
+                    crate::BlockState::Quarantined,
+                )?;
+            }
+            let Some(key) = BdevOffsetAllocator::generation_key(record.block_id, record.generation)
+            else {
+                warn!(
+                    "SPDK dir {} skipped invalid generation key for block {} generation {}",
+                    dir.id(),
+                    record.block_id,
+                    record.generation
+                );
+                continue;
+            };
+            alloc_entries.push((key, record.offset, record.size));
         }
         dir.state.offset_alloc.restore(&alloc_entries);
 
@@ -245,7 +303,18 @@ impl BlockLayout for BdevLayout {
                 bdev_name, abs_offset, meta.id, base_offset, physical_len, logical_len, max_len
             );
             let bdev = SpdkBdev::open_read(bdev_name, abs_offset, max_len)?;
-            BlockReadContext::with_physical(bdev, base_offset, logical_len, physical_len, off)
+            let reader =
+                BlockReadContext::with_physical(bdev, base_offset, logical_len, physical_len, off)?;
+            if let Some(registry) = self.pin_registry.as_ref() {
+                let guard = registry.pin(ExtentKey {
+                    block_id: meta.id(),
+                    bdev_offset: base_offset,
+                    size: meta.physical_bytes(),
+                });
+                Ok(reader.with_pin_guard(guard))
+            } else {
+                Ok(reader)
+            }
         }
         #[cfg(not(feature = "spdk"))]
         {

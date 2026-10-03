@@ -30,6 +30,7 @@ pub enum BlockState {
     Allocating = 3,
     Finalizing = 4,
     Quarantined = 5,
+    Retired = 6,
 }
 
 impl BlockState {
@@ -187,7 +188,10 @@ impl BlockMeta {
     pub fn is_transitioning(&self) -> bool {
         matches!(
             self.state,
-            BlockState::Allocating | BlockState::Finalizing | BlockState::Quarantined
+            BlockState::Allocating
+                | BlockState::Finalizing
+                | BlockState::Quarantined
+                | BlockState::Retired
         )
     }
 

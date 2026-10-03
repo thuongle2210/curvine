@@ -22,7 +22,6 @@ use curvine_core_error::{CommonError, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
-#[cfg(feature = "spdk")]
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -49,6 +48,11 @@ impl BlockStore {
             dataset.set_spdk_terminal_event_sender(tx);
             Some(rx)
         };
+        let pin_drain_rx = {
+            let (tx, rx) = mpsc::channel();
+            dataset.set_extent_pin_drain_sender(tx);
+            rx
+        };
         let block_store = BlockStore {
             state: Arc::new(RwLock::new(dataset)),
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
@@ -59,8 +63,29 @@ impl BlockStore {
         if let Some(rx) = terminal_event_rx {
             block_store.spawn_spdk_terminal_cleanup(rx);
         }
+        block_store.spawn_extent_pin_drain_cleanup(pin_drain_rx);
 
         Ok(block_store)
+    }
+
+    fn spawn_extent_pin_drain_cleanup(&self, rx: mpsc::Receiver<curvine_storage_local::ExtentKey>) {
+        let store = self.clone();
+        std::thread::Builder::new()
+            .name("extent-pin-drain-cleanup".to_string())
+            .spawn(move || {
+                while let Ok(key) = rx.recv() {
+                    if let Err(err) = store.reclaim_retired_spdk_generation(key.block_id, -1) {
+                        log::debug!(
+                            "retired SPDK reclaim after pin drain skipped for block {} offset {} size {}: {}",
+                            key.block_id,
+                            key.bdev_offset,
+                            key.size,
+                            err
+                        );
+                    }
+                }
+            })
+            .expect("failed to spawn extent pin drain cleanup thread");
     }
 
     #[cfg(feature = "spdk")]
@@ -203,12 +228,77 @@ impl BlockStore {
     }
 
     pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        self.open_block_for_write(block, false)
+            .map(|(meta, _)| meta)
+    }
+
+    pub fn open_block_for_write(
+        &self,
+        block: &ExtendedBlock,
+        _allow_full_overwrite_without_copy: bool,
+    ) -> CommonResult<(BlockMeta, bool)> {
         let _block_lock = self.block_lock(block.id, "open");
+        #[cfg(feature = "spdk")]
+        {
+            let spdk_reservation = self.with_dataset_write("open", |state| {
+                state.reserve_spdk_rewrite_generation(block, _allow_full_overwrite_without_copy)
+            })?;
+            if let Some(reservation) = spdk_reservation {
+                let skipped_copy =
+                    reservation.mode == crate::worker::storage::SpdkRewriteMode::FullOverwrite;
+                let copy_result = if reservation.mode
+                    == crate::worker::storage::SpdkRewriteMode::CopyPreserve
+                {
+                    {
+                        let state = self.read()?;
+                        let (layout, dir) = state.layout_for(&reservation.published)?;
+                        let started = Instant::now();
+                        let result = layout.copy_spdk_extent(
+                            &dir,
+                            &reservation.published,
+                            &reservation.staging,
+                        );
+                        self.observe_file_layout_operation("spdk_rewrite_copy", started.elapsed());
+                        result
+                    }
+                } else {
+                    log::debug!(
+                        "skipping SPDK rewrite copy for full-block overwrite block {} len {}",
+                        block.id,
+                        block.len
+                    );
+                    Ok(())
+                };
+                return match copy_result {
+                    Ok(()) => self
+                        .with_dataset_write("open", |state| {
+                            state.complete_spdk_rewrite_open(&reservation)
+                        })
+                        .map(|meta| (meta, skipped_copy)),
+                    Err(error) => {
+                        if let Err(rollback) = self.with_dataset_write("open", |state| {
+                            state.rollback_spdk_rewrite_generation(&reservation)
+                        }) {
+                            log::error!(
+                                "failed to roll back SPDK rewrite reservation for block {} after {}: {}",
+                                block.id,
+                                error,
+                                rollback
+                            );
+                        }
+                        Err(error)
+                    }
+                };
+            }
+        }
+
         let reservation =
             self.with_dataset_write("open", |state| state.reserve_file_open(block))?;
 
         let Some(reservation) = reservation else {
-            return self.with_dataset_write("open", |state| state.open_block(block));
+            return self
+                .with_dataset_write("open", |state| state.open_block(block))
+                .map(|meta| (meta, false));
         };
 
         let started = Instant::now();
@@ -216,7 +306,8 @@ impl BlockStore {
         self.observe_file_layout_operation("open", started.elapsed());
         match prepared {
             Ok(meta) => self
-                .with_dataset_write("open", |state| state.complete_file_open(&reservation, meta)),
+                .with_dataset_write("open", |state| state.complete_file_open(&reservation, meta))
+                .map(|meta| (meta, false)),
             Err(error) => {
                 if let Err(rollback) =
                     self.with_dataset_write("open", |state| state.rollback_file_open(&reservation))
@@ -336,6 +427,17 @@ impl BlockStore {
         let _block_lock = self.block_lock(proof.block_id, "release_quarantine");
         self.with_dataset_write("release_quarantine", |state| {
             state.release_quarantined_block_with_proof(proof)
+        })
+    }
+
+    pub fn reclaim_retired_spdk_generation(
+        &self,
+        block_id: i64,
+        generation: i64,
+    ) -> CommonResult<()> {
+        let _block_lock = self.block_lock(block_id, "reclaim_retired_spdk");
+        self.with_dataset_write("reclaim_retired_spdk", |state| {
+            state.reclaim_retired_spdk_generation(block_id, generation)
         })
     }
 

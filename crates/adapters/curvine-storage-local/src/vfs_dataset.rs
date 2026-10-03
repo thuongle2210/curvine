@@ -13,11 +13,15 @@
 // limitations under the License.
 
 use crate::layout::FileFinalizePlan;
+use crate::meta_store::BlockMetaStore;
 use crate::{
-    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
-    SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
+    BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, ExtentKey,
+    ExtentPinRegistry, FileLayout, SpdkMetaStore, StorageRequest, StorageVersion, VfsDir,
+    VfsMetaStore,
 };
-use crate::{BlockMeta, BlockState, QuarantineReleaseProof};
+use crate::{
+    BlockMeta, BlockState, QuarantineReleaseProof, SPDK_RETIRED_GENERATION, SPDK_STAGING_GENERATION,
+};
 use curvine_config::{ClusterConf, WorkerDataDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
@@ -26,7 +30,6 @@ use indexmap::map::Values;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "spdk")]
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -69,6 +72,7 @@ pub struct VfsDataset {
     layouts: BlockLayouts,
     num_blocks_to_delete: AtomicUsize,
     spdk_quarantine_limit: i64,
+    extent_pins: Arc<ExtentPinRegistry>,
 }
 
 pub struct RemovedBlockState {
@@ -97,6 +101,20 @@ pub struct FileFinalizeReservation {
     writing: BlockMeta,
     pending: BlockMeta,
     dir: Arc<VfsDir>,
+}
+
+pub struct SpdkRewriteReservation {
+    pub published: BlockMeta,
+    pub staging: BlockMeta,
+    pub generation: i64,
+    pub mode: SpdkRewriteMode,
+    dir: Arc<VfsDir>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpdkRewriteMode {
+    CopyPreserve,
+    FullOverwrite,
 }
 
 impl FileFinalizeReservation {
@@ -140,6 +158,7 @@ impl VfsDataset {
             Some(v) => v.version().worker_id,
         };
 
+        let extent_pins = Arc::new(ExtentPinRegistry::default());
         let mut ds = Self {
             cluster_id: cluster_id.to_string(),
             worker_id,
@@ -147,9 +166,10 @@ impl VfsDataset {
             dir_list,
             meta: VfsMetaStore::new(spdk_meta.clone()),
             committed_rewrites: HashMap::new(),
-            layouts: BlockLayouts::new(spdk_meta),
+            layouts: BlockLayouts::with_pin_registry(spdk_meta, extent_pins.clone()),
             num_blocks_to_delete: AtomicUsize::new(0),
             spdk_quarantine_limit: 0,
+            extent_pins,
         };
         ds.initialize()?;
         Ok(ds)
@@ -227,7 +247,15 @@ impl VfsDataset {
 
     #[cfg(feature = "spdk")]
     pub fn set_spdk_terminal_event_sender(&mut self, tx: mpsc::Sender<SpdkCommandTerminalEvent>) {
-        self.layouts = BlockLayouts::with_terminal_event_tx(self.meta.spdk_store(), tx);
+        self.layouts = BlockLayouts::with_terminal_event_tx(
+            self.meta.spdk_store(),
+            tx,
+            self.extent_pins.clone(),
+        );
+    }
+
+    pub fn set_extent_pin_drain_sender(&self, tx: mpsc::Sender<ExtentKey>) {
+        self.extent_pins.set_drain_sender(tx);
     }
 
     // Initialize.
@@ -447,6 +475,120 @@ impl VfsDataset {
             pending,
             dir,
         }))
+    }
+
+    pub fn reserve_spdk_rewrite_generation(
+        &mut self,
+        block: &ExtendedBlock,
+        allow_full_overwrite_without_copy: bool,
+    ) -> CommonResult<Option<SpdkRewriteReservation>> {
+        let Some(published) = self.meta.get(block.id).cloned() else {
+            return Ok(None);
+        };
+        if published.storage_type() != StorageType::SpdkDisk || !published.is_final() {
+            return Ok(None);
+        }
+        if self.committed_rewrites.contains_key(&block.id) {
+            return err_box!("SPDK block {} already has a rewrite reservation", block.id);
+        }
+        let mode = if allow_full_overwrite_without_copy && block.len == published.len() {
+            SpdkRewriteMode::FullOverwrite
+        } else {
+            SpdkRewriteMode::CopyPreserve
+        };
+
+        let dir = self
+            .dir_list
+            .get_dir(published.dir_id())
+            .ok_or_else(|| {
+                curvine_core_error::err_msg!(format!(
+                    "No storage directory found: {:?}",
+                    published.dir_id()
+                ))
+            })?
+            .clone();
+        let generation = SPDK_STAGING_GENERATION;
+        let size = published.physical_bytes().max(block.len);
+        let offset = dir
+            .state
+            .offset_alloc
+            .allocate_generation(block.id, generation, size)
+            .map_err(|e| {
+                curvine_core_error::err_msg!(format!(
+                    "Failed to allocate SPDK staging extent for block {} generation {}: {}",
+                    block.id, generation, e
+                ))
+            })?;
+
+        let mut staging = BlockMeta::new(block.id, block.len, &dir);
+        staging.state = BlockState::Writing;
+        staging.bdev_offset = offset;
+        staging.actual_len = dir.state.offset_alloc.allocation_size(size).unwrap_or(size);
+        dir.reserve_space(false, staging.physical_bytes());
+
+        let Some(store) = self.meta.spdk_store() else {
+            dir.state.offset_alloc.free_generation(block.id, generation);
+            dir.release_space(false, staging.physical_bytes());
+            return err_box!("SPDK metadata store is not available for staging generation");
+        };
+        if let Err(err) = store.put_generation(
+            staging.id(),
+            generation,
+            staging.dir_id(),
+            staging.bdev_offset,
+            staging.physical_bytes(),
+            staging.len(),
+            *staging.state(),
+        ) {
+            dir.state.offset_alloc.free_generation(block.id, generation);
+            dir.release_space(false, staging.physical_bytes());
+            return Err(err);
+        }
+
+        self.committed_rewrites.insert(block.id, published.clone());
+        Ok(Some(SpdkRewriteReservation {
+            published,
+            staging,
+            generation,
+            mode,
+            dir,
+        }))
+    }
+
+    pub fn rollback_spdk_rewrite_generation(
+        &mut self,
+        reservation: &SpdkRewriteReservation,
+    ) -> CommonResult<()> {
+        if let Some(store) = self.meta.spdk_store() {
+            store.delete_generation(reservation.staging.id(), reservation.generation)?;
+        }
+        reservation
+            .dir
+            .state
+            .offset_alloc
+            .free_generation(reservation.staging.id(), reservation.generation);
+        reservation
+            .dir
+            .release_space(false, reservation.staging.physical_bytes());
+        self.committed_rewrites.remove(&reservation.staging.id());
+        Ok(())
+    }
+
+    pub fn complete_spdk_rewrite_open(
+        &mut self,
+        reservation: &SpdkRewriteReservation,
+    ) -> CommonResult<BlockMeta> {
+        let current = self.get_block_check(reservation.staging.id())?;
+        if current.id() != reservation.staging.id()
+            || current.bdev_offset != reservation.published.bdev_offset
+        {
+            return err_box!(
+                "SPDK rewrite reservation for block {} changed before completion",
+                reservation.staging.id()
+            );
+        }
+        self.meta.put_memory_only(reservation.staging.clone());
+        Ok(reservation.staging.clone())
     }
 
     pub fn publish_file_finalize(
@@ -757,6 +899,14 @@ impl Dataset for VfsDataset {
         match self.meta.get(block.id).cloned() {
             Some(meta) => {
                 if meta.is_active() {
+                    if meta.storage_type() == StorageType::SpdkDisk && meta.is_final() {
+                        let reservation = self
+                            .reserve_spdk_rewrite_generation(block, false)?
+                            .expect("finalized SPDK block must create rewrite reservation");
+                        self.meta.put_memory_only(reservation.staging.clone());
+                        return Ok(reservation.staging);
+                    }
+
                     let dir = self.find_dir(meta.dir_id())?;
                     let layout = self.layouts.get(meta.storage_type());
                     let preserves_committed =
@@ -819,6 +969,45 @@ impl Dataset for VfsDataset {
     }
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        if let Some(committed) = self.committed_rewrites.get(&block.id).cloned() {
+            if committed.storage_type() == StorageType::SpdkDisk {
+                let staging = self.get_block_check(block.id)?.clone();
+                if staging.state() != &BlockState::Writing {
+                    return err_box!(
+                        "block {} status incorrect, expected {:?}, actual: {:?}",
+                        staging.id(),
+                        BlockState::Writing,
+                        staging.state()
+                    );
+                }
+                let dir = self.find_dir(staging.dir_id())?;
+                let final_meta = BlockMeta::with_final_spdk(&staging, block.len);
+                let Some(store) = self.meta.spdk_store() else {
+                    return err_box!("SPDK metadata store is not available for rewrite publish");
+                };
+                store.put_generation(
+                    committed.id(),
+                    SPDK_RETIRED_GENERATION,
+                    committed.dir_id(),
+                    committed.bdev_offset,
+                    committed.physical_bytes(),
+                    committed.len(),
+                    BlockState::Retired,
+                )?;
+                store.put_block_meta(&final_meta)?;
+                store.delete_generation(staging.id(), SPDK_STAGING_GENERATION)?;
+                dir.state
+                    .offset_alloc
+                    .publish_generation(block.id, SPDK_STAGING_GENERATION, SPDK_RETIRED_GENERATION)
+                    .map_err(|e| curvine_core_error::err_msg!(e))?;
+                dir.release_space(false, final_meta.physical_bytes());
+                dir.reserve_space(true, final_meta.physical_bytes());
+                self.committed_rewrites.remove(&block.id);
+                self.meta.put_memory_only(final_meta.clone());
+                return Ok(final_meta);
+            }
+        }
+
         // Keep the meta borrow scoped before mutating the meta store and dir accounting.
         let (dir_id, reserved_bytes, final_bytes, final_meta) = {
             let meta = self.get_block_check(block.id)?;
@@ -879,6 +1068,31 @@ impl Dataset for VfsDataset {
         };
 
         if let Some(committed) = self.committed_rewrites.get(&block.id).cloned() {
+            if committed.storage_type() == StorageType::SpdkDisk {
+                let Some(meta) = self.meta.get(block.id).cloned() else {
+                    return Ok(());
+                };
+                let dir = self
+                    .dir_list
+                    .get_dir(meta.dir_id())
+                    .ok_or_else(|| {
+                        curvine_core_error::err_msg!(format!(
+                            "No storage directory found: {:?}",
+                            meta.dir_id()
+                        ))
+                    })?
+                    .clone();
+                let reservation = SpdkRewriteReservation {
+                    published: committed.clone(),
+                    staging: meta,
+                    generation: SPDK_STAGING_GENERATION,
+                    mode: SpdkRewriteMode::CopyPreserve,
+                    dir,
+                };
+                self.rollback_spdk_rewrite_generation(&reservation)?;
+                self.meta.put(committed);
+                return Ok(());
+            }
             let (layout, dir) = self.layout_for(&meta)?;
             layout.deallocate(&dir, &meta)?;
             layout.release(&dir, &meta);
@@ -890,6 +1104,46 @@ impl Dataset for VfsDataset {
         }
 
         self.remove_block_by_id(block.id)?;
+        Ok(())
+    }
+
+    fn reclaim_retired_spdk_generation(
+        &mut self,
+        block_id: i64,
+        generation: i64,
+    ) -> CommonResult<()> {
+        let Some(store) = self.meta.spdk_store() else {
+            return err_box!("SPDK metadata store is not available for retired reclaim");
+        };
+        let Some(record) = store.get_generation(block_id, generation)? else {
+            return Ok(());
+        };
+        if record.state != BlockState::Retired {
+            return err_box!(
+                "SPDK block {} generation {} is {:?}, expected Retired",
+                block_id,
+                generation,
+                record.state
+            );
+        }
+        let key = ExtentKey {
+            block_id,
+            bdev_offset: record.offset,
+            size: record.size,
+        };
+        if self.extent_pins.is_pinned(key) {
+            return err_box!(
+                "SPDK block {} generation {} is still pinned by an active reader",
+                block_id,
+                generation
+            );
+        }
+        let dir = self.dir_list.get_dir(record.dir_id).ok_or_else(|| {
+            curvine_core_error::err_msg!(format!("No storage directory found: {:?}", record.dir_id))
+        })?;
+        store.delete_generation(block_id, generation)?;
+        dir.state.offset_alloc.free_generation(block_id, generation);
+        dir.release_space(true, record.size);
         Ok(())
     }
 
@@ -943,7 +1197,10 @@ mod test {
         BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion,
         VfsDataset, VfsDir,
     };
-    use crate::{BlockMeta, BlockState, QuarantineReleaseProof};
+    use crate::{
+        BlockMeta, BlockState, ExtentKey, QuarantineReleaseProof, SpdkRewriteMode,
+        SPDK_RETIRED_GENERATION, SPDK_STAGING_GENERATION,
+    };
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_io::DataSlice;
@@ -1834,6 +2091,298 @@ mod test {
         assert_eq!(
             restart_state.offset_alloc.free_list_entries(),
             vec![(0, 4096)]
+        );
+
+        drop(restarted);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_rewrite_generation_reserves_staging_extent_without_changing_published(
+    ) -> CommonResult<()> {
+        let path = "../testing/spdk_rewrite_generation";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let state = spdk_state();
+        let mut ds = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, state.clone())])?,
+            Some(store.clone()),
+        )?;
+
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let writing = ds.open_block(&block)?;
+        assert_eq!(writing.bdev_offset, 0);
+        let published = ds.finalize_block(&block)?;
+        assert_eq!(published.bdev_offset, 0);
+
+        let reservation = ds
+            .reserve_spdk_rewrite_generation(&block, false)?
+            .expect("finalized SPDK block should reserve staging generation");
+        assert_eq!(reservation.published.bdev_offset, 0);
+        assert_eq!(reservation.staging.bdev_offset, 4096);
+        assert_eq!(reservation.generation, SPDK_STAGING_GENERATION);
+        assert_eq!(reservation.mode, SpdkRewriteMode::CopyPreserve);
+        assert_eq!(ds.get_block(1).unwrap().bdev_offset, 0);
+
+        let generation = store
+            .get_generation(1, SPDK_STAGING_GENERATION)?
+            .expect("staging generation persisted");
+        assert_eq!(generation.offset, 4096);
+        assert_eq!(generation.state, BlockState::Writing);
+        assert_eq!(store.get(1)?.unwrap().offset, 0);
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_rewrite_generation_marks_full_overwrite_when_copy_bypass_is_allowed() -> CommonResult<()>
+    {
+        let path = "../testing/spdk_rewrite_full_overwrite_mode";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let state = spdk_state();
+        let mut ds = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, state.clone())])?,
+            Some(store.clone()),
+        )?;
+
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.finalize_block(&block)?;
+
+        let reservation = ds
+            .reserve_spdk_rewrite_generation(&block, true)?
+            .expect("finalized SPDK block should reserve staging generation");
+        assert_eq!(reservation.mode, SpdkRewriteMode::FullOverwrite);
+
+        ds.rollback_spdk_rewrite_generation(&reservation)?;
+
+        let larger_block = ExtendedBlock::new(1, 8192, StorageType::SpdkDisk, FileType::File);
+        let reservation = ds
+            .reserve_spdk_rewrite_generation(&larger_block, true)?
+            .expect("changed-size rewrite should still reserve staging generation");
+        assert_eq!(reservation.mode, SpdkRewriteMode::CopyPreserve);
+        ds.rollback_spdk_rewrite_generation(&reservation)?;
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_rewrite_generation_rollback_releases_staging_only() -> CommonResult<()> {
+        let path = "../testing/spdk_rewrite_generation_rollback";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let state = spdk_state();
+        let mut ds = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, state.clone())])?,
+            Some(store.clone()),
+        )?;
+
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.finalize_block(&block)?;
+        let reservation = ds.reserve_spdk_rewrite_generation(&block, false)?.unwrap();
+
+        ds.rollback_spdk_rewrite_generation(&reservation)?;
+        assert!(store.get_generation(1, SPDK_STAGING_GENERATION)?.is_none());
+        assert_eq!(store.get(1)?.unwrap().offset, 0);
+        assert_eq!(state.offset_alloc.free_list_entries(), vec![(4096, 4096)]);
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_open_finalized_rewrite_returns_staging_and_keeps_published_readable() -> CommonResult<()>
+    {
+        let path = "../testing/spdk_open_finalized_rewrite";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let state = spdk_state();
+        let mut ds = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, state.clone())])?,
+            Some(store.clone()),
+        )?;
+
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let writing = ds.open_block(&block)?;
+        assert_eq!(writing.bdev_offset, 0);
+        let published = ds.finalize_block(&block)?;
+        assert_eq!(published.bdev_offset, 0);
+
+        let staging = ds.open_block(&block)?;
+        assert_eq!(staging.state(), &BlockState::Writing);
+        assert_eq!(staging.bdev_offset, 4096);
+        assert_eq!(ds.get_readable_block(1).unwrap().bdev_offset, 0);
+        assert_eq!(
+            store.get(1)?.unwrap().offset,
+            0,
+            "legacy published metadata stays on X"
+        );
+        assert_eq!(
+            store
+                .get_generation(1, SPDK_STAGING_GENERATION)?
+                .unwrap()
+                .offset,
+            4096
+        );
+
+        ds.abort_block(&block)?;
+        assert_eq!(ds.get_readable_block(1).unwrap().bdev_offset, 0);
+        assert!(store.get_generation(1, SPDK_STAGING_GENERATION)?.is_none());
+        assert_eq!(state.offset_alloc.free_list_entries(), vec![(4096, 4096)]);
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_rewrite_finalize_publishes_staging_and_retires_old_extent() -> CommonResult<()> {
+        let path = "../testing/spdk_rewrite_finalize_publish";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let state = spdk_state();
+        let mut ds = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, state.clone())])?,
+            Some(store.clone()),
+        )?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.finalize_block(&block)?;
+        ds.open_block(&block)?;
+
+        let published = ds.finalize_block(&block)?;
+        assert_eq!(published.bdev_offset, 4096);
+        assert!(published.is_final());
+        assert_eq!(ds.get_readable_block(1).unwrap().bdev_offset, 4096);
+        assert_eq!(store.get(1)?.unwrap().offset, 4096);
+        assert!(store.get_generation(1, SPDK_STAGING_GENERATION)?.is_none());
+        let retired = store
+            .get_generation(1, SPDK_RETIRED_GENERATION)?
+            .expect("old extent retained as retired generation");
+        assert_eq!(retired.offset, 0);
+        assert_eq!(retired.state, BlockState::Retired);
+        assert!(state.offset_alloc.free_list_entries().is_empty());
+
+        let pin = ds.extent_pins.pin(ExtentKey {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        });
+        assert!(ds
+            .reclaim_retired_spdk_generation(1, SPDK_RETIRED_GENERATION)
+            .is_err());
+        assert!(store.get_generation(1, SPDK_RETIRED_GENERATION)?.is_some());
+        drop(pin);
+
+        ds.reclaim_retired_spdk_generation(1, SPDK_RETIRED_GENERATION)?;
+        assert!(store.get_generation(1, SPDK_RETIRED_GENERATION)?.is_none());
+        assert_eq!(state.offset_alloc.free_list_entries(), vec![(0, 4096)]);
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_restart_restores_retired_generation_occupancy() -> CommonResult<()> {
+        let path = "../testing/spdk_restart_retired_generation";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let state = spdk_state();
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+
+        {
+            let mut ds = VfsDataset::new(
+                "t",
+                DirList::new(vec![spdk_dir(1, state.clone())])?,
+                Some(store.clone()),
+            )?;
+            ds.open_block(&block)?;
+            ds.finalize_block(&block)?;
+            ds.open_block(&block)?;
+            ds.finalize_block(&block)?;
+            assert!(store.get_generation(1, SPDK_RETIRED_GENERATION)?.is_some());
+        }
+
+        let restart_state = spdk_state();
+        let mut restarted = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, restart_state.clone())])?,
+            Some(store.clone()),
+        )?;
+        assert_eq!(restarted.get_readable_block(1).unwrap().bdev_offset, 4096);
+
+        let next = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let next_meta = restarted.open_block(&next)?;
+        assert_eq!(
+            next_meta.bdev_offset, 8192,
+            "retired X and current Y must both occupy allocator space after restart"
+        );
+
+        restarted.reclaim_retired_spdk_generation(1, SPDK_RETIRED_GENERATION)?;
+        assert!(store.get_generation(1, SPDK_RETIRED_GENERATION)?.is_none());
+        assert_eq!(
+            restart_state.offset_alloc.free_list_entries(),
+            vec![(0, 4096)]
+        );
+
+        drop(restarted);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn spdk_restart_quarantines_in_progress_staging_generation() -> CommonResult<()> {
+        let path = "../testing/spdk_restart_staging_generation";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        store.put(1, 1, 0, 4096, 4096, true)?;
+        store.put_generation(
+            1,
+            SPDK_STAGING_GENERATION,
+            1,
+            4096,
+            4096,
+            4096,
+            BlockState::Writing,
+        )?;
+
+        let restart_state = spdk_state();
+        let mut restarted = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, restart_state.clone())])?,
+            Some(store.clone()),
+        )?;
+        let recovered = store
+            .get_generation(1, SPDK_STAGING_GENERATION)?
+            .expect("staging generation should remain persisted");
+        assert_eq!(recovered.state, BlockState::Quarantined);
+        assert_eq!(restarted.get_readable_block(1).unwrap().bdev_offset, 0);
+
+        let next = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let next_meta = restarted.open_block(&next)?;
+        assert_eq!(
+            next_meta.bdev_offset, 8192,
+            "published X and quarantined staging Y must both occupy allocator space"
         );
 
         drop(restarted);

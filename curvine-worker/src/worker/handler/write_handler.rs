@@ -51,9 +51,70 @@ pub struct WriteHandler {
     pub(crate) context: Option<WriteContext>,
     pub(crate) file: Option<BlockWriteContext>,
     pub(crate) is_commit: bool,
+    pub(crate) full_overwrite: Option<FullOverwriteTracker>,
     pub(crate) io_slow_us: u64,
     pub(crate) metrics: &'static WorkerMetrics,
     pub(crate) client_addr: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FullOverwriteTracker {
+    block_len: i64,
+    ranges: Vec<(i64, i64)>,
+}
+
+impl FullOverwriteTracker {
+    fn new(block_len: i64) -> Self {
+        Self {
+            block_len,
+            ranges: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, start: i64, len: i64) -> FsResult<()> {
+        if len <= 0 {
+            return Ok(());
+        }
+        let end = start.checked_add(len).ok_or_else(|| {
+            curvine_core_error::err_msg!(format!(
+                "Full overwrite range overflow: start={}, len={}",
+                start, len
+            ))
+        })?;
+        if start < 0 || end > self.block_len {
+            return err_box!(
+                "Full overwrite range [{}, {}) exceeds block length {}",
+                start,
+                end,
+                self.block_len
+            );
+        }
+        self.ranges.push((start, end));
+        Ok(())
+    }
+
+    fn covers_full_block(&self) -> bool {
+        if self.block_len == 0 {
+            return true;
+        }
+        let mut ranges = self.ranges.clone();
+        ranges.sort_unstable_by_key(|range| range.0);
+
+        let mut covered_end = 0;
+        for (start, end) in ranges {
+            if end <= covered_end {
+                continue;
+            }
+            if start > covered_end {
+                return false;
+            }
+            covered_end = end;
+            if covered_end >= self.block_len {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl WriteHandler {
@@ -65,6 +126,7 @@ impl WriteHandler {
             context: None,
             file: None,
             is_commit: false,
+            full_overwrite: None,
             io_slow_us: conf.worker.io_slow_us(),
             metrics,
             client_addr,
@@ -116,13 +178,21 @@ impl WriteHandler {
             );
         }
         self.is_commit = false;
+        self.full_overwrite = None;
 
         let open_block = ExtendedBlock {
             len: context.block_size,
             ..context.block.clone()
         };
+        let full_overwrite_candidate = context.off == 0
+            && context.block.len == context.block_size
+            && context.block_size >= 0
+            && context.block.alloc_opts.is_none();
 
-        let meta = match self.store.open_block(&open_block) {
+        let (meta, skipped_rewrite_copy) = match self
+            .store
+            .open_block_for_write(&open_block, full_overwrite_candidate)
+        {
             Ok(m) => m,
             Err(e) => {
                 // `CommonError` is a type-erased string error (see
@@ -207,6 +277,9 @@ impl WriteHandler {
         };
 
         let _ = mem::replace(&mut self.file, file);
+        if skipped_rewrite_copy {
+            self.full_overwrite = Some(FullOverwriteTracker::new(context.block_size));
+        }
         let _ = self.context.replace(context);
 
         self.metrics.write_blocks.with_label_values(&[label]).inc();
@@ -265,12 +338,18 @@ impl WriteHandler {
             let data_len = msg.data_len() as i64;
             if data_len > 0 {
                 let spend = TimeSpent::new();
+                let write_start = file.block_pos();
                 if let Err(write_err) = file.write_region(&msg.data) {
                     if file.has_uncertain_writes() {
                         uncertain_abort_block = Some(context.block.clone());
                     }
                     write_result = Err(write_err.into());
                 } else {
+                    if let Some(full_overwrite) = self.full_overwrite.as_mut() {
+                        if let Err(err) = full_overwrite.record(write_start, data_len) {
+                            write_result = Err(err);
+                        }
+                    }
                     let used = spend.used_us();
                     if used >= self.io_slow_us {
                         warn!(
@@ -377,6 +456,29 @@ impl WriteHandler {
             );
         }
 
+        if !commit {
+            self.full_overwrite = None;
+        }
+
+        if commit {
+            if let Some(full_overwrite) = self.full_overwrite.take() {
+                if !full_overwrite.covers_full_block() {
+                    if let Err(abort_err) = self.store.abort_block(&context.block) {
+                        log::warn!(
+                            "failed to abort block {} after incomplete full-overwrite coverage: {}",
+                            context.block.id,
+                            abort_err
+                        );
+                    }
+                    return err_box!(
+                        "Incomplete full-block overwrite for block {}: staging copy was skipped but write coverage did not cover {} bytes",
+                        context.block.id,
+                        full_overwrite.block_len
+                    );
+                }
+            }
+        }
+
         self.commit_block(&context.block, commit)?;
         self.is_commit = true;
 
@@ -411,7 +513,7 @@ impl WriteHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_storage_open_error, WriteHandler};
+    use super::{map_storage_open_error, FullOverwriteTracker, WriteHandler};
     use crate::worker::block::BlockStore;
     use crate::worker::handler::WriteContext;
     use crate::worker::storage::BlockWriteContext;
@@ -444,6 +546,40 @@ mod tests {
             map_storage_open_error(error.into()),
             FsError::Common(_)
         ));
+    }
+
+    #[test]
+    fn full_overwrite_tracker_accepts_merged_full_coverage() -> FsResult<()> {
+        let mut tracker = FullOverwriteTracker::new(10);
+
+        tracker.record(5, 5)?;
+        tracker.record(0, 3)?;
+        tracker.record(3, 2)?;
+
+        assert!(tracker.covers_full_block());
+        Ok(())
+    }
+
+    #[test]
+    fn full_overwrite_tracker_rejects_gaps() -> FsResult<()> {
+        let mut tracker = FullOverwriteTracker::new(10);
+
+        tracker.record(0, 4)?;
+        tracker.record(5, 5)?;
+
+        assert!(!tracker.covers_full_block());
+        Ok(())
+    }
+
+    #[test]
+    fn full_overwrite_tracker_rejects_out_of_bounds_range() {
+        let mut tracker = FullOverwriteTracker::new(10);
+
+        let err = tracker.record(8, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds block length"),
+            "unexpected error: {err}"
+        );
     }
 
     // Same construction pattern already used by
@@ -630,6 +766,7 @@ mod tests {
             context: Some(context),
             file: Some(file),
             is_commit: false,
+            full_overwrite: None,
             io_slow_us: 0,
             metrics,
             client_addr: "test".to_string(),
@@ -688,6 +825,7 @@ mod tests {
             context: Some(context),
             file: Some(file),
             is_commit: false,
+            full_overwrite: None,
             io_slow_us: 0,
             metrics,
             client_addr: "test".to_string(),

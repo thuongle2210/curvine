@@ -31,10 +31,15 @@ mod version;
 pub use self::version::*;
 
 mod dir_state;
-pub use self::dir_state::{DirState, DEFAULT_BLOCK_ALIGN};
+pub use self::dir_state::{BdevOffsetAllocator, DirState, DEFAULT_BLOCK_ALIGN};
+
+mod extent_pin;
+pub use self::extent_pin::{ExtentKey, ExtentPinGuard, ExtentPinRegistry};
 
 mod spdk_meta_store;
-pub use self::spdk_meta_store::SpdkMetaStore;
+pub use self::spdk_meta_store::{
+    SpdkMetaStore, SPDK_LEGACY_GENERATION, SPDK_RETIRED_GENERATION, SPDK_STAGING_GENERATION,
+};
 
 mod meta_store;
 pub use self::meta_store::*;
@@ -46,6 +51,6 @@ mod block_io_context;
 pub use self::block_io_context::{BlockReadContext, BlockWriteContext};
 
 mod vfs_dataset;
-pub use self::vfs_dataset::VfsDataset;
+pub use self::vfs_dataset::{SpdkRewriteMode, VfsDataset};
 
 pub type BlockDataset = VfsDataset;

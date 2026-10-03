@@ -75,6 +75,14 @@ pub trait Dataset {
         self.abort_block(block)
     }
 
+    fn reclaim_retired_spdk_generation(
+        &mut self,
+        _block_id: i64,
+        _generation: i64,
+    ) -> CommonResult<()> {
+        Ok(())
+    }
+
     // Delete a block.
     fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()>;
 

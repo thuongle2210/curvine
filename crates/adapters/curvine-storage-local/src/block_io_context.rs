@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ExtentPinGuard;
 use bytes::BytesMut;
 use curvine_core_error::{err_box, try_err};
 use curvine_io::DataSlice;
@@ -173,6 +174,7 @@ pub struct BlockReadContext {
     /// reads past this offset return sparse zeros (post-resize master inflate).
     physical_len: i64,
     block_pos: i64,
+    _pin_guard: Option<ExtentPinGuard>,
 }
 
 impl BlockReadContext {
@@ -229,7 +231,13 @@ impl BlockReadContext {
             block_size: logical_len,
             physical_len,
             block_pos: initial_off,
+            _pin_guard: None,
         })
+    }
+
+    pub fn with_pin_guard(mut self, guard: ExtentPinGuard) -> Self {
+        self._pin_guard = Some(guard);
+        self
     }
 
     pub fn path(&self) -> &str {
