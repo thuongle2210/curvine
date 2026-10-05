@@ -70,3 +70,21 @@ fn file_block_details_proto_preserves_actual_replica_storage() {
         BlockReplicaState::Unknown
     );
 }
+
+#[test]
+fn block_replica_detail_deserializes_missing_state_as_unknown() {
+    let json = r#"
+        {
+            "worker_id": 2,
+            "storage_type": "Disk",
+            "address": null
+        }
+    "#;
+
+    let replica: BlockReplicaDetail = serde_json::from_str(json).unwrap();
+
+    assert_eq!(replica.worker_id, 2);
+    assert_eq!(replica.storage_type, StorageType::Disk);
+    assert!(replica.address.is_none());
+    assert_eq!(replica.state, BlockReplicaState::Unknown);
+}

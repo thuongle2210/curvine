@@ -189,6 +189,7 @@ pub struct BlockReplicaDetail {
     pub worker_id: u32,
     pub storage_type: StorageType,
     pub address: Option<WorkerAddress>,
+    #[serde(default)]
     pub state: BlockReplicaState,
 }
 
