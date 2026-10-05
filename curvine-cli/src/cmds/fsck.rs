@@ -150,7 +150,7 @@ impl FsckCommand {
                 for entry in entries {
                     if entry.is_dir {
                         directories.push_back(entry.path);
-                    } else if entry.file_type != FileType::Link {
+                    } else {
                         self.scan_file(client, entry, report, true).await?;
                     }
                 }
@@ -170,7 +170,7 @@ impl FsckCommand {
         report: &mut FsckReport,
         tolerate_error: bool,
     ) -> CommonResult<()> {
-        if status.storage_policy.ufs_only() {
+        if !should_inspect_blocks(&status) {
             report.add_file(FileBlockDetails {
                 status,
                 blocks: Vec::new(),
@@ -189,7 +189,7 @@ impl FsckCommand {
 }
 
 fn should_inspect_blocks(status: &FileStatus) -> bool {
-    !status.is_dir && status.file_type != FileType::Link && !status.storage_policy.ufs_only()
+    status.file_type == FileType::File && !status.storage_policy.ufs_only()
 }
 
 fn render_report(report: &FsckReport, detail: bool) -> String {
@@ -585,12 +585,30 @@ mod tests {
     }
 
     #[test]
-    fn links_and_ufs_only_files_skip_block_inspection() {
+    fn only_regular_non_ufs_files_are_block_inspected() {
         let mut status = FileStatus::default();
         assert!(should_inspect_blocks(&status));
 
-        status.file_type = FileType::Link;
-        assert!(!should_inspect_blocks(&status));
+        status.storage_policy = StoragePolicy {
+            state: StorageState::Both,
+            ..Default::default()
+        };
+        assert!(should_inspect_blocks(&status));
+
+        for file_type in [
+            FileType::Dir,
+            FileType::Link,
+            FileType::Stream,
+            FileType::Agg,
+            FileType::Object,
+            FileType::Fifo,
+            FileType::Char,
+            FileType::Block,
+            FileType::Socket,
+        ] {
+            status.file_type = file_type;
+            assert!(!should_inspect_blocks(&status), "inspected {file_type:?}");
+        }
 
         status.file_type = FileType::File;
         status.storage_policy = StoragePolicy {
