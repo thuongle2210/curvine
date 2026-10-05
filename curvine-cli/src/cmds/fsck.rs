@@ -582,6 +582,28 @@ mod tests {
     }
 
     #[test]
+    fn summary_reports_lost_replica_as_unavailable() {
+        let mut report = FsckReport {
+            root: "/data".to_string(),
+            is_dir: true,
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(
+            1,
+            vec![(Some(address(1)), BlockReplicaState::Lost)],
+        ));
+
+        let output = render_report(&report, true);
+
+        assert!(output.contains("Available replicas: 0"));
+        assert!(output.contains("Unavailable replicas: 1"));
+        assert!(output.contains("Under-replicated blocks: 1"));
+        assert!(output.contains("lost"));
+        assert!(output.contains("Status: WARNING"));
+    }
+
+    #[test]
     fn empty_directory_is_ok() {
         let report = FsckReport {
             root: "/empty".to_string(),
