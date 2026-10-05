@@ -47,7 +47,6 @@ fn fsck_style_traversal_pages_nested_directories_without_duplicates() -> CommonR
                 list_page_size: 3,
             };
             let output = command.render(fs.fs_client()).await?;
-            print!("output: {output}");
 
             assert!(output.contains(&format!("Files: {expected} | Blocks: {expected}")));
             assert!(output.contains("Status: OK"));
