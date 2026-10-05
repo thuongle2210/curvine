@@ -1,6 +1,6 @@
 use curvine_model::{
-    BlockReplicaDetail, FileBlockDetail, FileBlockDetails, FileStatus, ProtoUtils, StorageType,
-    WorkerAddress,
+    BlockReplicaDetail, BlockReplicaState, FileBlockDetail, FileBlockDetails, FileStatus,
+    ProtoUtils, StorageType, WorkerAddress,
 };
 
 #[test]
@@ -26,11 +26,13 @@ fn file_block_details_proto_preserves_actual_replica_storage() {
                         rpc_port: 50010,
                         web_port: 50011,
                     }),
+                    state: BlockReplicaState::Live,
                 },
                 BlockReplicaDetail {
                     worker_id: 2,
                     storage_type: StorageType::Disk,
                     address: None,
+                    state: BlockReplicaState::Unknown,
                 },
             ],
         }],
@@ -59,4 +61,12 @@ fn file_block_details_proto_preserves_actual_replica_storage() {
         StorageType::Disk
     );
     assert!(restored.blocks[0].replicas[1].address.is_none());
+    assert_eq!(
+        restored.blocks[0].replicas[0].state,
+        BlockReplicaState::Live
+    );
+    assert_eq!(
+        restored.blocks[0].replicas[1].state,
+        BlockReplicaState::Unknown
+    );
 }

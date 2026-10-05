@@ -2,7 +2,7 @@ use clap::Parser;
 use curvine_client_core::file::FsClient;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::Path;
-use curvine_model::{FileBlockDetails, FileStatus, FileType, ListOptions};
+use curvine_model::{BlockReplicaState, FileBlockDetails, FileStatus, FileType, ListOptions};
 use curvine_runtime::common::ByteUnit;
 use std::collections::VecDeque;
 use std::fmt::Write;
@@ -63,15 +63,15 @@ impl FsckReport {
             let available = block
                 .replicas
                 .iter()
-                .filter(|replica| replica.address.is_some())
+                .filter(|replica| replica.state.is_available())
                 .count();
 
             self.block_count += 1;
             self.expected_replicas += expected;
             self.recorded_replicas += block.replicas.len();
             self.available_replicas += available;
-            self.unavailable_replicas += block.replicas.len() - available;
-            if block.replicas.len() < expected {
+            self.unavailable_replicas += block.replicas.len().saturating_sub(available);
+            if available < expected {
                 self.under_replicated_blocks += 1;
             }
         }
@@ -280,10 +280,10 @@ fn render_file(details: &FileBlockDetails, include_status: bool) -> String {
                 .as_ref()
                 .map(|address| format!("{}:{}", address.hostname, address.rpc_port))
                 .unwrap_or_else(|| format!("worker-{}", replica.worker_id));
-            let availability = if replica.address.is_some() {
-                "available"
-            } else {
-                "unavailable"
+            let availability = match replica.state {
+                BlockReplicaState::Live => "live",
+                BlockReplicaState::Lost => "lost",
+                BlockReplicaState::Unknown => "unknown",
             };
             writeln!(output, "  {:<28} {}", worker, availability).unwrap();
         }
@@ -291,11 +291,17 @@ fn render_file(details: &FileBlockDetails, include_status: bool) -> String {
 
     if include_status {
         let warning = details.blocks.iter().any(|block| {
-            block.replicas.len() < details.status.replicas.max(0) as usize
+            let expected = details.status.replicas.max(0) as usize;
+            let available = block
+                .replicas
+                .iter()
+                .filter(|replica| replica.state.is_available())
+                .count();
+            available < expected
                 || block
                     .replicas
                     .iter()
-                    .any(|replica| replica.address.is_none())
+                    .any(|replica| !replica.state.is_available())
         });
         writeln!(
             output,
@@ -323,7 +329,10 @@ mod tests {
         }
     }
 
-    fn details(replicas: i32, addresses: Vec<Option<WorkerAddress>>) -> FileBlockDetails {
+    fn details(
+        replicas: i32,
+        replicas_info: Vec<(Option<WorkerAddress>, BlockReplicaState)>,
+    ) -> FileBlockDetails {
         FileBlockDetails {
             status: FileStatus {
                 path: "/data/file".to_string(),
@@ -335,13 +344,14 @@ mod tests {
                 block_id: 7,
                 len: 100,
                 offset: 0,
-                replicas: addresses
+                replicas: replicas_info
                     .into_iter()
                     .enumerate()
-                    .map(|(index, address)| BlockReplicaDetail {
+                    .map(|(index, (address, state))| BlockReplicaDetail {
                         worker_id: index as u32 + 1,
                         storage_type: Default::default(),
                         address,
+                        state,
                     })
                     .collect(),
             }],
@@ -360,7 +370,13 @@ mod tests {
     #[test]
     fn healthy_and_empty_files_have_no_warnings() {
         let mut report = FsckReport::default();
-        report.add_file(details(2, vec![Some(address(1)), Some(address(2))]));
+        report.add_file(details(
+            2,
+            vec![
+                (Some(address(1)), BlockReplicaState::Live),
+                (Some(address(2)), BlockReplicaState::Live),
+            ],
+        ));
         assert_eq!(report.expected_replicas, 2);
         assert_eq!(report.recorded_replicas, 2);
         assert_eq!(report.available_replicas, 2);
@@ -378,7 +394,13 @@ mod tests {
     #[test]
     fn missing_and_unavailable_replicas_are_accounted_separately() {
         let mut report = FsckReport::default();
-        report.add_file(details(3, vec![Some(address(1)), None]));
+        report.add_file(details(
+            3,
+            vec![
+                (Some(address(1)), BlockReplicaState::Live),
+                (None, BlockReplicaState::Unknown),
+            ],
+        ));
 
         assert_eq!(report.expected_replicas, 3);
         assert_eq!(report.recorded_replicas, 2);
@@ -398,7 +420,7 @@ mod tests {
 
     #[test]
     fn add_file_sorts_blocks_and_replicas() {
-        let mut unordered = details(2, vec![Some(address(1))]);
+        let mut unordered = details(2, vec![(Some(address(1)), BlockReplicaState::Live)]);
         unordered.blocks = vec![
             FileBlockDetail {
                 block_id: 8,
@@ -415,11 +437,13 @@ mod tests {
                         worker_id: 3,
                         storage_type: Default::default(),
                         address: None,
+                        state: BlockReplicaState::Unknown,
                     },
                     BlockReplicaDetail {
                         worker_id: 1,
                         storage_type: Default::default(),
                         address: None,
+                        state: BlockReplicaState::Unknown,
                     },
                 ],
             },
@@ -451,13 +475,42 @@ mod tests {
 
     #[test]
     fn file_report_shows_health_without_storage_analysis() {
-        let output = render_file(&details(2, vec![Some(address(1)), None]), true);
+        let output = render_file(
+            &details(
+                2,
+                vec![
+                    (Some(address(1)), BlockReplicaState::Live),
+                    (Some(address(2)), BlockReplicaState::Lost),
+                ],
+            ),
+            true,
+        );
         assert!(output.contains("worker-1:50010"));
-        assert!(output.contains("available"));
+        assert!(output.contains("live"));
         assert!(output.contains("worker-2"));
-        assert!(output.contains("unavailable"));
+        assert!(output.contains("lost"));
         assert!(!output.contains("MISMATCH"));
         assert!(!output.contains("Policy:"));
+        assert!(output.contains("Status: WARNING"));
+    }
+
+    #[test]
+    fn addressed_but_unavailable_replica_is_not_counted_available() {
+        let mut report = FsckReport::default();
+        report.add_file(details(
+            1,
+            vec![(Some(address(1)), BlockReplicaState::Lost)],
+        ));
+
+        assert_eq!(report.recorded_replicas, 1);
+        assert_eq!(report.available_replicas, 0);
+        assert_eq!(report.unavailable_replicas, 1);
+        assert_eq!(report.under_replicated_blocks, 1);
+        assert!(report.has_warnings());
+
+        let output = render_file(&report.files[0], true);
+        assert!(output.contains("worker-1:50010"));
+        assert!(output.contains("lost"));
         assert!(output.contains("Status: WARNING"));
     }
 

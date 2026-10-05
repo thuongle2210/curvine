@@ -8,7 +8,14 @@ use std::sync::Arc;
 
 #[test]
 fn fsck_style_traversal_pages_nested_directories_without_duplicates() -> CommonResult<()> {
-    let testing = Testing::builder().workers(1).build()?;
+    let testing = Testing::builder()
+        .workers(1)
+        .mutate_conf(|conf| {
+            conf.client.block_size = 64 * 1024;
+            conf.client.block_size_str = "64KB".to_string();
+            conf.master.min_block_size = 64 * 1024;
+        })
+        .build()?;
     let _cluster = testing.start_cluster()?;
     let conf = testing.get_active_cluster_conf()?;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
