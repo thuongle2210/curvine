@@ -94,6 +94,16 @@ impl FsckReport {
 
 impl FsckCommand {
     pub async fn execute(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        print!("{}", self.render(client).await?);
+        Ok(())
+    }
+
+    pub async fn render(&self, client: Arc<FsClient>) -> CommonResult<String> {
+        let report = self.build_report(client).await?;
+        Ok(render_report(&report, self.detail))
+    }
+
+    async fn build_report(&self, client: Arc<FsClient>) -> CommonResult<FsckReport> {
         let path = Path::from_str(&self.path)?;
         let status = client.file_status(&path).await?;
         let mut report = FsckReport {
@@ -119,8 +129,7 @@ impl FsckCommand {
                 .files
                 .sort_by(|left, right| left.status.path.cmp(&right.status.path));
         }
-        print!("{}", render_report(&report, self.detail));
-        Ok(())
+        Ok(report)
     }
 
     async fn scan_directory(
