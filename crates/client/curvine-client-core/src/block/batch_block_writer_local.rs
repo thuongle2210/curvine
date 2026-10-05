@@ -150,8 +150,8 @@ impl BatchBlockWriterLocal {
         &self.worker_address
     }
 
-    pub fn actual_storage_type(&self, block_index: usize) -> Option<StorageType> {
-        self.actual_storage_types.get(block_index).copied()
+    pub fn actual_storage_type(&self, block_index: usize) -> StorageType {
+        self.actual_storage_types[block_index]
     }
 
     pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {

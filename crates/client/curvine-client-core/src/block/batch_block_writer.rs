@@ -62,7 +62,7 @@ impl BatchWriterAdapter {
         }
     }
 
-    fn actual_storage_type(&self, block_index: usize) -> Option<StorageType> {
+    fn actual_storage_type(&self, block_index: usize) -> StorageType {
         match self {
             BatchLocal(f) => f.actual_storage_type(block_index),
             BatchRemote(f) => f.actual_storage_type(block_index),
@@ -327,10 +327,10 @@ impl BatchBlockWriter {
             return Err(e);
         }
 
-        self.to_commit_blocks()
+        Ok(self.to_commit_blocks())
     }
 
-    pub fn to_commit_blocks(&self) -> FsResult<Vec<CommitBlock>> {
+    pub fn to_commit_blocks(&self) -> Vec<CommitBlock> {
         let mut locations = self
             .located_blocks
             .iter()
@@ -338,20 +338,9 @@ impl BatchBlockWriter {
             .collect::<Vec<_>>();
         for group in &self.groups {
             for (local_index, entry) in group.entries.iter().enumerate() {
-                let storage_type =
-                    group
-                        .writer
-                        .actual_storage_type(local_index)
-                        .ok_or_else(|| {
-                            FsError::common(format!(
-                                "missing actual storage type for block {} on worker {}",
-                                self.located_blocks[entry.original_index].block.id,
-                                group.writer.worker_address().worker_id
-                            ))
-                        })?;
                 locations[entry.original_index][entry.location_index] = Some(BlockLocation::new(
                     group.writer.worker_address().worker_id,
-                    storage_type,
+                    group.writer.actual_storage_type(local_index),
                 ));
             }
         }
@@ -361,16 +350,12 @@ impl BatchBlockWriter {
         for (i, located_block) in self.located_blocks.iter().enumerate() {
             let locations = locations[i]
                 .iter()
-                .enumerate()
-                .map(|(location_index, location)| {
-                    location.clone().ok_or_else(|| {
-                        FsError::common(format!(
-                            "missing actual storage type for block {} on worker {}",
-                            located_block.block.id, located_block.locs[location_index].worker_id
-                        ))
-                    })
+                .map(|location| {
+                    location
+                        .clone()
+                        .expect("every allocated batch replica has a worker group")
                 })
-                .collect::<FsResult<Vec<_>>>()?;
+                .collect();
             let mut commit_block = CommitBlock {
                 block_id: located_block.block.id,
                 block_len: located_block.block.len,
@@ -384,7 +369,7 @@ impl BatchBlockWriter {
             commit_blocks.push(commit_block);
         }
 
-        Ok(commit_blocks)
+        commit_blocks
     }
 }
 
