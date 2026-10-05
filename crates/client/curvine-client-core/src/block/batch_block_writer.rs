@@ -348,18 +348,17 @@ impl BatchBlockWriter {
         let mut commit_blocks = Vec::with_capacity(self.located_blocks.len());
 
         for (i, located_block) in self.located_blocks.iter().enumerate() {
-            let locations = locations[i]
-                .iter()
-                .map(|location| {
-                    location
-                        .clone()
-                        .expect("every allocated batch replica has a worker group")
-                })
-                .collect();
             let mut commit_block = CommitBlock {
                 block_id: located_block.block.id,
                 block_len: located_block.block.len,
-                locations,
+                locations: locations[i]
+                    .iter()
+                    .map(|location| {
+                        location
+                            .clone()
+                            .expect("every allocated batch replica has a worker group")
+                    })
+                    .collect(),
             };
 
             if let Some(&length) = self.file_lengths.get(i) {
