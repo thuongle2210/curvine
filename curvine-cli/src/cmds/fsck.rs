@@ -43,6 +43,7 @@ fn parse_list_page_size(value: &str) -> Result<usize, String> {
 struct FsckReport {
     root: String,
     is_dir: bool,
+    retain_files: bool,
     files: Vec<FileBlockDetails>,
     file_count: usize,
     block_count: usize,
@@ -76,7 +77,9 @@ impl FsckReport {
             }
         }
         self.file_count += 1;
-        self.files.push(details);
+        if self.retain_files {
+            self.files.push(details);
+        }
     }
 
     fn add_error(&mut self, path: String, error: String) {
@@ -96,6 +99,7 @@ impl FsckCommand {
         let mut report = FsckReport {
             root: status.path.clone(),
             is_dir: status.is_dir,
+            retain_files: !status.is_dir || self.detail,
             ..Default::default()
         };
 
@@ -110,9 +114,11 @@ impl FsckCommand {
             self.scan_file(&client, status, &mut report, false).await?;
         }
 
-        report
-            .files
-            .sort_by(|left, right| left.status.path.cmp(&right.status.path));
+        if report.retain_files {
+            report
+                .files
+                .sort_by(|left, right| left.status.path.cmp(&right.status.path));
+        }
         print!("{}", render_report(&report, self.detail));
         Ok(())
     }
@@ -369,7 +375,10 @@ mod tests {
 
     #[test]
     fn healthy_and_empty_files_have_no_warnings() {
-        let mut report = FsckReport::default();
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
         report.add_file(details(
             2,
             vec![
@@ -393,7 +402,10 @@ mod tests {
 
     #[test]
     fn missing_and_unavailable_replicas_are_accounted_separately() {
-        let mut report = FsckReport::default();
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
         report.add_file(details(
             3,
             vec![
@@ -412,10 +424,50 @@ mod tests {
 
     #[test]
     fn zero_recorded_replicas_are_under_replicated() {
-        let mut report = FsckReport::default();
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
         report.add_file(details(1, Vec::new()));
         assert_eq!(report.recorded_replicas, 0);
         assert_eq!(report.under_replicated_blocks, 1);
+    }
+
+    #[test]
+    fn directory_summary_does_not_retain_file_details() {
+        let mut report = FsckReport {
+            is_dir: true,
+            retain_files: false,
+            ..Default::default()
+        };
+
+        report.add_file(details(
+            1,
+            vec![(Some(address(1)), BlockReplicaState::Live)],
+        ));
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.block_count, 1);
+        assert_eq!(report.available_replicas, 1);
+        assert!(report.files.is_empty());
+    }
+
+    #[test]
+    fn detail_reports_retain_file_details_for_rendering() {
+        let mut report = FsckReport {
+            is_dir: true,
+            retain_files: true,
+            ..Default::default()
+        };
+
+        report.add_file(details(
+            1,
+            vec![(Some(address(1)), BlockReplicaState::Live)],
+        ));
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].status.path, "/data/file");
     }
 
     #[test]
@@ -448,7 +500,10 @@ mod tests {
                 ],
             },
         ];
-        let mut report = FsckReport::default();
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
         report.add_file(unordered);
 
         assert_eq!(report.files[0].blocks[0].block_id, 7);
@@ -496,7 +551,10 @@ mod tests {
 
     #[test]
     fn addressed_but_unavailable_replica_is_not_counted_available() {
-        let mut report = FsckReport::default();
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
         report.add_file(details(
             1,
             vec![(Some(address(1)), BlockReplicaState::Lost)],
