@@ -26,15 +26,16 @@ use curvine_model::{
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
-    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
-    GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+    BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
+    CreateFileRequest, DeleteRequest, GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest,
+    RenameRequest,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_rpc::handler::MessageHandler;
-use curvine_rpc::message::Builder;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::message::ResponseStatus;
+use curvine_rpc::message::{Builder, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
@@ -474,6 +475,70 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
     )?;
 
     assert_eq!(result.delete_blocks, vec![block_id]);
+    Ok(())
+}
+
+#[test]
+fn full_block_report_default_limit_to_master() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let count = MasterConf::DEFAULT_BLOCK_REPORT_LIMIT;
+    assert_eq!(MasterConf::default().block_report_limit, count);
+
+    let fs = new_fs(true, "full-block-report-100k");
+    let file = fs.create("/full-block-report-100k.log", false)?;
+    let worker_id = WorkerInfo::default().worker_id();
+
+    let blocks: Vec<_> = (0..count as i64)
+        .map(|seq| {
+            BlockReportInfo::new(
+                InodeId::create_block_id(file.id, seq).expect("block id"),
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                1,
+            )
+        })
+        .collect();
+
+    let req = BlockReportListRequest {
+        cluster_id: "curvine".into(),
+        worker_id,
+        full_report: true,
+        total_len: count as u64,
+        blocks: blocks
+            .iter()
+            .map(|block| BlockReportInfoProto {
+                id: block.id,
+                status: block.status.into(),
+                block_size: block.block_size,
+                storage_type: block.storage_type.into(),
+            })
+            .collect(),
+    };
+    let encoded = req.encode_to_vec();
+    assert!(
+        encoded.len() < MAX_DATE_SIZE as usize,
+        "100k-block report encoded to {} bytes, exceeds MAX_DATE_SIZE {}",
+        encoded.len(),
+        MAX_DATE_SIZE
+    );
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: true,
+            total_len: count as u64,
+            blocks,
+        },
+        None,
+    )?;
+    assert!(result.delete_blocks.is_empty());
+
+    let reported = {
+        let fs_dir = fs.fs_dir.read();
+        fs_dir.get_worker_block_ids(worker_id)?
+    };
+    assert_eq!(reported.len(), count);
     Ok(())
 }
 
@@ -2870,6 +2935,61 @@ fn file_block_details_preserve_unknown_worker_locations() -> CommonResult<()> {
         .expect("unknown worker location should be retained");
     assert_eq!(unknown.storage_type, StorageType::Ssd);
     assert!(unknown.address.is_none());
+    Ok(())
+}
+
+#[test]
+fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-lost-worker");
+    let path = "/lost-worker.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+    let worker_id = block.locs[0].worker_id;
+    let expected_address = block.locs[0].clone();
+    let reported_storage_type = StorageType::Ssd;
+    let location = BlockLocation::new(worker_id, reported_storage_type);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, location.clone())?;
+
+    let live_details = fs.get_file_block_details(path)?;
+    let live_replica = live_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("live worker location should be retained");
+    assert!(live_replica.address.is_some());
+
+    fs.worker_manager
+        .write()
+        .remove_expired_worker(worker_id)
+        .expect("worker should move to lost map");
+
+    let details = fs.get_file_block_details(path)?;
+    assert_eq!(details.blocks.len(), 1);
+    assert_eq!(details.blocks[0].block_id, block.block.id);
+    assert_eq!(details.blocks[0].replicas.len(), 1);
+    let lost = &details.blocks[0].replicas[0];
+    assert_eq!(lost.worker_id, worker_id);
+    assert_eq!(lost.storage_type, reported_storage_type);
+    let lost_address = lost
+        .address
+        .as_ref()
+        .expect("lost worker address should be resolved from lost worker map");
+    assert_eq!(lost_address.worker_id, expected_address.worker_id);
+    assert_eq!(lost_address.hostname, expected_address.hostname);
+    assert_eq!(lost_address.ip_addr, expected_address.ip_addr);
+    assert_eq!(lost_address.rpc_port, expected_address.rpc_port);
+    assert_eq!(lost_address.web_port, expected_address.web_port);
+
+    // Contrast: create_locate_block must use live-only get_worker; lost replicas must not be returned to readers.
+    assert!(
+        fs.create_locate_block(path, block.block.clone(), &[location])
+            .is_err(),
+        "read path must refuse a block whose only replica is on a lost worker"
+    );
     Ok(())
 }
 

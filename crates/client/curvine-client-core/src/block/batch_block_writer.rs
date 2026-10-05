@@ -23,6 +23,7 @@ use curvine_model::{
     BlockLocation, CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress,
 };
 use futures::future::try_join_all;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub(super) fn validate_batch_contexts(
@@ -89,20 +90,26 @@ impl BatchWriterAdapter {
         }
     }
 
+    async fn cancel(&mut self) -> FsResult<()> {
+        match self {
+            BatchLocal(f) => f.cancel().await,
+            BatchRemote(f) => f.cancel().await,
+        }
+    }
+
     // Create new WriterAdapter
     async fn new(
         fs_context: Arc<FsContext>,
-        located_blocks: &[LocatedBlock],
+        blocks: Vec<ExtendedBlock>,
+        has_spdk: bool,
         worker_addr: &WorkerAddress,
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         // SPDK bypasses kernel — no local path. Disable short-circuit if any block uses SPDK.
         // Use has_spdk from worker-reported actual storage type, not block.storage_type
-        let has_spdk = located_blocks.iter().any(|lb| lb.has_spdk);
         let short_circuit =
             conf.short_circuit && fs_context.is_local_worker(worker_addr) && !has_spdk;
 
-        let blocks: Vec<ExtendedBlock> = located_blocks.iter().map(|lb| lb.block.clone()).collect();
         let adapter = if short_circuit {
             match BatchBlockWriterLocal::new(
                 fs_context.clone(),
@@ -133,8 +140,73 @@ impl BatchWriterAdapter {
     }
 }
 
+struct WorkerGroupEntry {
+    original_index: usize,
+    location_index: usize,
+}
+
+struct WorkerGroup {
+    writer: BatchWriterAdapter,
+    entries: Vec<WorkerGroupEntry>,
+}
+
+struct PendingWorkerGroup {
+    worker: WorkerAddress,
+    blocks: Vec<ExtendedBlock>,
+    has_spdk: bool,
+    entries: Vec<WorkerGroupEntry>,
+}
+
+fn group_blocks_by_worker(located_blocks: &[LocatedBlock]) -> FsResult<Vec<PendingWorkerGroup>> {
+    let mut groups = Vec::<PendingWorkerGroup>::new();
+    let mut group_by_worker = HashMap::<u32, usize>::new();
+
+    for (original_index, located_block) in located_blocks.iter().enumerate() {
+        if located_block.locs.is_empty() {
+            return err_box!(
+                "There is no available worker for block {}",
+                located_block.block.id
+            );
+        }
+
+        let mut block_workers = HashSet::with_capacity(located_block.locs.len());
+        for (location_index, worker) in located_block.locs.iter().enumerate() {
+            if !block_workers.insert(worker.worker_id) {
+                return err_box!(
+                    "duplicate worker {} for block {}",
+                    worker.worker_id,
+                    located_block.block.id
+                );
+            }
+
+            let group_index = match group_by_worker.get(&worker.worker_id) {
+                Some(index) => *index,
+                None => {
+                    let index = groups.len();
+                    group_by_worker.insert(worker.worker_id, index);
+                    groups.push(PendingWorkerGroup {
+                        worker: worker.clone(),
+                        blocks: Vec::new(),
+                        has_spdk: false,
+                        entries: Vec::new(),
+                    });
+                    index
+                }
+            };
+            groups[group_index].blocks.push(located_block.block.clone());
+            groups[group_index].has_spdk |= located_block.has_spdk;
+            groups[group_index].entries.push(WorkerGroupEntry {
+                original_index,
+                location_index,
+            });
+        }
+    }
+
+    Ok(groups)
+}
+
 pub struct BatchBlockWriter {
-    inners: Vec<BatchWriterAdapter>,
+    groups: Vec<WorkerGroup>,
     fs_context: Arc<FsContext>,
     located_blocks: Vec<LocatedBlock>,
     file_lengths: Vec<i64>,
@@ -143,31 +215,48 @@ impl BatchBlockWriter {
     /// Create multiple BlockWriters for batch operations  
     pub async fn new(
         fs_context: Arc<FsContext>,
-        located_blocks: Vec<LocatedBlock>, // all blocks have the same worker information
+        located_blocks: Vec<LocatedBlock>,
     ) -> FsResult<Self> {
         if located_blocks.is_empty() {
             return err_box!("No blocks provided");
         }
 
-        // Get the first block to extract worker information
-        let first_locate = located_blocks.first().unwrap();
+        let pending_groups = group_blocks_by_worker(&located_blocks)?;
+        let mut groups: Vec<WorkerGroup> = Vec::with_capacity(pending_groups.len());
 
-        if first_locate.locs.is_empty() {
-            return err_box!("There is no available worker");
-        }
-
-        // Create adapters for each worker (same workers for all blocks)
-        let mut inners = Vec::with_capacity(first_locate.locs.len());
-        for addr in &first_locate.locs {
-            // Create a batch adapter that can handle multiple blocks
-            let adapter =
-                BatchWriterAdapter::new(fs_context.clone(), &located_blocks, addr).await?;
-            inners.push(adapter);
+        // TODO: Implement and benchmark bounded concurrent worker-group opens
+        for group in pending_groups {
+            let writer = match BatchWriterAdapter::new(
+                fs_context.clone(),
+                group.blocks,
+                group.has_spdk,
+                &group.worker,
+            )
+            .await
+            {
+                Ok(writer) => writer,
+                Err(error) => {
+                    for opened_group in &mut groups {
+                        if let Err(cancel_error) = opened_group.writer.cancel().await {
+                            log::warn!(
+                                "failed to cancel batch group on worker {}: {}",
+                                opened_group.writer.worker_address().worker_id,
+                                cancel_error
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            groups.push(WorkerGroup {
+                writer,
+                entries: group.entries,
+            });
         }
         let num_of_blocks = located_blocks.len();
 
         Ok(Self {
-            inners,
+            groups,
             fs_context,
             located_blocks,
             file_lengths: Vec::with_capacity(num_of_blocks),
@@ -175,16 +264,28 @@ impl BatchBlockWriter {
     }
 
     pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
-        // Store individual file lengths
+        if files.len() != self.located_blocks.len() {
+            return err_box!(
+                "batch file count mismatch, expected {}, actual {}",
+                self.located_blocks.len(),
+                files.len()
+            );
+        }
+
         for (_, content) in files {
             self.file_lengths.push(content.len() as i64);
         }
-        // Write each file separately to all writers with index
-        let futures = self.inners.iter_mut().map(|writer| async move {
-            writer
-                .write(files)
+        let futures = self.groups.iter_mut().map(|group| async move {
+            let group_files = group
+                .entries
+                .iter()
+                .map(|entry| files[entry.original_index])
+                .collect::<Vec<_>>();
+            group
+                .writer
+                .write(&group_files)
                 .await
-                .map_err(|e| (writer.worker_address().clone(), e))
+                .map_err(|e| (group.writer.worker_address().clone(), e))
         });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
@@ -196,11 +297,12 @@ impl BatchBlockWriter {
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        let futures = self.inners.iter_mut().map(|writer| async move {
-            writer
+        let futures = self.groups.iter_mut().map(|group| async move {
+            group
+                .writer
                 .flush()
                 .await
-                .map_err(|e| (writer.worker_address().clone(), e))
+                .map_err(|e| (group.writer.worker_address().clone(), e))
         });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
@@ -212,11 +314,12 @@ impl BatchBlockWriter {
 
     /// Complete all writers and return commit blocks  
     pub async fn complete(&mut self) -> FsResult<Vec<CommitBlock>> {
-        let futures = self.inners.iter_mut().map(|writer| async move {
-            writer
+        let futures = self.groups.iter_mut().map(|group| async move {
+            group
+                .writer
                 .complete()
                 .await
-                .map_err(|e| (writer.worker_address().clone(), e))
+                .map_err(|e| (group.writer.worker_address().clone(), e))
         });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
@@ -228,24 +331,44 @@ impl BatchBlockWriter {
     }
 
     pub fn to_commit_blocks(&self) -> FsResult<Vec<CommitBlock>> {
+        let mut locations = self
+            .located_blocks
+            .iter()
+            .map(|block| vec![None; block.locs.len()])
+            .collect::<Vec<_>>();
+        for group in &self.groups {
+            for (local_index, entry) in group.entries.iter().enumerate() {
+                let storage_type =
+                    group
+                        .writer
+                        .actual_storage_type(local_index)
+                        .ok_or_else(|| {
+                            FsError::common(format!(
+                                "missing actual storage type for block {} on worker {}",
+                                self.located_blocks[entry.original_index].block.id,
+                                group.writer.worker_address().worker_id
+                            ))
+                        })?;
+                locations[entry.original_index][entry.location_index] = Some(BlockLocation::new(
+                    group.writer.worker_address().worker_id,
+                    storage_type,
+                ));
+            }
+        }
+
         let mut commit_blocks = Vec::with_capacity(self.located_blocks.len());
 
         for (i, located_block) in self.located_blocks.iter().enumerate() {
-            let locations = self
-                .inners
+            let locations = locations[i]
                 .iter()
-                .map(|writer| {
-                    let storage_type = writer.actual_storage_type(i).ok_or_else(|| {
+                .enumerate()
+                .map(|(location_index, location)| {
+                    location.clone().ok_or_else(|| {
                         FsError::common(format!(
                             "missing actual storage type for block {} on worker {}",
-                            located_block.block.id,
-                            writer.worker_address().worker_id
+                            located_block.block.id, located_block.locs[location_index].worker_id
                         ))
-                    })?;
-                    Ok(BlockLocation::new(
-                        writer.worker_address().worker_id,
-                        storage_type,
-                    ))
+                    })
                 })
                 .collect::<FsResult<Vec<_>>>()?;
             let mut commit_block = CommitBlock {
@@ -267,9 +390,9 @@ impl BatchBlockWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_batch_contexts;
+    use super::{group_blocks_by_worker, validate_batch_contexts};
     use crate::block::CreateBlockContext;
-    use curvine_model::{ExtendedBlock, StorageType};
+    use curvine_model::{ExtendedBlock, LocatedBlock, StorageType, WorkerAddress};
 
     fn context(id: i64) -> CreateBlockContext {
         CreateBlockContext {
@@ -279,6 +402,20 @@ mod tests {
             path: None,
             storage_type: StorageType::Disk,
         }
+    }
+
+    fn worker(worker_id: u32) -> WorkerAddress {
+        WorkerAddress {
+            worker_id,
+            ..Default::default()
+        }
+    }
+
+    fn located_block(id: i64, worker_ids: impl IntoIterator<Item = u32>) -> LocatedBlock {
+        LocatedBlock::new(
+            ExtendedBlock::with_id(id),
+            worker_ids.into_iter().map(worker).collect(),
+        )
     }
 
     #[test]
@@ -297,5 +434,94 @@ mod tests {
         let error = validate_batch_contexts(&blocks, &[context(2), context(1)]).unwrap_err();
 
         assert!(error.to_string().contains("response id mismatch"));
+    }
+
+    #[test]
+    fn grouping_common_path_keeps_one_group_per_replica() {
+        const BLOCKS: usize = 1_000;
+        const REPLICAS: usize = 3;
+        let blocks = (0..BLOCKS)
+            .map(|id| located_block(id as i64, [1, 2, 3]))
+            .collect::<Vec<_>>();
+
+        let groups = group_blocks_by_worker(&blocks).unwrap();
+
+        assert_eq!(groups.len(), REPLICAS);
+        assert!(groups.iter().all(|group| group.entries.len() == BLOCKS));
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.entries.len())
+                .sum::<usize>(),
+            BLOCKS * REPLICAS
+        );
+    }
+
+    #[test]
+    fn grouping_distributed_path_processes_each_assignment_once() {
+        const BLOCKS: usize = 10_000;
+        const WORKERS: usize = 32;
+        let blocks = (0..BLOCKS)
+            .map(|id| located_block(id as i64, [(id % WORKERS) as u32 + 1]))
+            .collect::<Vec<_>>();
+
+        let groups = group_blocks_by_worker(&blocks).unwrap();
+
+        assert_eq!(groups.len(), WORKERS);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.entries.len())
+                .sum::<usize>(),
+            BLOCKS
+        );
+        assert!(groups
+            .iter()
+            .all(|group| group.entries.len() <= BLOCKS.div_ceil(WORKERS)));
+    }
+
+    #[test]
+    fn grouping_maps_overlapping_replica_sets_to_original_locations() {
+        let blocks = vec![located_block(1, [1, 2]), located_block(2, [2, 3])];
+
+        let groups = group_blocks_by_worker(&blocks).unwrap();
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].worker.worker_id, 1);
+        assert_eq!(groups[0].entries.len(), 1);
+        assert_eq!(groups[0].entries[0].original_index, 0);
+        assert_eq!(groups[0].entries[0].location_index, 0);
+
+        assert_eq!(groups[1].worker.worker_id, 2);
+        assert_eq!(groups[1].entries.len(), 2);
+        assert_eq!(groups[1].entries[0].original_index, 0);
+        assert_eq!(groups[1].entries[0].location_index, 1);
+        assert_eq!(groups[1].entries[1].original_index, 1);
+        assert_eq!(groups[1].entries[1].location_index, 0);
+
+        assert_eq!(groups[2].worker.worker_id, 3);
+        assert_eq!(groups[2].entries.len(), 1);
+        assert_eq!(groups[2].entries[0].original_index, 1);
+        assert_eq!(groups[2].entries[0].location_index, 1);
+    }
+
+    #[test]
+    fn grouping_rejects_block_without_workers() {
+        let error = match group_blocks_by_worker(&[located_block(1, [])]) {
+            Ok(_) => panic!("grouping should reject a block without workers"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("no available worker"));
+    }
+
+    #[test]
+    fn grouping_rejects_duplicate_worker_for_block() {
+        let error = match group_blocks_by_worker(&[located_block(1, [1, 1])]) {
+            Ok(_) => panic!("grouping should reject duplicate workers"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("duplicate worker 1"));
     }
 }

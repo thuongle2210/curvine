@@ -601,7 +601,7 @@ impl MasterFilesystem {
         client_addr: ClientAddress,
         exclude_workers: Vec<u32>,
     ) -> FsResult<Vec<WorkerAddress>> {
-        let wm = self.worker_manager.read();
+        let mut wm = self.worker_manager.write();
         let validate_block = Self::validate_add_block(file, &client_addr, None)?;
         let choose_ctx = ChooseContext::with_block(validate_block, exclude_workers);
         Ok(wm.choose_worker(choose_ctx)?)
@@ -672,13 +672,22 @@ impl MasterFilesystem {
             return self.create_locate_block(path, extend_block, &locs);
         }
 
+        let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
         let block =
-            fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len)?;
+            match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
+                Ok(block) => block,
+                Err(e) => {
+                    self.worker_manager
+                        .write()
+                        .unschedule_chosen_workers(&choose_workers, block_size);
+                    return Err(e);
+                }
+            };
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -842,51 +851,71 @@ impl MasterFilesystem {
     }
 
     pub fn get_file_block_details<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlockDetails> {
-        let fs_dir = self.fs_dir.read();
         let path = path.as_ref();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-        let inode = match inp.get_last_inode() {
-            Some(inode) => inode,
-            None => return err_ext!(FsError::file_not_found(path)),
+
+        let (status, block_snapshots, worker_addresses) = {
+            let fs_dir = self.fs_dir.read();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let inode = match inp.get_last_inode() {
+                Some(inode) => inode,
+                None => return err_ext!(FsError::file_not_found(path)),
+            };
+            let file = inode.as_file_ref()?;
+            let file_locs = fs_dir.get_file_locations(file)?;
+            let status = inode.to_file_status(path)?;
+            let mut offset = 0;
+            let mut block_snapshots = Vec::with_capacity(file.blocks.len());
+            let mut worker_ids = HashSet::new();
+
+            for meta in &file.blocks {
+                let len = meta.len();
+                let replicas = file_locs.get(&meta.id).cloned().unwrap_or_default();
+                for replica in &replicas {
+                    worker_ids.insert(replica.worker_id);
+                }
+                block_snapshots.push((meta.id, len, offset, replicas));
+                offset += len;
+            }
+
+            // Snapshot addresses under the existing fs_dir -> worker_manager lock order.
+            let worker_addresses = {
+                let worker_manager = self.worker_manager.read();
+                worker_ids
+                    .into_iter()
+                    .filter_map(|worker_id| {
+                        worker_manager
+                            .get_known_worker(worker_id)
+                            .map(|worker| (worker_id, worker.address.clone()))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+
+            (status, block_snapshots, worker_addresses)
         };
-        let file = inode.as_file_ref()?;
-        let file_locs = fs_dir.get_file_locations(file)?;
-        let worker_manager = self.worker_manager.read();
-        let mut offset = 0;
-        let mut blocks = Vec::with_capacity(file.blocks.len());
 
-        for meta in &file.blocks {
-            let mut replicas = file_locs
-                .get(&meta.id)
-                .map(|locations| {
-                    locations
-                        .iter()
-                        .map(|location| BlockReplicaDetail {
-                            worker_id: location.worker_id,
-                            storage_type: location.storage_type,
-                            address: worker_manager
-                                .get_worker(location.worker_id)
-                                .map(|worker| worker.address.clone()),
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            replicas.sort_by_key(|replica| replica.worker_id);
+        let blocks = block_snapshots
+            .into_iter()
+            .map(|(block_id, len, offset, locations)| {
+                let mut replicas = locations
+                    .into_iter()
+                    .map(|location| BlockReplicaDetail {
+                        worker_id: location.worker_id,
+                        storage_type: location.storage_type,
+                        address: worker_addresses.get(&location.worker_id).cloned(),
+                    })
+                    .collect::<Vec<_>>();
+                replicas.sort_by_key(|replica| replica.worker_id);
 
-            let len = meta.len();
-            blocks.push(FileBlockDetail {
-                block_id: meta.id,
-                len,
-                offset,
-                replicas,
-            });
-            offset += len;
-        }
+                FileBlockDetail {
+                    block_id,
+                    len,
+                    offset,
+                    replicas,
+                }
+            })
+            .collect();
 
-        Ok(FileBlockDetails {
-            status: inode.to_file_status(path)?,
-            blocks,
-        })
+        Ok(FileBlockDetails { status, blocks })
     }
 
     pub fn cv_metadata_snapshot_page(
@@ -1193,7 +1222,7 @@ impl MasterFilesystem {
                     // allocatable view mirrors the allocation policy. Failed
                     // storage dirs are already excluded from worker.capacity.
                     info.allocatable_capacity += worker.capacity;
-                    info.allocatable_available += worker.available;
+                    info.allocatable_available += worker.allocatable_available().max(0);
                 }
                 WorkerStatus::Blacklist => info.blacklist_workers.push(worker.clone()),
                 WorkerStatus::Decommission => info.decommission_workers.push(worker.clone()),
@@ -1783,13 +1812,29 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
 
-        let choose_workers =
-            self.choose_worker_for_file(inode.as_file_ref()?, client_addr, exclude_workers)?;
+        let file = inode.as_file_ref()?;
+        let block_size = file.block_size as i64;
+        let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
-        let block = fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers)?;
+        let block = match fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers) {
+            Ok((block, assigned)) => {
+                if !assigned {
+                    self.worker_manager
+                        .write()
+                        .unschedule_chosen_workers(&choose_workers, block_size);
+                }
+                block
+            }
+            Err(e) => {
+                self.worker_manager
+                    .write()
+                    .unschedule_chosen_workers(&choose_workers, block_size);
+                return Err(e);
+            }
+        };
 
         Ok(LocatedBlock {
             block,
@@ -2140,5 +2185,86 @@ mod tests {
             "lost worker capacity must not leak into allocatable"
         );
         assert_eq!(info.allocatable_available, 800);
+    }
+
+    #[test]
+    fn worker_info_rest_json_omits_scheduled_fields() {
+        let mut worker = worker_with_status(1, WorkerStatus::Live, 1000, 800);
+        worker.scheduled_bytes = 128;
+        worker.scheduled_since_ms = 99;
+        let json = serde_json::to_string(&worker).unwrap();
+        assert!(!json.contains("scheduled_bytes"));
+        assert!(!json.contains("scheduled_since_ms"));
+    }
+
+    #[test]
+    fn assign_worker_retry_does_not_leak_scheduled_bytes() {
+        let fs = test_fs("assign-worker-retry-unschedule");
+        let capacity = 1 << 30;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/retry.log", true).unwrap();
+        let blocks = fs
+            .resize(
+                "/retry.log",
+                FileAllocOpts::with_alloc(created.block_size, FileAllocMode::DEFAULT),
+            )
+            .unwrap();
+        let located = &blocks.block_locs[0];
+        assert!(located.block.alloc_opts.is_some());
+        assert!(located.locs.is_empty());
+        let block = located.block.clone();
+        let client = ClientAddress::default();
+
+        fs.assign_worker("/retry.log", block.clone(), client.clone(), vec![])
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        // Idempotent retry must not stack a second reservation on top of the
+        // first successful assignment.
+        fs.assign_worker("/retry.log", block.clone(), client.clone(), vec![])
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        // After heartbeat reports the write, leftover reservation is gone.
+        // Another retry still must not leak scheduled_bytes.
+        {
+            let mut wm = fs.worker_manager.write();
+            let worker = wm.worker_map.workers.get_mut(&1).unwrap();
+            let prev = worker.available;
+            worker.available = prev - created.block_size;
+            worker.reclaim_scheduled_from_heartbeat(prev);
+            assert_eq!(worker.scheduled_bytes, 0);
+        }
+
+        fs.assign_worker("/retry.log", block, client, vec![])
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            0
+        );
     }
 }
