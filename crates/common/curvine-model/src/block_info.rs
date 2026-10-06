@@ -165,17 +165,12 @@ pub struct FileBlocks {
     pub block_locs: Vec<LocatedBlock>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BlockReplicaState {
     Live,
     Lost,
+    #[default]
     Unknown,
-}
-
-impl Default for BlockReplicaState {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl BlockReplicaState {
