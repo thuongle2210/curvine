@@ -52,6 +52,13 @@ pub(crate) enum QpairReleaseOutcome {
     PendingDestroy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetiredQpairFinish {
+    Complete,
+    DeferredRetired,
+    PendingDestroy,
+}
+
 pub struct QpairPool {
     pub(crate) inner: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
     pub(crate) pending_destroy: Mutex<HashMap<usize, Vec<*mut spdk_ffi::spdk_nvme_qpair>>>,
@@ -1025,18 +1032,18 @@ impl SpdkEnv {
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
         retired: RetiredQpair,
-    ) -> bool {
+    ) -> RetiredQpairFinish {
         if !retired.requires_free() && self.state() == SpdkEnvState::Initialized {
             match self.qpair_pool.release(ctrlr, qpair) {
                 QpairReleaseOutcome::Cached | QpairReleaseOutcome::Destroyed => {
                     retired.reclaim();
-                    return true;
+                    return RetiredQpairFinish::Complete;
                 }
                 QpairReleaseOutcome::PendingDestroy => {
                     // QpairPool owns retry through pending_destroy. Do not put
-                    // the same qpair back into retired_qpairs.
+                    // the same qpair into deferred_qpairs.
                     retired.reclaim();
-                    return false;
+                    return RetiredQpairFinish::PendingDestroy;
                 }
             }
         }
@@ -1045,12 +1052,24 @@ impl SpdkEnv {
         if rc != 0 {
             error!("failed to free retired SPDK qpair {:p}: rc={}", qpair, rc);
             self.retired_qpairs.put_back(qpair, retired);
-            return false;
+            return RetiredQpairFinish::DeferredRetired;
         }
 
         retired.reclaim();
         self.qpair_pool.release_destroyed(ctrlr);
-        true
+        RetiredQpairFinish::Complete
+    }
+
+    fn defer_qpair(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) {
+        self.deferred_qpairs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(qpair as usize)
+            .or_insert(ctrlr as usize);
     }
 
     /// Resolve qpairs whose unregister acknowledgement timed out. A qpair stays
@@ -1075,12 +1094,11 @@ impl SpdkEnv {
                 continue;
             };
             let ctrlr = ctrlr_key as *mut spdk_ffi::spdk_nvme_ctrlr;
-            if !self.finish_retired_qpair(ctrlr, qpair, retired) {
-                self.deferred_qpairs
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .entry(qpair_key)
-                    .or_insert(ctrlr_key);
+            if matches!(
+                self.finish_retired_qpair(ctrlr, qpair, retired),
+                RetiredQpairFinish::DeferredRetired
+            ) {
+                self.defer_qpair(ctrlr, qpair);
             }
         }
     }
@@ -1100,12 +1118,11 @@ impl SpdkEnv {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
         if let Some(retired) = self.retired_qpairs.take(qpair) {
-            if !self.finish_retired_qpair(ctrlr, qpair, retired) {
-                self.deferred_qpairs
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .entry(qpair as usize)
-                    .or_insert(ctrlr as usize);
+            if matches!(
+                self.finish_retired_qpair(ctrlr, qpair, retired),
+                RetiredQpairFinish::DeferredRetired
+            ) {
+                self.defer_qpair(ctrlr, qpair);
             }
             return;
         }
@@ -1113,33 +1130,23 @@ impl SpdkEnv {
         match self.unregister_qpair_from_poller(qpair) {
             UnregisterResult::Acked => {
                 if let Some(retired) = self.retired_qpairs.take(qpair) {
-                    if self.finish_retired_qpair(ctrlr, qpair, retired) {
-                        return;
+                    if matches!(
+                        self.finish_retired_qpair(ctrlr, qpair, retired),
+                        RetiredQpairFinish::DeferredRetired
+                    ) {
+                        self.defer_qpair(ctrlr, qpair);
                     }
-                    self.deferred_qpairs
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .entry(qpair as usize)
-                        .or_insert(ctrlr as usize);
                 } else {
                     error!(
                         "unregister acked but no retired marker for qpair {:p}",
                         qpair
                     );
                     self.retired_qpairs.mark_must_free(qpair);
-                    self.deferred_qpairs
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .entry(qpair as usize)
-                        .or_insert(ctrlr as usize);
+                    self.defer_qpair(ctrlr, qpair);
                 }
             }
             UnregisterResult::TimedOut | UnregisterResult::Disconnected => {
-                self.deferred_qpairs
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .entry(qpair as usize)
-                    .or_insert(ctrlr as usize);
+                self.defer_qpair(ctrlr, qpair);
             }
         }
         self.resolve_deferred_qpairs();
