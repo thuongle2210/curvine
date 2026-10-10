@@ -1092,9 +1092,8 @@ impl SpdkEnv {
             .len()
     }
 
-    /// Transfer a closing qpair out of a bdev after unregister acknowledgement.
-    /// Timeout behavior remains conservative in this PR; deferred timeout retry is
-    /// introduced by the follow-up deferred-cleanup PR.
+    /// Transfer a closing qpair out of a bdev. On unregister timeout, ownership
+    /// moves to deferred_qpairs and the pointer cannot re-enter the reusable pool.
     pub(crate) fn retire_qpair(
         &self,
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
@@ -1143,6 +1142,20 @@ impl SpdkEnv {
                     .or_insert(ctrlr as usize);
             }
         }
+        self.resolve_deferred_qpairs();
+    }
+
+    #[cfg(test)]
+    fn defer_qpair_for_test(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) {
+        self.deferred_qpairs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(qpair as usize)
+            .or_insert(ctrlr as usize);
         self.resolve_deferred_qpairs();
     }
 
@@ -1640,6 +1653,18 @@ mod test {
         assert_eq!(env.deferred_qpair_count(), 0);
         assert_eq!(cnt(&env.qpair_pool, ctrlr as usize), 1);
         assert_eq!(env.qpair_pool.controller_stats(ctrlr as usize).0, 0);
+    }
+
+    #[test]
+    fn retire_qpair_defers_on_unregister_timeout() {
+        let env = test_env();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+
+        env.defer_qpair_for_test(ctrlr, qpair);
+
+        assert_eq!(env.deferred_qpair_count(), 1);
+        assert!(env.retired_qpairs.take(qpair).is_none());
     }
 
     #[test]
