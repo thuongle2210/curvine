@@ -454,25 +454,21 @@ impl QpairPool {
         }
         self.total_cached.store(failed_count, Ordering::Release);
         spdk_metrics::set_qpair_cached(failed_count);
-        // Warn if there are still active (in-flight) qpairs - these are not freed here,
-        // they are tracked by their SpdkBdev owners and will be released via drop().
-        for state in self
+        let active_count = self
             .ctrl_state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-        {
-            let active = state.active.load(Ordering::Acquire);
-            if active > 0 {
-                warn!(
-                    "QpairPool: drain_all called with {} active (in-flight) qpair(s) remaining",
-                    active
-                );
-                break;
-            }
+            .map(|state| state.active.load(Ordering::Acquire))
+            .sum::<usize>();
+        if active_count > 0 {
+            warn!(
+                "QpairPool: drain_all called with {} active (in-flight) qpair(s) remaining",
+                active_count
+            );
         }
         self.notify.notify_all();
-        failed_count == 0 && failed_pending_count == 0
+        failed_count == 0 && failed_pending_count == 0 && active_count == 0
     }
 
     pub(crate) fn publish_metrics(&self) {
@@ -1530,6 +1526,19 @@ mod test {
         // A repeated drain remains safe and does not create a new shutdown transition.
         p.drain_all();
         assert!(p.shutdown.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drain_all_fails_when_active_reservations_remain() {
+        let p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 1);
+
+        assert_eq!(p.try_reserve(ctrlr as usize), QpairReserveResult::Reserved);
+
+        assert!(!p.drain_all());
+        let (active, _) = p.controller_stats(ctrlr as usize);
+        assert_eq!(active, 1);
     }
 
     #[test]
