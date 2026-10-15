@@ -62,7 +62,7 @@ impl BatchWriterAdapter {
         }
     }
 
-    fn actual_storage_type(&self, block_index: usize) -> StorageType {
+    fn actual_storage_type(&self, block_index: usize) -> Option<StorageType> {
         match self {
             BatchLocal(f) => f.actual_storage_type(block_index),
             BatchRemote(f) => f.actual_storage_type(block_index),
@@ -327,10 +327,10 @@ impl BatchBlockWriter {
             return Err(e);
         }
 
-        Ok(self.to_commit_blocks())
+        self.to_commit_blocks()
     }
 
-    pub fn to_commit_blocks(&self) -> Vec<CommitBlock> {
+    pub fn to_commit_blocks(&self) -> FsResult<Vec<CommitBlock>> {
         let mut locations = self
             .located_blocks
             .iter()
@@ -338,9 +338,20 @@ impl BatchBlockWriter {
             .collect::<Vec<_>>();
         for group in &self.groups {
             for (local_index, entry) in group.entries.iter().enumerate() {
+                let storage_type =
+                    group
+                        .writer
+                        .actual_storage_type(local_index)
+                        .ok_or_else(|| {
+                            FsError::common(format!(
+                                "missing actual storage type for block {} on worker {}",
+                                self.located_blocks[entry.original_index].block.id,
+                                group.writer.worker_address().worker_id
+                            ))
+                        })?;
                 locations[entry.original_index][entry.location_index] = Some(BlockLocation::new(
                     group.writer.worker_address().worker_id,
-                    group.writer.actual_storage_type(local_index),
+                    storage_type,
                 ));
             }
         }
@@ -368,7 +379,7 @@ impl BatchBlockWriter {
             commit_blocks.push(commit_block);
         }
 
-        commit_blocks
+        Ok(commit_blocks)
     }
 }
 

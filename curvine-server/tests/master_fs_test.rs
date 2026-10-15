@@ -3167,9 +3167,11 @@ fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResu
         .expect("blacklisted worker location should be retained");
     assert_eq!(blacklist.state, WorkerStatus::Blacklist);
     assert!(blacklist.address.is_some());
-    assert!(fs
-        .create_locate_block(path, block.block.clone(), std::slice::from_ref(&location))
-        .is_ok());
+    assert!(
+        fs.create_locate_block(path, block.block.clone(), std::slice::from_ref(&location))
+            .is_err(),
+        "read path must refuse a block whose only replica is on a blacklisted worker"
+    );
 
     fs.worker_manager.write().add_dcm(vec![hostname]);
     let dcm_details = fs.get_file_block_details(path)?;
@@ -3180,9 +3182,11 @@ fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResu
         .expect("decommissioned worker location should be retained");
     assert_eq!(decommission.state, WorkerStatus::Decommission);
     assert!(decommission.address.is_some());
-    assert!(fs
-        .create_locate_block(path, block.block.clone(), &[location])
-        .is_ok());
+    assert!(
+        fs.create_locate_block(path, block.block.clone(), &[location])
+            .is_err(),
+        "read path must refuse a block whose only replica is on a decommissioned worker"
+    );
     Ok(())
 }
 

@@ -262,6 +262,7 @@ mod tests {
             "fsck",
             "/data",
             "--detail",
+            "--policy-mismatch",
             "--list-page-size",
             "512",
         ])
@@ -272,6 +273,7 @@ mod tests {
         };
         assert_eq!(command.path, "/data");
         assert!(command.detail);
+        assert!(command.policy_mismatch);
         assert_eq!(command.list_page_size, 512);
     }
 

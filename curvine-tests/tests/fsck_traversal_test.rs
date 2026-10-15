@@ -58,6 +58,7 @@ fn fsck_style_traversal_pages_nested_directories_without_duplicates() -> CommonR
             let command = FsckCommand {
                 path: root.to_string(),
                 detail: true,
+                policy_mismatch: false,
                 list_page_size: 3,
             };
             let output = command.render(fs.fs_client()).await?;
@@ -75,6 +76,7 @@ fn fsck_style_traversal_pages_nested_directories_without_duplicates() -> CommonR
             let summary = FsckCommand {
                 path: root.to_string(),
                 detail: false,
+                policy_mismatch: false,
                 list_page_size: 3,
             }
             .render(fs.fs_client())
@@ -120,6 +122,7 @@ fn fsck_reports_single_file_status_and_skipped_directory_entries() -> CommonResu
         let file_output = FsckCommand {
             path: file.path().to_string(),
             detail: false,
+            policy_mismatch: false,
             list_page_size: 3,
         }
         .render(fs.fs_client())
@@ -130,6 +133,7 @@ fn fsck_reports_single_file_status_and_skipped_directory_entries() -> CommonResu
         let detail_output = FsckCommand {
             path: "/fsck-skips".to_string(),
             detail: true,
+            policy_mismatch: false,
             list_page_size: 3,
         }
         .render(fs.fs_client())
@@ -142,6 +146,7 @@ fn fsck_reports_single_file_status_and_skipped_directory_entries() -> CommonResu
         let summary_output = FsckCommand {
             path: "/fsck-skips".to_string(),
             detail: false,
+            policy_mismatch: false,
             list_page_size: 3,
         }
         .render(fs.fs_client())
@@ -198,6 +203,7 @@ fn fsck_reports_lost_replica_in_two_worker_cluster() -> CommonResult<()> {
         let output = FsckCommand {
             path: "/fsck-multi".to_string(),
             detail: true,
+            policy_mismatch: false,
             list_page_size: 3,
         }
         .render(fs.fs_client())
