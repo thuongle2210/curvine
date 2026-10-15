@@ -69,6 +69,12 @@ impl CacheInvalidationResult {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicationBlockState {
+    pub replicas: u8,
+    pub locations: Vec<BlockLocation>,
+}
+
 impl FsDir {
     pub fn new(
         conf: &ClusterConf,
@@ -846,6 +852,53 @@ impl FsDir {
         Ok(self.store.get_block_locations(block_id)?)
     }
 
+    /// Returns replication state only when the block still belongs to the current file version.
+    pub(crate) fn replication_block_state(
+        &self,
+        block_id: i64,
+    ) -> FsResult<Option<ReplicationBlockState>> {
+        let inode_id = InodeId::get_id(block_id);
+        let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
+            return Ok(None);
+        };
+        if !file.blocks.iter().any(|block| block.id == block_id) {
+            return Ok(None);
+        }
+        Ok(Some(ReplicationBlockState {
+            replicas: file.replicas,
+            locations: self.store.get_block_locations(block_id)?,
+        }))
+    }
+
+    /// Adds a replication result only if the block is still current and still needs a replica.
+    /// The caller holds the filesystem write lock, so validation and insertion are atomic with
+    /// respect to overwrite and deletion.
+    pub(crate) fn add_replication_location_if_needed(
+        &mut self,
+        block_id: i64,
+        location: BlockLocation,
+    ) -> FsResult<bool> {
+        let inode_id = InodeId::get_id(block_id);
+        let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
+            return Ok(false);
+        };
+        if !file.blocks.iter().any(|block| block.id == block_id) {
+            return Ok(false);
+        }
+
+        let locations = self.store.get_block_locations(block_id)?;
+        if locations
+            .iter()
+            .any(|current| current.worker_id == location.worker_id)
+            || locations.len() >= file.replicas as usize
+        {
+            return Ok(false);
+        }
+
+        self.store.add_block_location(block_id, location)?;
+        Ok(true)
+    }
+
     pub fn reopen_file(
         &mut self,
         inp: &InodePath,
@@ -1415,6 +1468,7 @@ impl FsDir {
     ) -> FsResult<ExtendedBlock> {
         let mut inode = try_option!(inp.get_last_inode(), "File {} not exists", inp.path());
         self.assign_worker_inode(inp.path(), &mut inode, block_id, workers)
+            .map(|(block, _assigned)| block)
     }
 
     pub fn assign_worker_inode(
@@ -1423,11 +1477,11 @@ impl FsDir {
         inode: &mut InodePtr,
         block_id: i64,
         workers: &[WorkerAddress],
-    ) -> FsResult<ExtendedBlock> {
+    ) -> FsResult<(ExtendedBlock, bool)> {
         let file = inode.as_file_mut()?;
 
         let block = file.search_block_mut_check(block_id)?;
-        let res = block.assign_worker(workers);
+        let assigned = block.assign_worker(workers);
         let block = ExtendedBlock {
             id: block.id,
             len: block.len as i64,
@@ -1436,13 +1490,13 @@ impl FsDir {
             file_type: file.file_type,
         };
 
-        if res {
+        if assigned {
             self.store.apply_new_block(inode.as_ref(), &[])?;
             self.journal_writer
                 .log_add_block(self, audit_path, inode.as_file_ref()?, vec![])?;
         }
 
-        Ok(block)
+        Ok((block, assigned))
     }
 
     pub fn get_locations(&self, meta: &BlockMeta) -> CommonResult<Vec<BlockLocation>> {

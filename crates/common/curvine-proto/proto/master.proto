@@ -211,10 +211,19 @@ message GetBlockLocationsResponse {
 }
 
 // Diagnostic block placements retain actual storage types and unavailable replicas.
+enum WorkerStatusProto {
+    WORKER_STATUS_UNKNOWN = 0;
+    WORKER_STATUS_LIVE = 1;
+    WORKER_STATUS_BLACKLIST = 2;
+    WORKER_STATUS_DECOMMISSION = 3;
+    WORKER_STATUS_LOST = 4;
+}
+
 message BlockReplicaDetailProto {
     required uint32 worker_id = 1;
     required StorageTypeProto storage_type = 2;
     optional WorkerAddressProto address = 3;
+    optional WorkerStatusProto state = 4 [default = WORKER_STATUS_UNKNOWN];
 }
 
 message FileBlockDetailProto {
@@ -401,24 +410,4 @@ message GetCvMetadataSnapshotPageResponse {
     repeated CvMetadataSnapshotEntryProto entries = 1;
     optional string next_page_token = 2;
     required uint64 epoch = 3;
-}
-
-message CvMetadataDeltaEntryProto {
-    required string path = 1;
-    optional CvMetadataSnapshotEntryProto entry = 2;
-}
-
-message GetCvMetadataDeltaPageRequest {
-    required uint64 from_epoch = 1;
-    optional uint64 target_epoch = 2;
-    optional string page_token = 3;
-    optional uint32 page_size = 4 [default = 10000];
-}
-
-message GetCvMetadataDeltaPageResponse {
-    repeated CvMetadataDeltaEntryProto entries = 1;
-    optional string next_page_token = 2;
-    required uint64 from_epoch = 3;
-    required uint64 to_epoch = 4;
-    required bool full_snapshot_required = 5;
 }

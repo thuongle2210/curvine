@@ -22,19 +22,20 @@ use curvine_model::ProtoUtils;
 use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
     CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
-    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo, WorkerStatus,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
-    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
-    GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+    BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
+    CreateFileRequest, DeleteRequest, GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest,
+    RenameRequest,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_rpc::handler::MessageHandler;
-use curvine_rpc::message::Builder;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::message::ResponseStatus;
+use curvine_rpc::message::{Builder, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
@@ -307,9 +308,7 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::GetJobStatus,
         RpcCode::CancelJob,
         RpcCode::ReportTask,
-        RpcCode::GetFilesystemInfo,
         RpcCode::GetCvMetadataSnapshotPage,
-        RpcCode::GetCvMetadataDeltaPage,
     ] {
         let msg = Builder::new_rpc(code).build();
         assert!(
@@ -324,6 +323,7 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::ListOptions,
         RpcCode::WorkerHeartbeat,
         RpcCode::WorkerBlockReport,
+        RpcCode::GetFilesystemInfo,
     ] {
         let msg = Builder::new_rpc(code).build();
         assert!(handler.is_sync(&msg), "{code:?} must use the sync handler");
@@ -331,6 +331,22 @@ fn control_plane_requests_use_the_async_handler() {
 
     let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
     assert!(handler.is_sync(&mkdir));
+
+    // Pin the actor-runtime routing: only heartbeat and block report must
+    // use actor_rt; GetFilesystemInfo (statfs) must run on the main pool so
+    // that statfs bursts cannot delay heartbeats.
+    let fs_info_msg = Builder::new_rpc(RpcCode::GetFilesystemInfo).build();
+    assert!(
+        handler.get_rt(&fs_info_msg).is_none(),
+        "GetFilesystemInfo must NOT be routed to actor_rt"
+    );
+    for code in [RpcCode::WorkerHeartbeat, RpcCode::WorkerBlockReport] {
+        let msg = Builder::new_rpc(code).build();
+        assert!(
+            handler.get_rt(&msg).is_some(),
+            "{code:?} must be routed to actor_rt"
+        );
+    }
 }
 
 #[test]
@@ -474,6 +490,70 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
     )?;
 
     assert_eq!(result.delete_blocks, vec![block_id]);
+    Ok(())
+}
+
+#[test]
+fn full_block_report_default_limit_to_master() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let count = MasterConf::DEFAULT_BLOCK_REPORT_LIMIT;
+    assert_eq!(MasterConf::default().block_report_limit, count);
+
+    let fs = new_fs(true, "full-block-report-100k");
+    let file = fs.create("/full-block-report-100k.log", false)?;
+    let worker_id = WorkerInfo::default().worker_id();
+
+    let blocks: Vec<_> = (0..count as i64)
+        .map(|seq| {
+            BlockReportInfo::new(
+                InodeId::create_block_id(file.id, seq).expect("block id"),
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                1,
+            )
+        })
+        .collect();
+
+    let req = BlockReportListRequest {
+        cluster_id: "curvine".into(),
+        worker_id,
+        full_report: true,
+        total_len: count as u64,
+        blocks: blocks
+            .iter()
+            .map(|block| BlockReportInfoProto {
+                id: block.id,
+                status: block.status.into(),
+                block_size: block.block_size,
+                storage_type: block.storage_type.into(),
+            })
+            .collect(),
+    };
+    let encoded = req.encode_to_vec();
+    assert!(
+        encoded.len() < MAX_DATE_SIZE as usize,
+        "100k-block report encoded to {} bytes, exceeds MAX_DATE_SIZE {}",
+        encoded.len(),
+        MAX_DATE_SIZE
+    );
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: true,
+            total_len: count as u64,
+            blocks,
+        },
+        None,
+    )?;
+    assert!(result.delete_blocks.is_empty());
+
+    let reported = {
+        let fs_dir = fs.fs_dir.read();
+        fs_dir.get_worker_block_ids(worker_id)?
+    };
+    assert_eq!(reported.len(), count);
     Ok(())
 }
 
@@ -878,6 +958,7 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
         opts,
         OpenFlags::new_create().set_overwrite(true),
     )?;
+    fs.complete_file("/ttl/a/b/file.log", None, 0, vec![], "", false, None)?;
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
@@ -919,6 +1000,15 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
         file_opts,
         OpenFlags::new_create().set_overwrite(true),
     )?;
+    fs.complete_file(
+        "/ttl/expired-dir/file.log",
+        None,
+        0,
+        vec![],
+        "",
+        false,
+        None,
+    )?;
 
     std::thread::sleep(Duration::from_millis(10));
     let dir_mtime_before_child_delete = fs.file_status("/ttl/expired-dir")?.mtime;
@@ -948,6 +1038,125 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
     assert!(
         fs.file_status("/ttl/expired-dir").is_err(),
         "TTL delete should remove the expired directory, not only its child file"
+    );
+
+    Ok(())
+}
+
+// An expired directory must not take unexpired children with it. The
+// directory stays until those children are gone, then the next TTL pass
+// removes the empty directory.
+#[test]
+fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-non-empty-dir");
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let dir = fs.mkdir_with_opts("/ttl/live-children", dir_opts)?;
+
+    let file_opts = CreateFileOptsBuilder::new()
+        .ttl_ms(3_600_000)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    fs.create_with_opts(
+        "/ttl/live-children/file.log",
+        file_opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+
+    std::thread::sleep(Duration::from_millis(10));
+    let dir_mtime = fs.file_status("/ttl/live-children")?.mtime;
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+
+    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    assert!(
+        !dir_processed,
+        "expired directory with a live child must be deferred"
+    );
+    assert_eq!(inode.id(), dir.id);
+    assert!(
+        fs.file_status("/ttl/live-children/file.log").is_ok(),
+        "unexpired child must survive the parent directory TTL"
+    );
+    assert_eq!(
+        fs.file_status("/ttl/live-children")?.mtime,
+        dir_mtime,
+        "deferring a non-empty directory must not refresh its mtime"
+    );
+
+    fs.delete("/ttl/live-children/file.log", false)?;
+    let (dir_processed, _) = executor.execute_by_id(dir.id)?;
+    assert!(
+        dir_processed,
+        "expired directory should be deleted once it is empty"
+    );
+    assert!(
+        fs.file_status("/ttl/live-children").is_err(),
+        "empty expired directory should be removed on the following TTL pass"
+    );
+
+    Ok(())
+}
+
+// Directory TTL Free must still run when children are present. Free drops
+// cached blocks and leaves the child file in place.
+#[test]
+fn ttl_executor_frees_child_blocks_of_expired_directory() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-executor-free-dir");
+
+    let dir_opts = MkdirOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Free)
+        .build();
+    let dir = fs.mkdir_with_opts("/ttl/free-dir", dir_opts)?;
+
+    let client = ClientAddress::default();
+    let file_path = "/ttl/free-dir/file.log";
+    let status = fs.create_with_opts(
+        file_path,
+        CreateFileOptsBuilder::new()
+            .ttl_ms(3_600_000)
+            .ttl_action(TtlAction::Free)
+            .build(),
+        OpenFlags::new_create(),
+    )?;
+    let block = fs.add_block(file_path, None, client.clone(), vec![], vec![], 0, None)?;
+    fs.complete_file(
+        file_path,
+        None,
+        status.block_size,
+        vec![full_commit(&block, status.block_size)],
+        &client.client_name,
+        false,
+        None,
+    )?;
+    fs.set_attr(file_path, SetAttrOptsBuilder::new().ufs_mtime(1).build())?;
+    assert!(
+        !fs.get_block_locations(file_path)?.block_locs.is_empty(),
+        "child file should have blocks before directory TTL free"
+    );
+
+    std::thread::sleep(Duration::from_millis(10));
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let (processed, inode) = executor.execute_by_id(dir.id)?;
+    assert!(
+        processed,
+        "directory TTL Free should run while a child file is still present"
+    );
+    assert_eq!(inode.id(), dir.id);
+    assert!(
+        fs.file_status(file_path).is_ok(),
+        "child file must remain after directory TTL Free"
+    );
+    assert!(
+        fs.get_block_locations(file_path)?.block_locs.is_empty(),
+        "directory TTL Free should drop the child file's cached blocks"
     );
 
     Ok(())
@@ -2870,6 +3079,114 @@ fn file_block_details_preserve_unknown_worker_locations() -> CommonResult<()> {
         .expect("unknown worker location should be retained");
     assert_eq!(unknown.storage_type, StorageType::Ssd);
     assert!(unknown.address.is_none());
+    assert_eq!(unknown.state, WorkerStatus::Unknown);
+    Ok(())
+}
+
+#[test]
+fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-lost-worker");
+    let path = "/lost-worker.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+    let worker_id = block.locs[0].worker_id;
+    let expected_address = block.locs[0].clone();
+    let reported_storage_type = StorageType::Ssd;
+    let location = BlockLocation::new(worker_id, reported_storage_type);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, location.clone())?;
+
+    let live_details = fs.get_file_block_details(path)?;
+    let live_replica = live_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("live worker location should be retained");
+    assert!(live_replica.address.is_some());
+    assert_eq!(live_replica.state, WorkerStatus::Live);
+
+    fs.worker_manager
+        .write()
+        .remove_expired_worker(worker_id)
+        .expect("worker should move to lost map");
+
+    let details = fs.get_file_block_details(path)?;
+    assert_eq!(details.blocks.len(), 1);
+    assert_eq!(details.blocks[0].block_id, block.block.id);
+    assert_eq!(details.blocks[0].replicas.len(), 1);
+    let lost = &details.blocks[0].replicas[0];
+    assert_eq!(lost.worker_id, worker_id);
+    assert_eq!(lost.storage_type, reported_storage_type);
+    let lost_address = lost
+        .address
+        .as_ref()
+        .expect("lost worker address should be resolved from lost worker map");
+    assert_eq!(lost_address.worker_id, expected_address.worker_id);
+    assert_eq!(lost_address.hostname, expected_address.hostname);
+    assert_eq!(lost_address.ip_addr, expected_address.ip_addr);
+    assert_eq!(lost_address.rpc_port, expected_address.rpc_port);
+    assert_eq!(lost_address.web_port, expected_address.web_port);
+    assert_eq!(lost.state, WorkerStatus::Lost);
+
+    // Contrast: create_locate_block must use live-only get_worker; lost replicas must not be returned to readers.
+    assert!(
+        fs.create_locate_block(path, block.block.clone(), &[location])
+            .is_err(),
+        "read path must refuse a block whose only replica is on a lost worker"
+    );
+    Ok(())
+}
+
+#[test]
+fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "file-block-details-non-live-worker");
+    let path = "/registered-non-live-worker.log";
+    let client = ClientAddress::default();
+    fs.create(path, false)?;
+    let block = fs.add_block(path, None, client, vec![], vec![], 0, None)?;
+    let worker_id = block.locs[0].worker_id;
+    let hostname = block.locs[0].hostname.clone();
+    let location = BlockLocation::new(worker_id, StorageType::Disk);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, location.clone())?;
+
+    fs.worker_manager
+        .write()
+        .add_blacklist_worker(worker_id)
+        .expect("worker should be blacklisted");
+    let blacklist_details = fs.get_file_block_details(path)?;
+    let blacklist = blacklist_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("blacklisted worker location should be retained");
+    assert_eq!(blacklist.state, WorkerStatus::Blacklist);
+    assert!(blacklist.address.is_some());
+    assert!(
+        fs.create_locate_block(path, block.block.clone(), std::slice::from_ref(&location))
+            .is_err(),
+        "read path must refuse a block whose only replica is on a blacklisted worker"
+    );
+
+    fs.worker_manager.write().add_dcm(vec![hostname]);
+    let dcm_details = fs.get_file_block_details(path)?;
+    let decommission = dcm_details.blocks[0]
+        .replicas
+        .iter()
+        .find(|replica| replica.worker_id == worker_id)
+        .expect("decommissioned worker location should be retained");
+    assert_eq!(decommission.state, WorkerStatus::Decommission);
+    assert!(decommission.address.is_some());
+    assert!(
+        fs.create_locate_block(path, block.block.clone(), &[location])
+            .is_err(),
+        "read path must refuse a block whose only replica is on a decommissioned worker"
+    );
     Ok(())
 }
 

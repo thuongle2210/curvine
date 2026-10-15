@@ -15,7 +15,7 @@
 use crate::{ClusterConf, DBConf, RaftPeer};
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_rpc::client::ClientConf;
-use curvine_runtime::common::{ByteUnit, Utils};
+use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
 use curvine_runtime::runtime::Runtime;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -48,19 +48,32 @@ pub struct JournalConf {
     pub writer_flush_batch_size: u64,
     pub writer_flush_batch_ms: u64,
 
-    // Snapshot creation interval
+    // Follower time trigger for creating a snapshot. Entry count can also
+    // request one, but `snapshot_min_interval` still allows only one snapshot
+    // inside that window.
     pub snapshot_interval: String,
+
+    // Minimum gap between snapshots on the leader and on followers.
+    // At most one snapshot is created during this interval; on the leader a
+    // failed attempt also opens the window, so retries wait for the next
+    // cycle. Zero disables the limit.
+    pub snapshot_min_interval: DurationUnit,
+
+    /// Whether the leader creates a metadata snapshot.
+    ///
+    /// `None` creates one only when the raft group has a single node.
+    /// Set `true` or `false` to override that. An omitted key in a TOML
+    /// config falls back to `Some(true)`, and `None` is reachable from Rust
+    /// code only.
+    ///
+    /// When the leader does not create snapshots, the leader raft log has no
+    /// compaction path until the follower snapshot reporting path lands, so
+    /// this mode is not production ready yet. A running master logs an error
+    /// every few minutes while it is disabled.
+    pub leader_create_snapshot: Option<bool>,
 
     // How many entries are created after creating snapshots.
     pub snapshot_entries: u64,
-
-    // Internal ring buffer for metadata snapshot delta RPCs.
-    #[serde(
-        skip_serializing,
-        skip_deserializing,
-        default = "JournalConf::default_metadata_delta_log_capacity"
-    )]
-    pub metadata_delta_log_capacity: usize,
 
     pub snapshot_read_chunk_size: usize,
 
@@ -119,15 +132,16 @@ pub struct JournalConf {
 
     #[serde(default = "JournalConf::rocksdb_default")]
     pub rocksdb: DBConf,
+
+    /// Raft ID of one lost HA member to rebuild from healthy peers. Only the
+    /// matching member disables elections and voting until durable Raft and
+    /// application state have caught up.
+    #[serde(default)]
+    pub recover_from_peers: Option<u64>,
 }
 
 impl JournalConf {
     pub const DEFAULT_NODE_ID: u64 = 0;
-    pub const DEFAULT_METADATA_DELTA_LOG_CAPACITY: usize = 100_000;
-
-    fn default_metadata_delta_log_capacity() -> usize {
-        Self::DEFAULT_METADATA_DELTA_LOG_CAPACITY
-    }
 
     // Create a test configuration, which will also randomly select a server port.
     pub fn with_test() -> Self {
@@ -152,12 +166,24 @@ impl JournalConf {
         Arc::new(rt)
     }
 
+    /// Durable marker retained until a lost member has safely rejoined Raft.
+    pub fn recovery_marker(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.journal_dir).join("member-recovery-in-progress")
+    }
+
     pub fn local_addr(&self) -> InetAddr {
         InetAddr::new(self.hostname.clone(), self.rpc_port)
     }
 
     pub fn db_conf(&self) -> DBConf {
         self.rocksdb.clone().set_dir(&self.journal_dir)
+    }
+
+    /// Leader snapshots follow `leader_create_snapshot` when it is set.
+    /// Otherwise a single raft node creates them and a larger group does not.
+    pub fn leader_creates_snapshot(&self) -> bool {
+        self.leader_create_snapshot
+            .unwrap_or(self.journal_addrs.len() == 1)
     }
 
     pub fn new_client_conf(&self) -> ClientConf {
@@ -212,8 +238,9 @@ impl Default for JournalConf {
             writer_flush_batch_size: 1000,
             writer_flush_batch_ms: 10,
             snapshot_interval: "6h".to_string(),
-            snapshot_entries: 1000000,
-            metadata_delta_log_capacity: Self::DEFAULT_METADATA_DELTA_LOG_CAPACITY,
+            snapshot_min_interval: DurationUnit::new(10 * DurationUnit::MINUTE),
+            leader_create_snapshot: Some(true),
+            snapshot_entries: 1_000_000,
             snapshot_read_chunk_size: 1024 * 1024,
 
             conn_retry_max_duration_ms: 0,
@@ -254,6 +281,7 @@ impl Default for JournalConf {
             ufs_copy_timeout: "20m".to_owned(), // 20 minutes
 
             rocksdb,
+            recover_from_peers: None,
         }
     }
 }

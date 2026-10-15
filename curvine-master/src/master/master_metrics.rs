@@ -19,7 +19,7 @@ use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::Master;
 use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
-use curvine_model::MetricValue;
+use curvine_model::{MetricValue, WorkerInfo};
 use curvine_runtime::sync::FastDashMap;
 use log::{debug, info, warn};
 use std::fmt::{Debug, Formatter};
@@ -36,6 +36,7 @@ pub struct MasterMetrics {
     pub(crate) blocks_size_avg: Gauge,
     pub(crate) allocatable_capacity: Gauge,
     pub(crate) allocatable_available: Gauge,
+    pub(crate) scheduled_bytes: GaugeVec,
 
     pub(crate) worker_num: GaugeVec,
 
@@ -55,7 +56,9 @@ pub struct MasterMetrics {
     // for the replication manager
     pub(crate) replication_staging_number: Gauge,
     pub(crate) replication_inflight_number: Gauge,
+    pub(crate) replication_uncertain_number: Gauge,
     pub(crate) replication_failure_count: Counter,
+    pub(crate) replication_timeout_count: Counter,
 
     pub(crate) operation_duration: HistogramVec,
 
@@ -118,6 +121,11 @@ impl MasterMetrics {
                 "allocatable_available",
                 "Available space eligible for new writes (Live workers only)",
             )?,
+            scheduled_bytes: m::new_gauge_vec(
+                "scheduled_bytes",
+                "In-flight allocations not yet reflected in heartbeat available space, labelled by live worker connect address",
+                &["worker_addr"],
+            )?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
@@ -152,16 +160,24 @@ impl MasterMetrics {
             )?,
             replication_inflight_number: m::new_gauge(
                 "replication_inflight_number",
-                "Replication stage number",
+                "Replication jobs awaiting a result",
+            )?,
+            replication_uncertain_number: m::new_gauge(
+                "replication_uncertain_number",
+                "Replication jobs whose remote execution state is uncertain",
             )?,
             replication_failure_count: m::new_counter(
                 "replication_failure_count",
                 "Total failure count",
             )?,
+            replication_timeout_count: m::new_counter(
+                "replication_timeout_count",
+                "Total replication submit and result timeouts",
+            )?,
 
             operation_duration: m::new_histogram_vec_with_buckets(
                 "operation_duration",
-                "Operation duration except WorkerHeartbeat",
+                "Operation duration including WorkerHeartbeat",
                 &["operation"],
                 &buckets,
             )?,
@@ -222,6 +238,16 @@ impl MasterMetrics {
         Ok(wm)
     }
 
+    fn refresh_scheduled_bytes(metric: &GaugeVec, workers: &[WorkerInfo]) {
+        metric.reset();
+        for worker in workers {
+            let worker_addr = worker.address.connect_addr();
+            metric
+                .with_label_values(&[&worker_addr])
+                .set(worker.scheduled_bytes.max(0));
+        }
+    }
+
     pub fn text_output(&self, fs: MasterFilesystem) -> CommonResult<String> {
         let filesystem_info = fs.filesystem_info()?;
         self.capacity.set(filesystem_info.capacity);
@@ -232,6 +258,7 @@ impl MasterMetrics {
             .set(filesystem_info.allocatable_capacity);
         self.allocatable_available
             .set(filesystem_info.allocatable_available);
+        Self::refresh_scheduled_bytes(&self.scheduled_bytes, &filesystem_info.live_workers);
 
         if filesystem_info.block_num > 0 {
             let avg_size = filesystem_info.fs_used / filesystem_info.block_num;
@@ -300,5 +327,72 @@ impl MasterMetrics {
 impl Debug for MasterMetrics {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "MasterMetrics")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_model::WorkerAddress;
+
+    fn live_worker(ip: &str, rpc_port: u32, scheduled_bytes: i64) -> WorkerInfo {
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: rpc_port,
+                hostname: "worker".to_string(),
+                ip_addr: ip.to_string(),
+                rpc_port,
+                web_port: 0,
+            },
+            1,
+        );
+        worker.scheduled_bytes = scheduled_bytes;
+        worker
+    }
+
+    #[test]
+    fn scheduled_bytes_drops_lost_worker_labels() {
+        let metric_name = "test_scheduled_bytes_drops_lost_worker_labels";
+        let metric = m::new_gauge_vec(metric_name, metric_name, &["worker_addr"]).unwrap();
+        let lost = "10.0.0.1:8995";
+
+        MasterMetrics::refresh_scheduled_bytes(&metric, &[live_worker("10.0.0.1", 8995, 128)]);
+        let output = Metrics::text_output().unwrap();
+        assert!(
+            output.contains(&format!("{metric_name}{{worker_addr=\"{lost}\"}} 128")),
+            "{output}"
+        );
+
+        MasterMetrics::refresh_scheduled_bytes(&metric, &[]);
+        let output = Metrics::text_output().unwrap();
+        assert!(
+            !output.contains(&format!("{metric_name}{{worker_addr=\"{lost}\"}}")),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn scheduled_bytes_keeps_same_ip_workers_distinct() {
+        let metric_name = "test_scheduled_bytes_keeps_same_ip_workers_distinct";
+        let metric = m::new_gauge_vec(metric_name, metric_name, &["worker_addr"]).unwrap();
+        let workers = [
+            live_worker("10.0.0.1", 8995, 128),
+            live_worker("10.0.0.1", 8996, 256),
+        ];
+
+        MasterMetrics::refresh_scheduled_bytes(&metric, &workers);
+        let output = Metrics::text_output().unwrap();
+        assert!(
+            output.contains(&format!(
+                "{metric_name}{{worker_addr=\"10.0.0.1:8995\"}} 128"
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "{metric_name}{{worker_addr=\"10.0.0.1:8996\"}} 256"
+            )),
+            "{output}"
+        );
     }
 }

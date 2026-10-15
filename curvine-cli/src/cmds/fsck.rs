@@ -1,8 +1,24 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use clap::Parser;
 use curvine_client_core::file::FsClient;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::Path;
-use curvine_model::{FileBlockDetail, FileBlockDetails, FileStatus, FileType, ListOptions};
+use curvine_model::{
+    FileBlockDetail, FileBlockDetails, FileStatus, FileType, ListOptions, WorkerStatus,
+};
 use curvine_runtime::common::ByteUnit;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
@@ -37,16 +53,22 @@ fn parse_list_page_size(value: &str) -> Result<usize, String> {
     let value = value
         .parse::<usize>()
         .map_err(|_| "must be a positive integer".to_string())?;
-    if !(1..=MAX_LIST_PAGE_SIZE).contains(&value) {
-        return Err(format!("must be between 1 and {MAX_LIST_PAGE_SIZE}"));
-    }
+    validate_list_page_size(value).map_err(|error| error.to_string())?;
     Ok(value)
+}
+
+fn validate_list_page_size(value: usize) -> CommonResult<()> {
+    if !(1..=MAX_LIST_PAGE_SIZE).contains(&value) {
+        return err_box!("--list-page-size must be between 1 and {MAX_LIST_PAGE_SIZE}");
+    }
+    Ok(())
 }
 
 #[derive(Default)]
 struct FsckReport {
     root: String,
     is_dir: bool,
+    retain_files: bool,
     files: Vec<FileScan>,
     storage_placements: BTreeMap<String, usize>,
     worker_placements: BTreeMap<String, usize>,
@@ -74,17 +96,6 @@ impl FileScan {
             .filter(|block| block_mismatches(&self.details.status, block))
             .count()
     }
-
-    fn mismatch_replicas(&self) -> usize {
-        self.details
-            .blocks
-            .iter()
-            .flat_map(|block| &block.replicas)
-            .filter(|replica| {
-                replica.storage_type != self.details.status.storage_policy.storage_type
-            })
-            .count()
-    }
 }
 
 impl FsckReport {
@@ -96,14 +107,14 @@ impl FsckReport {
             let available = block
                 .replicas
                 .iter()
-                .filter(|replica| replica.address.is_some())
+                .filter(|replica| replica_is_available(replica.state))
                 .count();
 
             self.block_count += 1;
             self.expected_replicas += expected;
             self.recorded_replicas += block.replicas.len();
             self.available_replicas += available;
-            self.unavailable_replicas += block.replicas.len() - available;
+            self.unavailable_replicas += block.replicas.len().saturating_sub(available);
             if block_mismatches(&details.status, block) {
                 self.mismatch_blocks += 1;
             }
@@ -114,7 +125,7 @@ impl FsckReport {
                     replica.storage_type != details.status.storage_policy.storage_type
                 })
                 .count();
-            if block.replicas.len() < expected {
+            if available < expected {
                 self.under_replicated_blocks += 1;
             }
 
@@ -123,16 +134,14 @@ impl FsckReport {
                     .storage_placements
                     .entry(replica.storage_type.as_str_name().to_string())
                     .or_default() += 1;
-                let worker = replica
-                    .address
-                    .as_ref()
-                    .map(|address| format!("{}:{}", address.hostname, address.rpc_port))
-                    .unwrap_or_else(|| format!("worker-{} (unavailable)", replica.worker_id));
+                let worker = format_worker(replica.address.as_ref(), replica.worker_id);
                 *self.worker_placements.entry(worker).or_default() += 1;
             }
         }
         self.file_count += 1;
-        self.files.push(FileScan { details });
+        if self.retain_files {
+            self.files.push(FileScan { details });
+        }
     }
 
     fn add_error(&mut self, path: String, error: String) {
@@ -150,33 +159,38 @@ impl FsckReport {
 
 impl FsckCommand {
     pub async fn execute(&self, client: Arc<FsClient>) -> CommonResult<()> {
+        print!("{}", self.render(client).await?);
+        Ok(())
+    }
+
+    pub async fn render(&self, client: Arc<FsClient>) -> CommonResult<String> {
+        validate_list_page_size(self.list_page_size)?;
+        let report = self.build_report(client).await?;
+        Ok(render_report(&report, self.detail, self.policy_mismatch))
+    }
+
+    async fn build_report(&self, client: Arc<FsClient>) -> CommonResult<FsckReport> {
         let path = Path::from_str(&self.path)?;
         let status = client.file_status(&path).await?;
         let mut report = FsckReport {
             root: status.path.clone(),
             is_dir: status.is_dir,
+            retain_files: !status.is_dir || self.detail || self.policy_mismatch,
             ..Default::default()
         };
 
         if status.is_dir {
             self.scan_directory(&client, status, &mut report).await?;
-        } else if !should_inspect_blocks(&status) {
-            report.add_file(FileBlockDetails {
-                status,
-                blocks: Vec::new(),
-            });
         } else {
             self.scan_file(&client, status, &mut report, false).await?;
         }
 
-        report
-            .files
-            .sort_by(|left, right| left.details.status.path.cmp(&right.details.status.path));
-        print!(
-            "{}",
-            render_report(&report, self.detail, self.policy_mismatch)
-        );
-        Ok(())
+        if report.retain_files {
+            report
+                .files
+                .sort_by(|left, right| left.details.status.path.cmp(&right.details.status.path));
+        }
+        Ok(report)
     }
 
     async fn scan_directory(
@@ -206,7 +220,7 @@ impl FsckCommand {
                 for entry in entries {
                     if entry.is_dir {
                         directories.push_back(entry.path);
-                    } else if entry.file_type != FileType::Link {
+                    } else {
                         self.scan_file(client, entry, report, true).await?;
                     }
                 }
@@ -226,7 +240,7 @@ impl FsckCommand {
         report: &mut FsckReport,
         tolerate_error: bool,
     ) -> CommonResult<()> {
-        if status.storage_policy.ufs_only() {
+        if block_inspection_skip_reason(&status).is_some() {
             report.add_file(FileBlockDetails {
                 status,
                 blocks: Vec::new(),
@@ -244,8 +258,14 @@ impl FsckCommand {
     }
 }
 
-fn should_inspect_blocks(status: &FileStatus) -> bool {
-    !status.is_dir && status.file_type != FileType::Link && !status.storage_policy.ufs_only()
+fn block_inspection_skip_reason(status: &FileStatus) -> Option<&'static str> {
+    if status.file_type != FileType::File {
+        Some("file type is not a regular file")
+    } else if status.storage_policy.ufs_only() {
+        Some("file is UFS-only")
+    } else {
+        None
+    }
 }
 
 fn block_mismatches(status: &FileStatus, block: &FileBlockDetail) -> bool {
@@ -257,11 +277,14 @@ fn block_mismatches(status: &FileStatus, block: &FileBlockDetail) -> bool {
 
 fn render_report(report: &FsckReport, detail: bool, policy_mismatch: bool) -> String {
     if !report.is_dir {
-        return report
-            .files
-            .first()
-            .map(|file| render_file(file, policy_mismatch, true))
-            .unwrap_or_default();
+        let Some(file) = report.files.first() else {
+            return String::new();
+        };
+        let mut output = render_file(file, policy_mismatch);
+        if block_inspection_skip_reason(&file.details.status).is_none() {
+            render_findings(&mut output, report);
+        }
+        return output;
     }
 
     let mut output = String::new();
@@ -277,7 +300,7 @@ fn render_report(report: &FsckReport, detail: bool, policy_mismatch: bool) -> St
         writeln!(output).unwrap();
         for file in &report.files {
             if !policy_mismatch || file.mismatch_blocks() > 0 {
-                output.push_str(&render_file(file, policy_mismatch, false));
+                output.push_str(&render_file(file, policy_mismatch));
                 writeln!(output).unwrap();
             }
         }
@@ -309,6 +332,11 @@ fn render_report(report: &FsckReport, detail: bool, policy_mismatch: bool) -> St
         report.unavailable_replicas
     )
     .unwrap();
+    render_findings(&mut output, report);
+    output
+}
+
+fn render_findings(output: &mut String, report: &FsckReport) {
     writeln!(output, "\n--- Findings ---").unwrap();
     writeln!(
         output,
@@ -349,12 +377,15 @@ fn render_report(report: &FsckReport, detail: bool, policy_mismatch: bool) -> St
         }
     )
     .unwrap();
-    output
 }
 
-fn render_file(file: &FileScan, policy_mismatch: bool, include_status: bool) -> String {
-    let mut output = String::new();
+fn render_file(file: &FileScan, policy_mismatch: bool) -> String {
     let details = &file.details;
+    if let Some(reason) = block_inspection_skip_reason(&details.status) {
+        return render_skipped_file(&details.status, reason);
+    }
+
+    let mut output = String::new();
     let status = &details.status;
     writeln!(output, "File: {}", status.path).unwrap();
     writeln!(
@@ -383,11 +414,14 @@ fn render_file(file: &FileScan, policy_mismatch: bool, include_status: bool) -> 
             writeln!(output, "  no replicas").unwrap();
         }
         for replica in &block.replicas {
-            let worker = replica
-                .address
-                .as_ref()
-                .map(|address| format!("{}:{}", address.hostname, address.rpc_port))
-                .unwrap_or_else(|| format!("worker-{} (unavailable)", replica.worker_id));
+            let worker = format_worker(replica.address.as_ref(), replica.worker_id);
+            let availability = match replica.state {
+                WorkerStatus::Live => "live",
+                WorkerStatus::Blacklist => "blacklist",
+                WorkerStatus::Decommission => "decommission",
+                WorkerStatus::Lost => "lost",
+                WorkerStatus::Unknown => "unknown",
+            };
             let mismatch = if replica.storage_type != status.storage_policy.storage_type {
                 " [MISMATCH]"
             } else {
@@ -395,47 +429,29 @@ fn render_file(file: &FileScan, policy_mismatch: bool, include_status: bool) -> 
             };
             writeln!(
                 output,
-                "  {:<28} {}{}",
+                "  {:<28} {:<12} {}{}",
                 worker,
+                availability,
                 replica.storage_type.as_str_name(),
                 mismatch
             )
             .unwrap();
         }
     }
+    output
+}
 
-    if include_status {
-        let mismatch_blocks = file.mismatch_blocks();
-        let mismatch_replicas = file.mismatch_replicas();
-        let warning = mismatch_blocks > 0
-            || details.blocks.iter().any(|block| {
-                block.replicas.len() < status.replicas.max(0) as usize
-                    || block
-                        .replicas
-                        .iter()
-                        .any(|replica| replica.address.is_none())
-            });
-        writeln!(output, "\n--- Findings ---").unwrap();
-        writeln!(output, "  Policy mismatch blocks: {mismatch_blocks}").unwrap();
-        writeln!(
-            output,
-            "  Mismatched replica placements: {mismatch_replicas}"
-        )
-        .unwrap();
-        if mismatch_blocks > 0 {
-            writeln!(
-                output,
-                "  Placement mismatches may reflect storage fallback; they do not indicate data corruption."
-            )
-            .unwrap();
-        }
-        writeln!(
-            output,
-            "\nStatus: {}",
-            if warning { "WARNING" } else { "OK" }
-        )
-        .unwrap();
-    }
+fn render_skipped_file(status: &FileStatus, reason: &str) -> String {
+    let mut output = String::new();
+    writeln!(output, "File: {}", status.path).unwrap();
+    writeln!(
+        output,
+        "Size: {} | Blocks: 0 | Expected replicas: {}",
+        ByteUnit::byte_to_string(status.len.max(0) as u64),
+        status.replicas.max(0)
+    )
+    .unwrap();
+    writeln!(output, "Block inspection skipped: {reason}").unwrap();
     output
 }
 
@@ -450,6 +466,16 @@ fn render_distribution(output: &mut String, title: &str, values: &BTreeMap<Strin
         let percent = (*count as f64 / total as f64) * 100.0;
         writeln!(output, "  {name}: {count} ({percent:.1}%)").unwrap();
     }
+}
+
+fn format_worker(address: Option<&curvine_model::WorkerAddress>, worker_id: u32) -> String {
+    address
+        .map(|address| format!("{}:{}", address.hostname, address.rpc_port))
+        .unwrap_or_else(|| format!("worker-{worker_id}"))
+}
+
+fn replica_is_available(status: WorkerStatus) -> bool {
+    matches!(status, WorkerStatus::Live)
 }
 
 #[cfg(test)]
@@ -469,7 +495,10 @@ mod tests {
         }
     }
 
-    fn details(replicas: i32, addresses: Vec<Option<WorkerAddress>>) -> FileBlockDetails {
+    fn details(
+        replicas: i32,
+        replicas_info: Vec<(Option<WorkerAddress>, WorkerStatus)>,
+    ) -> FileBlockDetails {
         FileBlockDetails {
             status: FileStatus {
                 path: "/data/file".to_string(),
@@ -481,13 +510,14 @@ mod tests {
                 block_id: 7,
                 len: 100,
                 offset: 0,
-                replicas: addresses
+                replicas: replicas_info
                     .into_iter()
                     .enumerate()
-                    .map(|(index, address)| BlockReplicaDetail {
+                    .map(|(index, (address, state))| BlockReplicaDetail {
                         worker_id: index as u32 + 1,
                         storage_type: Default::default(),
                         address,
+                        state,
                     })
                     .collect(),
             }],
@@ -498,11 +528,13 @@ mod tests {
         worker_id: u32,
         storage_type: StorageType,
         address: Option<WorkerAddress>,
+        state: WorkerStatus,
     ) -> BlockReplicaDetail {
         BlockReplicaDetail {
             worker_id,
             storage_type,
             address,
+            state,
         }
     }
 
@@ -516,9 +548,26 @@ mod tests {
     }
 
     #[test]
+    fn list_page_size_validation_protects_direct_callers() {
+        assert!(validate_list_page_size(1).is_ok());
+        assert!(validate_list_page_size(MAX_LIST_PAGE_SIZE).is_ok());
+        assert!(validate_list_page_size(0).is_err());
+        assert!(validate_list_page_size(MAX_LIST_PAGE_SIZE + 1).is_err());
+    }
+
+    #[test]
     fn healthy_and_empty_files_have_no_warnings() {
-        let mut report = FsckReport::default();
-        report.add_file(details(2, vec![Some(address(1)), Some(address(2))]));
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(
+            2,
+            vec![
+                (Some(address(1)), WorkerStatus::Live),
+                (Some(address(2)), WorkerStatus::Live),
+            ],
+        ));
         assert_eq!(report.expected_replicas, 2);
         assert_eq!(report.recorded_replicas, 2);
         assert_eq!(report.available_replicas, 2);
@@ -535,8 +584,17 @@ mod tests {
 
     #[test]
     fn missing_and_unavailable_replicas_are_accounted_separately() {
-        let mut report = FsckReport::default();
-        report.add_file(details(3, vec![Some(address(1)), None]));
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(
+            3,
+            vec![
+                (Some(address(1)), WorkerStatus::Live),
+                (None, WorkerStatus::Unknown),
+            ],
+        ));
 
         assert_eq!(report.expected_replicas, 3);
         assert_eq!(report.recorded_replicas, 2);
@@ -548,15 +606,49 @@ mod tests {
 
     #[test]
     fn zero_recorded_replicas_are_under_replicated() {
-        let mut report = FsckReport::default();
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
         report.add_file(details(1, Vec::new()));
         assert_eq!(report.recorded_replicas, 0);
         assert_eq!(report.under_replicated_blocks, 1);
     }
 
     #[test]
+    fn directory_summary_does_not_retain_file_details() {
+        let mut report = FsckReport {
+            is_dir: true,
+            retain_files: false,
+            ..Default::default()
+        };
+
+        report.add_file(details(1, vec![(Some(address(1)), WorkerStatus::Live)]));
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.block_count, 1);
+        assert_eq!(report.available_replicas, 1);
+        assert!(report.files.is_empty());
+    }
+
+    #[test]
+    fn detail_reports_retain_file_details_for_rendering() {
+        let mut report = FsckReport {
+            is_dir: true,
+            retain_files: true,
+            ..Default::default()
+        };
+
+        report.add_file(details(1, vec![(Some(address(1)), WorkerStatus::Live)]));
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].details.status.path, "/data/file");
+    }
+
+    #[test]
     fn add_file_sorts_blocks_and_replicas() {
-        let mut unordered = details(2, vec![Some(address(1))]);
+        let mut unordered = details(2, vec![(Some(address(1)), WorkerStatus::Live)]);
         unordered.blocks = vec![
             FileBlockDetail {
                 block_id: 8,
@@ -569,20 +661,15 @@ mod tests {
                 len: 100,
                 offset: 0,
                 replicas: vec![
-                    BlockReplicaDetail {
-                        worker_id: 3,
-                        storage_type: Default::default(),
-                        address: None,
-                    },
-                    BlockReplicaDetail {
-                        worker_id: 1,
-                        storage_type: Default::default(),
-                        address: None,
-                    },
+                    replica(3, StorageType::Disk, None, WorkerStatus::Unknown),
+                    replica(1, StorageType::Disk, None, WorkerStatus::Unknown),
                 ],
             },
         ];
-        let mut report = FsckReport::default();
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
         report.add_file(unordered);
 
         assert_eq!(report.files[0].details.blocks[0].block_id, 7);
@@ -608,19 +695,90 @@ mod tests {
     }
 
     #[test]
-    fn file_report_shows_requested_and_actual_storage() {
-        let mut details = details(2, vec![Some(address(1)), None]);
+    fn file_report_shows_requested_actual_storage_and_health() {
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        let mut details = details(
+            2,
+            vec![
+                (Some(address(1)), WorkerStatus::Live),
+                (Some(address(2)), WorkerStatus::Lost),
+            ],
+        );
         details.status.storage_policy.storage_type = StorageType::Mem;
         details.blocks[0].replicas[0].storage_type = StorageType::Mem;
         details.blocks[0].replicas[1].storage_type = StorageType::Disk;
-        let output = render_file(&FileScan { details }, false, true);
+        report.add_file(details);
+
+        let output = render_report(&report, false, false);
         assert!(output.contains("worker-1:50010"));
+        assert!(output.contains("live"));
+        assert!(output.contains("worker-2:50010"));
+        assert!(output.contains("lost"));
         assert!(output.contains("Policy: MEM"));
-        assert!(output.contains("worker-2 (unavailable)"));
         assert!(output.contains("DISK [MISMATCH]"));
         assert!(output.contains("Policy mismatch blocks: 1"));
         assert!(output.contains("Mismatched replica placements: 1"));
         assert!(output.contains("do not indicate data corruption"));
+        assert!(output.contains("Status: WARNING"));
+    }
+
+    #[test]
+    fn healthy_file_report_shows_ok_status() {
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(
+            2,
+            vec![
+                (Some(address(1)), WorkerStatus::Live),
+                (Some(address(2)), WorkerStatus::Live),
+            ],
+        ));
+
+        let output = render_report(&report, false, false);
+
+        assert!(output.contains("Status: OK"));
+    }
+
+    #[test]
+    fn addressed_but_unavailable_replica_is_not_counted_available() {
+        let mut report = FsckReport {
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(1, vec![(Some(address(1)), WorkerStatus::Lost)]));
+
+        assert_eq!(report.recorded_replicas, 1);
+        assert_eq!(report.available_replicas, 0);
+        assert_eq!(report.unavailable_replicas, 1);
+        assert_eq!(report.under_replicated_blocks, 1);
+        assert!(report.has_warnings());
+
+        let output = render_file(&report.files[0], false);
+        assert!(output.contains("worker-1:50010"));
+        assert!(output.contains("lost"));
+    }
+
+    #[test]
+    fn summary_reports_lost_replica_as_unavailable() {
+        let mut report = FsckReport {
+            root: "/data".to_string(),
+            is_dir: true,
+            retain_files: true,
+            ..Default::default()
+        };
+        report.add_file(details(1, vec![(Some(address(1)), WorkerStatus::Lost)]));
+
+        let output = render_report(&report, true, false);
+
+        assert!(output.contains("Available replicas: 0"));
+        assert!(output.contains("Unavailable replicas: 1"));
+        assert!(output.contains("Under-replicated blocks: 1"));
+        assert!(output.contains("lost"));
         assert!(output.contains("Status: WARNING"));
     }
 
@@ -642,9 +800,9 @@ mod tests {
         let mut mixed = details(3, Vec::new());
         mixed.status.storage_policy.storage_type = StorageType::Mem;
         mixed.blocks[0].replicas = vec![
-            replica(1, StorageType::Mem, Some(address(1))),
-            replica(2, StorageType::Disk, Some(address(2))),
-            replica(3, StorageType::Ssd, Some(address(3))),
+            replica(1, StorageType::Mem, Some(address(1)), WorkerStatus::Live),
+            replica(2, StorageType::Disk, Some(address(2)), WorkerStatus::Live),
+            replica(3, StorageType::Ssd, Some(address(3)), WorkerStatus::Live),
         ];
         let mut report = FsckReport::default();
         report.add_file(mixed);
@@ -668,10 +826,15 @@ mod tests {
         let mut mixed = details(4, Vec::new());
         mixed.status.storage_policy.storage_type = StorageType::Mem;
         mixed.blocks[0].replicas = vec![
-            replica(1, StorageType::Mem, Some(address(1))),
-            replica(2, StorageType::SpdkDisk, Some(address(2))),
-            replica(3, StorageType::Disk, Some(address(3))),
-            replica(4, StorageType::Ssd, None),
+            replica(1, StorageType::Mem, Some(address(1)), WorkerStatus::Live),
+            replica(
+                2,
+                StorageType::SpdkDisk,
+                Some(address(2)),
+                WorkerStatus::Live,
+            ),
+            replica(3, StorageType::Disk, Some(address(3)), WorkerStatus::Live),
+            replica(4, StorageType::Ssd, None, WorkerStatus::Unknown),
         ];
         let mut report = FsckReport {
             root: "/data".to_string(),
@@ -685,10 +848,7 @@ mod tests {
             assert!(output.contains(&format!("{storage_type}: 1 (25.0%)")));
         }
         assert_eq!(report.storage_placements.get("SSD"), Some(&1));
-        assert_eq!(
-            report.worker_placements.get("worker-4 (unavailable)"),
-            Some(&1)
-        );
+        assert_eq!(report.worker_placements.get("worker-4"), Some(&1));
     }
 
     #[test]
@@ -696,10 +856,10 @@ mod tests {
         let mut mixed = details(2, Vec::new());
         mixed.status.storage_policy.storage_type = StorageType::Mem;
         mixed.blocks[0].replicas = vec![
-            replica(1, StorageType::Mem, Some(address(1))),
-            replica(2, StorageType::Disk, Some(address(2))),
+            replica(1, StorageType::Mem, Some(address(1)), WorkerStatus::Live),
+            replica(2, StorageType::Disk, Some(address(2)), WorkerStatus::Live),
         ];
-        let output = render_file(&FileScan { details: mixed }, false, false);
+        let output = render_file(&FileScan { details: mixed }, false);
         let matching = output
             .lines()
             .find(|line| line.contains("worker-1"))
@@ -715,12 +875,12 @@ mod tests {
 
     #[test]
     fn policy_mismatch_filter_hides_matching_blocks_and_files() {
-        let mut matching = details(1, vec![Some(address(1))]);
+        let mut matching = details(1, vec![(Some(address(1)), WorkerStatus::Live)]);
         matching.status.path = "/data/matching".to_string();
         matching.status.storage_policy.storage_type = StorageType::Mem;
         matching.blocks[0].replicas[0].storage_type = StorageType::Mem;
 
-        let mut mixed = details(1, vec![Some(address(2))]);
+        let mut mixed = details(1, vec![(Some(address(2)), WorkerStatus::Live)]);
         mixed.status.path = "/data/mixed".to_string();
         mixed.status.storage_policy.storage_type = StorageType::Mem;
         mixed.blocks[0].replicas[0].storage_type = StorageType::Disk;
@@ -728,12 +888,18 @@ mod tests {
             block_id: 8,
             len: 100,
             offset: 100,
-            replicas: vec![replica(2, StorageType::Mem, Some(address(2)))],
+            replicas: vec![replica(
+                2,
+                StorageType::Mem,
+                Some(address(2)),
+                WorkerStatus::Live,
+            )],
         });
 
         let mut report = FsckReport {
             root: "/data".to_string(),
             is_dir: true,
+            retain_files: true,
             ..Default::default()
         };
         report.add_file(matching);
@@ -747,18 +913,72 @@ mod tests {
     }
 
     #[test]
-    fn links_and_ufs_only_files_skip_block_inspection() {
+    fn only_regular_non_ufs_files_are_block_inspected() {
         let mut status = FileStatus::default();
-        assert!(should_inspect_blocks(&status));
+        assert!(block_inspection_skip_reason(&status).is_none());
 
-        status.file_type = FileType::Link;
-        assert!(!should_inspect_blocks(&status));
+        status.storage_policy = StoragePolicy {
+            state: StorageState::Both,
+            ..Default::default()
+        };
+        assert!(block_inspection_skip_reason(&status).is_none());
+
+        for file_type in [
+            FileType::Dir,
+            FileType::Link,
+            FileType::Stream,
+            FileType::Agg,
+            FileType::Object,
+            FileType::Fifo,
+            FileType::Char,
+            FileType::Block,
+            FileType::Socket,
+        ] {
+            status.file_type = file_type;
+            assert!(
+                block_inspection_skip_reason(&status).is_some(),
+                "inspected {file_type:?}"
+            );
+        }
 
         status.file_type = FileType::File;
         status.storage_policy = StoragePolicy {
             state: StorageState::Ufs,
             ..Default::default()
         };
-        assert!(!should_inspect_blocks(&status));
+        assert!(block_inspection_skip_reason(&status).is_some());
+    }
+
+    #[test]
+    fn ufs_only_file_reports_block_inspection_skipped() {
+        let status = FileStatus {
+            path: "/ufs-only".to_string(),
+            len: 100,
+            replicas: 1,
+            storage_policy: StoragePolicy {
+                state: StorageState::Ufs,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let output = render_skipped_file(&status, "file is UFS-only");
+
+        assert!(output.contains("Block inspection skipped: file is UFS-only"));
+        assert!(!output.contains("Status: OK"));
+    }
+
+    #[test]
+    fn non_regular_file_reports_block_inspection_skipped() {
+        let status = FileStatus {
+            path: "/link".to_string(),
+            file_type: FileType::Link,
+            ..Default::default()
+        };
+
+        let output = render_skipped_file(&status, "file type is not a regular file");
+
+        assert!(output.contains("Block inspection skipped: file type is not a regular file"));
+        assert!(!output.contains("Status: OK"));
     }
 }
