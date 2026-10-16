@@ -14,8 +14,8 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::{InodePath, InodeView};
-use curvine_core_error::err_box;
-use curvine_error::FsResult;
+use curvine_core_error::err_ext;
+use curvine_error::{FsError, FsResult};
 use curvine_model::TtlAction;
 use log::debug;
 
@@ -56,6 +56,10 @@ impl InodeTtlExecutor {
         Ok(inode)
     }
 
+    pub fn is_active(&self) -> bool {
+        self.filesystem.master_monitor.is_active()
+    }
+
     fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
         let fs_dir = self.filesystem.fs_dir();
         let fs_dir_guard = fs_dir.read();
@@ -67,7 +71,7 @@ impl InodeTtlExecutor {
         let inode = if let Some(inode) = self.get_inode_from_store(inode_id)? {
             inode
         } else {
-            return err_box!("Inode {} not found", inode_id);
+            return err_ext!(FsError::file_not_found(format!("inode_id={}", inode_id)));
         };
 
         if !inode.is_expired()? {
