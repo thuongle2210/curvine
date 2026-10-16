@@ -137,6 +137,7 @@ impl JournalLoader {
             has_apply_worker: !testing,
         };
 
+        loader.refresh_metrics()?;
         if !testing {
             let loader1 = loader.clone();
             rt.spawn(async move {
@@ -189,16 +190,24 @@ impl JournalLoader {
             state.applied = applied;
         }
 
+        self.refresh_fsm_metrics(&state);
+        drop(state);
+        self.hard_state_changed(&self.log_store.hard_state());
+        Ok(())
+    }
+
+    fn refresh_fsm_metrics(&self, state: &FsmState) {
         self.metrics.journal_applied.set(state.applied.index as i64);
         self.metrics
             .journal_ufs_applied
             .set(state.ufs_applied.index as i64);
-        drop(state);
+    }
 
-        let state = self.log_store.hard_state();
-        self.metrics.journal_committed.set(state.commit as i64);
-        self.metrics.journal_term.set(state.term as i64);
-
+    /// Refresh gauges only: never advance metadata/UFS replay watermarks just
+    /// to make monitoring appear caught up.
+    fn refresh_metrics(&self) -> CommonResult<()> {
+        self.refresh_fsm_metrics(&*self.fsm_state()?);
+        self.hard_state_changed(&self.log_store.hard_state());
         Ok(())
     }
 
@@ -207,6 +216,22 @@ impl JournalLoader {
             term: entry.term,
             index: entry.index,
             ..Default::default()
+        }
+    }
+
+    async fn replay_entry(&self, is_leader: bool, entry: &JournalEntry) -> CommonResult<()> {
+        {
+            let fs_dir = self.fs_dir.read();
+            fs_dir.update_op_id(entry.op_id());
+            if let Some(inode_id) = entry.inode_id() {
+                fs_dir.update_last_inode_id(inode_id)?;
+            }
+        }
+
+        if is_leader {
+            self.ufs_loader.apply_entry(entry).await
+        } else {
+            self.apply_entry(entry.clone())
         }
     }
 
@@ -264,34 +289,15 @@ impl JournalLoader {
                 _ => has_ufs_affecting = true,
             }
 
-            {
-                let fs_dir = self.fs_dir.read();
-                if !is_leader {
-                    if let Some(inode_id) = op_entry.allocated_inode_id() {
-                        let last_inode_id = fs_dir.last_inode_id();
-                        if inode_id <= last_inode_id {
-                            return err_box!(
-                                "refusing duplicate inode allocation during follower replay: inode_id={}, last_inode_id={}, journal={:?}",
-                                inode_id,
-                                last_inode_id,
-                                op_entry
-                            );
-                        }
-                    }
+            if let Err(e) = self.replay_entry(is_leader, &op_entry).await {
+                if self.ignore_reply_error {
+                    error!(
+                        "skip failed journal replay, entry index={}, term={}, journal={:?}, error={}",
+                        entry.index, entry.term, op_entry, e
+                    );
+                    continue;
                 }
-                fs_dir.update_op_id(op_entry.op_id());
-                if let Some(inode_id) = op_entry.inode_id() {
-                    fs_dir.update_last_inode_id(inode_id)?;
-                }
-            }
 
-            let res = if is_leader {
-                self.ufs_loader.apply_entry(&op_entry).await
-            } else {
-                self.apply_entry(op_entry.clone())
-            };
-
-            if let Err(e) = res {
                 if is_leader && skip_ufs_error {
                     error!(
                         "skip failed UFS replay after retries, entry index={}, term={}, journal={:?}, error={}",
@@ -307,14 +313,17 @@ impl JournalLoader {
         self.set_applied(is_leader, applied, has_ufs_affecting)?;
 
         if let Some(e) = snapshot {
+            let spent = TimeSpent::new();
             let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
 
             self.log_store.create_snapshot(snap_data.clone())?;
             self.log_store.compact(snap_data.fsm_state.compact())?;
 
             info!(
-                "create leader snapshot, dir={}, fsm_state={:?}",
-                e.dir, snap_data.fsm_state
+                "create leader snapshot, dir={}, cost={}ms, fsm_state={:?}",
+                e.dir,
+                spent.used_ms(),
+                snap_data.fsm_state
             );
         }
 
@@ -471,10 +480,7 @@ impl JournalLoader {
                     }
 
                     Err(error) => {
-                        if self.ignore_reply_error {
-                            error!("apply entry failed(skip): {}", error);
-                            Self::complete_entry_ack(msg, Ok(()));
-                        } else if is_leader {
+                        if is_leader {
                             retry_num += 1;
 
                             if retry_num >= self.max_retry_num {
@@ -522,10 +528,12 @@ impl JournalLoader {
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
         let fsm_state = self.fsm_state_snapshot()?;
-        let fs_dir = self.fs_dir.read();
         let dir = match dir_option {
             Some(dir) => dir,
-            None => fs_dir.create_checkpoint(fsm_state.applied.index)?,
+            None => {
+                let fs_dir = self.fs_dir.read();
+                fs_dir.create_checkpoint(fsm_state.applied.index)?
+            }
         };
 
         let data = RaftUtils::create_file_snapshot(&dir, self.node_id, fsm_state)?;
@@ -602,6 +610,7 @@ impl JournalLoader {
         let mount_ms = spend.used_ms();
 
         *self.fsm_state()? = snapshot.fsm_state;
+        self.refresh_metrics()?;
 
         info!(
             "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",
@@ -951,16 +960,7 @@ impl JournalLoader {
     }
 
     async fn apply_direct(&self, msg: ApplyMsg) -> RaftResult<()> {
-        let result = if let Err(e) = self.apply_msg(false, &msg, false).await {
-            if self.ignore_reply_error {
-                error!("apply entry failed: {}", e);
-                Ok(())
-            } else {
-                Err(e.into())
-            }
-        } else {
-            Ok(())
-        };
+        let result = self.apply_msg(false, &msg, false).await.map_err(Into::into);
 
         if matches!(&msg, ApplyMsg::EntryWithAck(_)) {
             Self::complete_entry_ack(msg, result);
@@ -998,6 +998,11 @@ impl AppStorage for JournalLoader {
                 std::process::abort();
             }
         }
+    }
+
+    fn hard_state_changed(&self, state: &raft::eraftpb::HardState) {
+        self.metrics.journal_committed.set(state.commit as i64);
+        self.metrics.journal_term.set(state.term as i64);
     }
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
