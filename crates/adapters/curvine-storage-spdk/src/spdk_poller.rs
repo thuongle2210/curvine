@@ -1023,7 +1023,7 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
 #[cfg(test)]
 pub(crate) fn retired_qpair_with_stale_callback_for_test() -> (RetiredQpair, *mut c_void) {
     let completion = IoCompletion::new();
-    let inflight = Arc::new(AtomicUsize::new(0));
+    let inflight = Arc::new(AtomicUsize::new(1));
     assert!(completion.complete(-libc::ESHUTDOWN));
 
     let mut qpair_state = Box::new(QpairState {
@@ -1035,6 +1035,7 @@ pub(crate) fn retired_qpair_with_stale_callback_for_test() -> (RetiredQpair, *mu
         completion,
         async_ctx: unsafe { std::mem::zeroed() },
         bdev_inflight: inflight,
+        dma_ref_released: AtomicBool::new(false),
         qpair_state: &mut *qpair_state,
         pending_idx: 0,
     }));
@@ -1094,7 +1095,7 @@ mod test {
     #[test]
     fn retired_qpair_free_failure_keeps_stale_callback_ctx_valid_until_reclaim() {
         let completion = IoCompletion::new();
-        let inflight = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(1));
 
         // Force the callback into the late path: completion was already signaled
         // when the qpair was retired, so a later SPDK callback must not free ctx.
@@ -1111,6 +1112,7 @@ mod test {
             completion: completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
             bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
             qpair_state: qpair_state_ptr,
             pending_idx: 0,
         }));
@@ -2017,8 +2019,9 @@ mod test {
         let entry = retired.take(qpair).expect("shutdown record must exist");
         assert!(entry.requires_free());
         assert_eq!(completion.wait(0), -libc::EIO);
-        assert_eq!(inflight.load(Ordering::Acquire), 0);
+        assert_eq!(inflight.load(Ordering::Acquire), 1);
         entry.reclaim();
+        assert_eq!(inflight.load(Ordering::Acquire), 0);
     }
 
     #[test]
