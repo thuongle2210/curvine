@@ -1,5 +1,6 @@
 #![cfg(feature = "spdk")]
 
+use crate::spdk_bdev::DmaBuf;
 use crate::spdk_ffi;
 use crate::spdk_metrics;
 #[cfg(test)]
@@ -703,6 +704,14 @@ struct ControllerEntry {
     state: AtomicU8,
 }
 
+struct RetiredDma {
+    bdev_name: String,
+    _read_buf: DmaBuf,
+    _write_buf: DmaBuf,
+    inflight: Arc<AtomicUsize>,
+    retired_at: Instant,
+}
+
 impl ControllerEntry {
     fn state(&self) -> ControllerState {
         match self.state.load(Ordering::Acquire) {
@@ -750,6 +759,7 @@ pub struct SpdkEnv {
     poller: Mutex<Option<SpdkPoller>>,
     retired_qpairs: Arc<RetiredQpairRegistry>,
     deferred_qpairs: Mutex<HashMap<usize, usize>>,
+    retired_dma: Mutex<Vec<RetiredDma>>,
     shutdown_complete: AtomicBool,
     lifecycle: Mutex<()>,
     #[cfg(test)]
@@ -782,6 +792,7 @@ impl SpdkEnv {
             poller: Mutex::new(None),
             retired_qpairs: RetiredQpairRegistry::new(),
             deferred_qpairs: Mutex::new(HashMap::new()),
+            retired_dma: Mutex::new(Vec::new()),
             shutdown_complete: AtomicBool::new(false),
             lifecycle: Mutex::new(()),
             #[cfg(test)]
@@ -1241,8 +1252,64 @@ impl SpdkEnv {
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
     ) -> CommonResult<*mut spdk_ffi::spdk_nvme_qpair> {
         self.resolve_deferred_qpairs();
+        self.reclaim_retired_dma();
         self.qpair_pool.acquire(ctrlr)
     }
+
+    pub(crate) fn defer_dma_buffers(
+        &self,
+        bdev_name: String,
+        read_buf: DmaBuf,
+        write_buf: DmaBuf,
+        inflight: Arc<AtomicUsize>,
+    ) {
+        let pending = inflight.load(Ordering::Acquire);
+        warn!(
+            "Deferring SPDK DMA buffers for '{}' with {} in-flight ref(s)",
+            bdev_name, pending
+        );
+        self.retired_dma
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(RetiredDma {
+                bdev_name,
+                _read_buf: read_buf,
+                _write_buf: write_buf,
+                inflight,
+                retired_at: Instant::now(),
+            });
+    }
+
+    pub(crate) fn reclaim_retired_dma(&self) -> usize {
+        let mut retired = self
+            .retired_dma
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = retired.len();
+        retired.retain(|entry| {
+            let pending = entry.inflight.load(Ordering::Acquire);
+            if pending == 0 {
+                info!(
+                    "Reclaiming retired SPDK DMA buffers for '{}' after {:?}",
+                    entry.bdev_name,
+                    entry.retired_at.elapsed()
+                );
+                false
+            } else {
+                true
+            }
+        });
+        before - retired.len()
+    }
+
+    #[cfg(test)]
+    fn retired_dma_count(&self) -> usize {
+        self.retired_dma
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
     fn prepare_retired_qpair_for_free(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
         #[cfg(test)]
         if let Some(hook) = &self.test_hooks.poll_retired_qpair {
@@ -1293,12 +1360,14 @@ impl SpdkEnv {
             match self.qpair_pool.release(ctrlr, qpair) {
                 QpairReleaseOutcome::Cached | QpairReleaseOutcome::Destroyed => {
                     retired.reclaim();
+                    self.reclaim_retired_dma();
                     return RetiredQpairFinish::Complete;
                 }
                 QpairReleaseOutcome::PendingDestroy => {
                     // QpairPool owns retry through pending_destroy. Do not put
                     // the same qpair into deferred_qpairs.
                     retired.reclaim();
+                    self.reclaim_retired_dma();
                     return RetiredQpairFinish::PendingDestroy;
                 }
             }
@@ -1317,6 +1386,7 @@ impl SpdkEnv {
 
         retired.reclaim();
         self.qpair_pool.release_destroyed(ctrlr);
+        self.reclaim_retired_dma();
         RetiredQpairFinish::Complete
     }
 
@@ -1417,6 +1487,7 @@ impl SpdkEnv {
                 }
             }
         }
+        self.reclaim_retired_dma();
         retired_retry_pending
     }
 
@@ -1900,6 +1971,44 @@ mod test {
             ..Default::default()
         };
         SpdkEnv::new(conf).unwrap()
+    }
+
+    fn defer_test_dma(env: &SpdkEnv, inflight: Arc<AtomicUsize>) {
+        env.defer_dma_buffers(
+            "test-bdev".to_string(),
+            DmaBuf::null_for_test(4096, 4096),
+            DmaBuf::null_for_test(4096, 4096),
+            inflight,
+        );
+    }
+
+    #[test]
+    fn retired_dma_reclaim_waits_for_inflight_to_drain() {
+        let env = test_env();
+        let inflight = Arc::new(AtomicUsize::new(1));
+
+        defer_test_dma(&env, inflight.clone());
+
+        assert_eq!(env.retired_dma_count(), 1);
+        assert_eq!(env.reclaim_retired_dma(), 0);
+        assert_eq!(env.retired_dma_count(), 1);
+
+        inflight.store(0, Ordering::Release);
+
+        assert_eq!(env.reclaim_retired_dma(), 1);
+        assert_eq!(env.retired_dma_count(), 0);
+    }
+
+    #[test]
+    fn retired_dma_reclaim_is_idempotent() {
+        let env = test_env();
+        let inflight = Arc::new(AtomicUsize::new(0));
+
+        defer_test_dma(&env, inflight);
+
+        assert_eq!(env.reclaim_retired_dma(), 1);
+        assert_eq!(env.reclaim_retired_dma(), 0);
+        assert_eq!(env.retired_dma_count(), 0);
     }
 
     #[test]

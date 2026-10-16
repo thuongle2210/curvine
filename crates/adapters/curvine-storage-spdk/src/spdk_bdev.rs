@@ -110,6 +110,15 @@ impl DmaBuf {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn null_for_test(capacity: usize, block_size: u32) -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+            capacity,
+            block_size,
+        }
+    }
+
     /// Round n up to nearest multiple of align.
     #[inline]
     pub fn align_up(n: usize, align: usize) -> usize {
@@ -170,9 +179,9 @@ pub struct SpdkBdev {
     /// Whether opened for writing.
     writable: bool,
     /// Read buffer (avoids repeated allocation).
-    read_buf: DmaBuf,
+    read_buf: Option<DmaBuf>,
     /// Write buffer (avoids repeated allocation).
-    write_buf: DmaBuf,
+    write_buf: Option<DmaBuf>,
     /// Raw namespace pointer.
     ns: *mut crate::spdk_ffi::spdk_nvme_ns,
     /// I/O channel for this bdev.
@@ -281,8 +290,8 @@ impl SpdkBdev {
                 pos: offset,
                 writable,
                 io_channel,
-                read_buf,
-                write_buf,
+                read_buf: Some(read_buf),
+                write_buf: Some(write_buf),
                 ns,
                 ctrlr,
                 io_timeout_ms,
@@ -355,8 +364,12 @@ impl SpdkBdev {
             return err_box!("SPDK qpair is dead, device unreachable");
         }
 
-        let buf_cap = self.read_buf.capacity();
-        let dma_buf = self.read_buf.as_ptr();
+        let read_buf = self
+            .read_buf
+            .as_mut()
+            .expect("SPDK read buffer missing before drop");
+        let buf_cap = read_buf.capacity();
+        let dma_buf = read_buf.as_ptr();
 
         let bs = self.block_size as usize;
         let mut result = BytesMut::with_capacity(len);
@@ -440,8 +453,12 @@ impl SpdkBdev {
         if len == 0 {
             return Ok(());
         }
-        let buf_cap = self.write_buf.capacity();
-        let dma_buf = self.write_buf.as_ptr();
+        let write_buf = self
+            .write_buf
+            .as_mut()
+            .expect("SPDK write buffer missing before drop");
+        let buf_cap = write_buf.capacity();
+        let dma_buf = write_buf.as_ptr();
 
         let bs = self.block_size as usize;
         let mut written = 0usize;
@@ -752,15 +769,30 @@ impl Drop for SpdkBdev {
             if std::time::Instant::now() >= deadline {
                 error!(
                     "SpdkBdev '{}': {} in-flight I/O(s) still pending after {}s. \
-                         Leaking DMA buffers to prevent use-after-free.",
+                         Deferring DMA buffer free until callbacks drain.",
                     self.name,
                     count,
                     max_wait.as_secs()
                 );
-                // Poison pointers so DmaBuf::drop is a no-op.
-                self.read_buf.ptr = std::ptr::null_mut();
-                self.write_buf.ptr = std::ptr::null_mut();
-                // TODO: leak qpair and handle on timeout because reusing a qpair with retired callbacks causes use after free.
+                if let Some(env) = env {
+                    let read_buf = self.read_buf.take();
+                    let write_buf = self.write_buf.take();
+                    if let (Some(read_buf), Some(write_buf)) = (read_buf, write_buf) {
+                        env.defer_dma_buffers(
+                            self.name.clone(),
+                            read_buf,
+                            write_buf,
+                            self.inflight.clone(),
+                        );
+                    }
+                } else {
+                    if let Some(read_buf) = self.read_buf.take() {
+                        std::mem::forget(read_buf);
+                    }
+                    if let Some(write_buf) = self.write_buf.take() {
+                        std::mem::forget(write_buf);
+                    }
+                }
                 break;
             }
             if !logged {
