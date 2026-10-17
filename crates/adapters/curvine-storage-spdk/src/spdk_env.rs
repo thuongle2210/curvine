@@ -276,7 +276,7 @@ impl QpairPool {
         self.total_cached.fetch_sub(qpairs.len(), Ordering::AcqRel);
         let mut failed = Vec::new();
         for qpair in qpairs {
-            if unsafe { spdk_ffi::curvine_spdk_free_io_qpair(qpair) } != 0 {
+            if self.free_io_qpair(qpair) != 0 {
                 failed.push(qpair);
             }
         }
@@ -807,6 +807,9 @@ struct SpdkEnvTestHooks {
     env_fini: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     poller_stop: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     unregister_qpair: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
+    unregister_ctrlr: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
+    nvme_detach:
+        Option<std::sync::Arc<dyn Fn(*mut spdk_ffi::spdk_nvme_ctrlr) -> i32 + Send + Sync>>,
     poll_retired_qpair: Option<
         std::sync::Arc<
             dyn Fn(*mut spdk_ffi::spdk_nvme_qpair) -> RetiredQpairPollOutcome + Send + Sync,
@@ -1590,18 +1593,12 @@ impl SpdkEnv {
                 target_idx
             );
         }
-        let unregister_result = {
-            let poller = self
-                .poller
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(poller) = poller.as_ref() else {
-                return err_box!("SPDK poller is not running; refusing runtime detach");
-            };
-            poller.unregister_ctrlr(CtrlHandle(ctrlr))
-        };
+        let unregister_result = self.unregister_ctrlr_from_poller(CtrlHandle(ctrlr));
         match unregister_result {
             UnregisterResult::Acked => {}
+            UnregisterResult::Disconnected if self.poller.lock().unwrap().is_none() => {
+                return err_box!("SPDK poller is not running; refusing runtime detach");
+            }
             result => {
                 return err_box!(
                     "poller did not acknowledge SPDK target {} removal: {:?}",
@@ -1610,7 +1607,7 @@ impl SpdkEnv {
                 );
             }
         }
-        let rc = unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
+        let rc = self.nvme_detach_ctrlr(ctrlr);
         if rc != 0 {
             return err_box!(
                 "spdk_nvme_detach failed for target {}: rc={}",
@@ -1696,6 +1693,29 @@ impl SpdkEnv {
         } else {
             UnregisterResult::Disconnected
         }
+    }
+
+    pub(crate) fn unregister_ctrlr_from_poller(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.unregister_ctrlr {
+            return hook();
+        }
+
+        let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(poller) = poller.as_ref() {
+            poller.unregister_ctrlr(ctrlr)
+        } else {
+            UnregisterResult::Disconnected
+        }
+    }
+
+    fn nvme_detach_ctrlr(&self, ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr) -> i32 {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.nvme_detach {
+            return hook(ctrlr);
+        }
+
+        unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) }
     }
 
     // SPDK FFI — feature-gated
@@ -1999,6 +2019,32 @@ mod test {
         SpdkEnv::new(conf).unwrap()
     }
 
+    fn add_test_controller(env: &mut SpdkEnv, target_idx: usize, ctrlr: usize) {
+        env.bdevs.push(BdevInfo {
+            name: format!("nvme-{target_idx}"),
+            size_bytes: 1024,
+            block_size: 512,
+            num_blocks: 2,
+            target_endpoint: format!("tcp://target-{target_idx}"),
+            ctrlr,
+            ns: ctrlr + 0x1000,
+            io_timeout_ms: 1000,
+        });
+        env.controllers.push(ControllerEntry {
+            target_idx,
+            ctrlr,
+            state: AtomicU8::new(ControllerState::Active as u8),
+        });
+        env.qpair_pool.register_limit(ctrlr, 1);
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+    }
+
+    fn set_detach_success_hooks(env: &mut SpdkEnv) {
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::Acked));
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| 0));
+    }
+
     fn defer_test_dma(env: &SpdkEnv, inflight: Arc<AtomicUsize>) {
         env.retired_dma.defer(
             "test-bdev".to_string(),
@@ -2211,6 +2257,151 @@ mod test {
         assert!(err.contains("target 1"));
         assert!(err.contains("2 handle"));
         assert!(SpdkEnv::validate_detach_preconditions(1, 0).is_ok());
+    }
+
+    #[test]
+    fn detach_target_rejects_unknown_target() {
+        let env = test_env();
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        let err = env.detach_target(7).unwrap_err().to_string();
+
+        assert!(err.contains("target index 7"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn detach_target_is_idempotent_when_already_detached() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.controllers[0]
+            .state
+            .store(ControllerState::Detached as u8, Ordering::Release);
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+    }
+
+    #[test]
+    fn detach_target_rejects_open_handles() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.open_handles.store(1, Ordering::Release);
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(err.contains("while 1 handle"), "unexpected error: {err}");
+        assert_eq!(env.controllers[0].state(), ControllerState::Active);
+    }
+
+    #[test]
+    fn detach_target_rejects_remaining_deferred_qpairs() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        env.deferred_qpairs.lock().unwrap().insert(0x2000, 0x1000);
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("still has deferred qpairs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn detach_target_rejects_active_qpair_reservations() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        assert_eq!(
+            env.qpair_pool.try_reserve(0x1000),
+            QpairReserveResult::Reserved
+        );
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("active qpair reservations"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn detach_target_rejects_cached_qpair_free_failure() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        push(&env.qpair_pool, 0x1000);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(|_| -libc::EIO);
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("failed to free cached qpairs"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(cnt(&env.qpair_pool, 0x1000), 1);
+    }
+
+    #[test]
+    fn detach_target_rejects_missing_poller() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| 0));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("poller is not running"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn detach_target_rejects_unregister_ctrlr_timeout() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::TimedOut));
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| 0));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("did not acknowledge"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("TimedOut"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn detach_target_surfaces_nvme_detach_failure() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::Acked));
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| -libc::EIO));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("spdk_nvme_detach failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn detach_target_success_marks_controller_detached_and_hides_bdev() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+        assert_eq!(env.qpair_pool.controller_stats(0x1000), (0, 0));
+        assert_eq!(env.active_bdev_count(), 0);
+        assert!(env.get_bdev("nvme-0").is_none());
     }
 
     #[test]
