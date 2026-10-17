@@ -802,6 +802,7 @@ impl Drop for SpdkBdev {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
+        // Release handle.
         if let Some(env) = env {
             env.release_handle();
         }
