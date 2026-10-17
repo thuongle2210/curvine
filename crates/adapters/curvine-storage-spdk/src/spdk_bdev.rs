@@ -748,13 +748,19 @@ impl Drop for SpdkBdev {
         if let Some(env) = env {
             env.retire_qpair(self.ctrlr, self.io_channel.qpair);
         } else {
-            let rc = unsafe { crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair) };
-            if rc != 0 {
-                error!(
-                    "failed to free SPDK qpair {:p}: rc={}",
-                    self.io_channel.qpair, rc
-                );
-            }
+            // Unreachable: every live SpdkBdev is constructed via open(), which requires
+            // SpdkEnv::global_or_err() to succeed first, and SPDK_ENV is never cleared.
+            // Without an env there is no safe force-complete/stale-reclaim path, so leak
+            // the qpair instead of freeing it while SPDK may still reference it.
+            debug_assert!(
+                false,
+                "SpdkBdev dropped with no global SpdkEnv; invariant violated"
+            );
+            error!(
+                "SpdkBdev '{}': no global SpdkEnv during drop; leaking qpair {:p} \
+                 because there is no safe teardown path without an env",
+                self.name, self.io_channel.qpair
+            );
         }
 
         // Wait until SPDK no longer owns any DMA buffer from this bdev.
