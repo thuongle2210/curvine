@@ -1849,6 +1849,7 @@ mod test {
         assert_eq!(old_inflight.load(Ordering::Acquire), 1);
         assert_eq!(new_inflight.load(Ordering::Acquire), 1);
         assert_eq!(ack_rx.try_recv(), Ok(()), "ack must be sent");
+        assert!(retired_qpair.requires_free());
         retired_qpair.reclaim();
         assert_eq!(old_inflight.load(Ordering::Acquire), 0);
         assert_eq!(new_inflight.load(Ordering::Acquire), 0);
