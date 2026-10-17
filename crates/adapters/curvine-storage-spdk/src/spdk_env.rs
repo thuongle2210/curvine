@@ -1564,6 +1564,7 @@ impl SpdkEnv {
                     target_idx,
                     self.open_handles.load(Ordering::Acquire),
                 )?;
+                // TODO(spdk): define retry/revert policy for failures after entering Detaching.
                 controller
                     .state
                     .store(ControllerState::Detaching as u8, Ordering::Release);
