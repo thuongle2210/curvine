@@ -1228,8 +1228,8 @@ impl SpdkEnv {
     }
 
     /// Look up a bdev by name.
-    pub fn get_bdev(&self, name: &str) -> Option<BdevInfo> {
-        self.active_bdevs().find(|b| b.name == name).cloned()
+    pub fn get_bdev(&self, name: &str) -> Option<&BdevInfo> {
+        self.active_bdevs().find(|b| b.name == name)
     }
 
     /// Total capacity across all bdevs, in bytes.
