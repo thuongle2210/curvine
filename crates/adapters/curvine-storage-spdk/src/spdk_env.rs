@@ -2309,6 +2309,7 @@ mod test {
             err.contains("still has deferred qpairs"),
             "unexpected error: {err}"
         );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
     #[test]
@@ -2327,6 +2328,7 @@ mod test {
             err.contains("active qpair reservations"),
             "unexpected error: {err}"
         );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
     #[test]
@@ -2344,6 +2346,7 @@ mod test {
             "unexpected error: {err}"
         );
         assert_eq!(cnt(&env.qpair_pool, 0x1000), 1);
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
     #[test]
@@ -2358,6 +2361,7 @@ mod test {
             err.contains("poller is not running"),
             "unexpected error: {err}"
         );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
     #[test]
@@ -2374,6 +2378,7 @@ mod test {
             "unexpected error: {err}"
         );
         assert!(err.contains("TimedOut"), "unexpected error: {err}");
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
     #[test]
@@ -2389,6 +2394,7 @@ mod test {
             err.contains("spdk_nvme_detach failed"),
             "unexpected error: {err}"
         );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
     }
 
     #[test]
