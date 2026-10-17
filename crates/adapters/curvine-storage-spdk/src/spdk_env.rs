@@ -1536,6 +1536,7 @@ impl SpdkEnv {
     /// outlive SPDK ownership. The operation is conservative by design: no SPDK
     /// handle may be open anywhere while a runtime detach is in progress.
     pub fn detach_target(&self, target_idx: usize) -> CommonResult<()> {
+        // TODO(spdk): use per-controller locks/counters so detaching one target does not block unrelated target opens.
         let _lifecycle = self
             .lifecycle
             .lock()
