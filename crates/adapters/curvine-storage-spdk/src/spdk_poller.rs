@@ -1962,6 +1962,41 @@ mod test {
     }
 
     #[test]
+    fn unregister_ctrlr_real_round_trip_acks() {
+        let retired = RetiredQpairRegistry::new();
+        let config = PollerConfig {
+            poll_interval_ms: 10,
+            spin_iter: 10,
+            io_queue_depth: 8,
+            ctrlrs: Vec::new(),
+        };
+        let poller = SpdkPoller::start(config, retired);
+        let ctrlr = CtrlHandle(0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr);
+
+        let result = poller.unregister_ctrlr(ctrlr);
+
+        assert_eq!(result, UnregisterResult::Acked);
+    }
+
+    #[test]
+    fn unregister_ctrlr_after_stop_returns_disconnected() {
+        let retired = RetiredQpairRegistry::new();
+        let config = PollerConfig {
+            poll_interval_ms: 10,
+            spin_iter: 10,
+            io_queue_depth: 8,
+            ctrlrs: Vec::new(),
+        };
+        let mut poller = SpdkPoller::start(config, retired);
+        poller.stop();
+        let ctrlr = CtrlHandle(0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr);
+
+        let result = poller.unregister_ctrlr(ctrlr);
+
+        assert_eq!(result, UnregisterResult::Disconnected);
+    }
+
+    #[test]
     fn retired_registry_cleanup_uses_existing_record() {
         let qpair = 0x1 as *mut _;
         let retired = RetiredQpairRegistry::new();
