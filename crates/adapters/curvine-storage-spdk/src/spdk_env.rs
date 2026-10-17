@@ -706,10 +706,76 @@ struct ControllerEntry {
 
 struct RetiredDma {
     bdev_name: String,
-    _read_buf: DmaBuf,
-    _write_buf: DmaBuf,
+    _read_buf: Option<DmaBuf>,
+    _write_buf: Option<DmaBuf>,
     inflight: Arc<AtomicUsize>,
     retired_at: Instant,
+}
+
+pub(crate) struct RetiredDmaRegistry {
+    entries: Mutex<Vec<RetiredDma>>,
+}
+
+impl RetiredDmaRegistry {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entries: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn defer(
+        &self,
+        bdev_name: String,
+        read_buf: Option<DmaBuf>,
+        write_buf: Option<DmaBuf>,
+        inflight: Arc<AtomicUsize>,
+    ) {
+        let pending = inflight.load(Ordering::Acquire);
+        warn!(
+            "Deferring SPDK DMA buffers for '{}' with {} in-flight ref(s)",
+            bdev_name, pending
+        );
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(RetiredDma {
+                bdev_name,
+                _read_buf: read_buf,
+                _write_buf: write_buf,
+                inflight,
+                retired_at: Instant::now(),
+            });
+    }
+
+    pub(crate) fn reclaim(&self) -> usize {
+        let mut retired = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = retired.len();
+        retired.retain(|entry| {
+            let pending = entry.inflight.load(Ordering::Acquire);
+            if pending == 0 {
+                info!(
+                    "Reclaiming retired SPDK DMA buffers for '{}' after {:?}",
+                    entry.bdev_name,
+                    entry.retired_at.elapsed()
+                );
+                false
+            } else {
+                true
+            }
+        });
+        before - retired.len()
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
 }
 
 impl ControllerEntry {
@@ -759,7 +825,7 @@ pub struct SpdkEnv {
     poller: Mutex<Option<SpdkPoller>>,
     retired_qpairs: Arc<RetiredQpairRegistry>,
     deferred_qpairs: Mutex<HashMap<usize, usize>>,
-    retired_dma: Mutex<Vec<RetiredDma>>,
+    retired_dma: Arc<RetiredDmaRegistry>,
     shutdown_complete: AtomicBool,
     lifecycle: Mutex<()>,
     #[cfg(test)]
@@ -792,7 +858,7 @@ impl SpdkEnv {
             poller: Mutex::new(None),
             retired_qpairs: RetiredQpairRegistry::new(),
             deferred_qpairs: Mutex::new(HashMap::new()),
-            retired_dma: Mutex::new(Vec::new()),
+            retired_dma: RetiredDmaRegistry::new(),
             shutdown_complete: AtomicBool::new(false),
             lifecycle: Mutex::new(()),
             #[cfg(test)]
@@ -1256,58 +1322,17 @@ impl SpdkEnv {
         self.qpair_pool.acquire(ctrlr)
     }
 
-    pub(crate) fn defer_dma_buffers(
-        &self,
-        bdev_name: String,
-        read_buf: DmaBuf,
-        write_buf: DmaBuf,
-        inflight: Arc<AtomicUsize>,
-    ) {
-        let pending = inflight.load(Ordering::Acquire);
-        warn!(
-            "Deferring SPDK DMA buffers for '{}' with {} in-flight ref(s)",
-            bdev_name, pending
-        );
-        self.retired_dma
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(RetiredDma {
-                bdev_name,
-                _read_buf: read_buf,
-                _write_buf: write_buf,
-                inflight,
-                retired_at: Instant::now(),
-            });
+    pub(crate) fn retired_dma_registry(&self) -> Arc<RetiredDmaRegistry> {
+        self.retired_dma.clone()
     }
 
     pub(crate) fn reclaim_retired_dma(&self) -> usize {
-        let mut retired = self
-            .retired_dma
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let before = retired.len();
-        retired.retain(|entry| {
-            let pending = entry.inflight.load(Ordering::Acquire);
-            if pending == 0 {
-                info!(
-                    "Reclaiming retired SPDK DMA buffers for '{}' after {:?}",
-                    entry.bdev_name,
-                    entry.retired_at.elapsed()
-                );
-                false
-            } else {
-                true
-            }
-        });
-        before - retired.len()
+        self.retired_dma.reclaim()
     }
 
     #[cfg(test)]
     fn retired_dma_count(&self) -> usize {
-        self.retired_dma
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+        self.retired_dma.count()
     }
 
     fn prepare_retired_qpair_for_free(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
@@ -1974,10 +1999,10 @@ mod test {
     }
 
     fn defer_test_dma(env: &SpdkEnv, inflight: Arc<AtomicUsize>) {
-        env.defer_dma_buffers(
+        env.retired_dma.defer(
             "test-bdev".to_string(),
-            DmaBuf::null_for_test(4096, 4096),
-            DmaBuf::null_for_test(4096, 4096),
+            Some(DmaBuf::null_for_test(4096, 4096)),
+            Some(DmaBuf::null_for_test(4096, 4096)),
             inflight,
         );
     }

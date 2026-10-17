@@ -11,6 +11,7 @@
 
 #![cfg(feature = "spdk")]
 
+use crate::spdk_env::RetiredDmaRegistry;
 use bytes::BytesMut;
 use curvine_core_error::err_box;
 use curvine_io::BlockIO;
@@ -191,6 +192,7 @@ pub struct SpdkBdev {
     /// I/O timeout in milliseconds. 0 = no timeout.
     io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    retired_dma: Arc<RetiredDmaRegistry>,
 }
 
 // SAFETY: owns qpair and DMA buffers exclusively
@@ -274,6 +276,7 @@ impl SpdkBdev {
             let poller_tx = env.poller_sender(); // Get sender from SpdkEnv
             let eventfd = env.poller_eventfd(); // Get eventfd for wake signaling
             let poller_is_sleeping = env.poller_is_sleeping(); // Skip eventfd if active
+            let retired_dma = env.retired_dma_registry();
             let qpair_dead = std::sync::Arc::new(AtomicBool::new(false));
             let io_channel = SpdkIoChannel {
                 qpair,
@@ -296,6 +299,7 @@ impl SpdkBdev {
                 ctrlr,
                 io_timeout_ms,
                 inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                retired_dma,
             })
         }
     }
@@ -774,25 +778,12 @@ impl Drop for SpdkBdev {
                     count,
                     max_wait.as_secs()
                 );
-                if let Some(env) = env {
-                    let read_buf = self.read_buf.take();
-                    let write_buf = self.write_buf.take();
-                    if let (Some(read_buf), Some(write_buf)) = (read_buf, write_buf) {
-                        env.defer_dma_buffers(
-                            self.name.clone(),
-                            read_buf,
-                            write_buf,
-                            self.inflight.clone(),
-                        );
-                    }
-                } else {
-                    if let Some(read_buf) = self.read_buf.take() {
-                        std::mem::forget(read_buf);
-                    }
-                    if let Some(write_buf) = self.write_buf.take() {
-                        std::mem::forget(write_buf);
-                    }
-                }
+                self.retired_dma.defer(
+                    self.name.clone(),
+                    self.read_buf.take(),
+                    self.write_buf.take(),
+                    self.inflight.clone(),
+                );
                 break;
             }
             if !logged {
