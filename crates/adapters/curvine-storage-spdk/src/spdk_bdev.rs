@@ -403,7 +403,7 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
-                if rc == -libc::EIO {
+                if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                     self.io_channel.qpair_dead.store(true, Ordering::Release);
                 }
                 return err_box!(
@@ -486,7 +486,7 @@ impl SpdkBdev {
                 let rc = completion.wait(self.io_timeout_ms * 1000);
 
                 if rc != 0 {
-                    if rc == -libc::EIO {
+                    if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                         self.io_channel.qpair_dead.store(true, Ordering::Release);
                     }
                     return err_box!(
@@ -536,7 +536,7 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
-                if rc == -libc::EIO {
+                if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                     self.io_channel.qpair_dead.store(true, Ordering::Release);
                 }
                 return err_box!(
@@ -573,7 +573,7 @@ impl SpdkBdev {
         )?;
         let rc = completion.wait(self.io_timeout_ms * 1000);
         if rc != 0 {
-            if rc == -libc::EIO {
+            if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
                 self.io_channel.qpair_dead.store(true, Ordering::Release);
             }
             return err_box!(
@@ -721,6 +721,14 @@ impl Display for SpdkBdev {
 
 impl Drop for SpdkBdev {
     fn drop(&mut self) {
+        // Retire the qpair first. If the poller force-completed I/O and moved
+        // callbacks to stale, retirement reclaims them and releases DMA refs
+        // before the wait loop below observes `inflight`.
+        let env = crate::spdk_env::SpdkEnv::global_including_shutdown();
+        if let Some(env) = env {
+            env.retire_qpair(self.ctrlr, self.io_channel.qpair);
+        }
+
         // Wait for in-flight I/O.
         let max_wait = if self.io_timeout_ms > 0 {
             std::time::Duration::from_millis(self.io_timeout_ms * 2)
@@ -758,10 +766,8 @@ impl Drop for SpdkBdev {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        // Return qpair to pool and release handle.
-        if let Some(env) = crate::spdk_env::SpdkEnv::global_including_shutdown() {
-            // Unregister qpair from poller before returning it to pool to avoid use-after-free.
-            env.retire_qpair(self.ctrlr, self.io_channel.qpair);
+        // Release handle.
+        if let Some(env) = env {
             env.release_handle();
         } else {
             let rc = unsafe { crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair) };
