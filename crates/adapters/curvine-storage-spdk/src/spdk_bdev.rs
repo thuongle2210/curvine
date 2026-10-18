@@ -11,6 +11,7 @@
 
 #![cfg(feature = "spdk")]
 
+use crate::spdk_env::RetiredDmaRegistry;
 use bytes::BytesMut;
 use curvine_core_error::err_box;
 use curvine_io::BlockIO;
@@ -110,6 +111,15 @@ impl DmaBuf {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn null_for_test(capacity: usize, block_size: u32) -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+            capacity,
+            block_size,
+        }
+    }
+
     /// Round n up to nearest multiple of align.
     #[inline]
     pub fn align_up(n: usize, align: usize) -> usize {
@@ -169,10 +179,12 @@ pub struct SpdkBdev {
     pos: i64,
     /// Whether opened for writing.
     writable: bool,
-    /// Read buffer (avoids repeated allocation).
-    read_buf: DmaBuf,
-    /// Write buffer (avoids repeated allocation).
-    write_buf: DmaBuf,
+    /// Read buffer (avoids repeated allocation). Only `None` after
+    /// `defer_dma_buffers()` moves ownership during drop.
+    read_buf: Option<DmaBuf>,
+    /// Write buffer (avoids repeated allocation). Only `None` after
+    /// `defer_dma_buffers()` moves ownership during drop.
+    write_buf: Option<DmaBuf>,
     /// Raw namespace pointer.
     ns: *mut crate::spdk_ffi::spdk_nvme_ns,
     /// I/O channel for this bdev.
@@ -182,6 +194,7 @@ pub struct SpdkBdev {
     /// I/O timeout in milliseconds. 0 = no timeout.
     io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    retired_dma: Arc<RetiredDmaRegistry>,
 }
 
 // SAFETY: owns qpair and DMA buffers exclusively
@@ -265,6 +278,7 @@ impl SpdkBdev {
             let poller_tx = env.poller_sender(); // Get sender from SpdkEnv
             let eventfd = env.poller_eventfd(); // Get eventfd for wake signaling
             let poller_is_sleeping = env.poller_is_sleeping(); // Skip eventfd if active
+            let retired_dma = env.retired_dma_registry();
             let qpair_dead = std::sync::Arc::new(AtomicBool::new(false));
             let io_channel = SpdkIoChannel {
                 qpair,
@@ -281,12 +295,13 @@ impl SpdkBdev {
                 pos: offset,
                 writable,
                 io_channel,
-                read_buf,
-                write_buf,
+                read_buf: Some(read_buf),
+                write_buf: Some(write_buf),
                 ns,
                 ctrlr,
                 io_timeout_ms,
                 inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                retired_dma,
             })
         }
     }
@@ -355,8 +370,12 @@ impl SpdkBdev {
             return err_box!("SPDK qpair is dead, device unreachable");
         }
 
-        let buf_cap = self.read_buf.capacity();
-        let dma_buf = self.read_buf.as_ptr();
+        let read_buf = self
+            .read_buf
+            .as_mut()
+            .expect("SPDK read buffer missing before drop");
+        let buf_cap = read_buf.capacity();
+        let dma_buf = read_buf.as_ptr();
 
         let bs = self.block_size as usize;
         let mut result = BytesMut::with_capacity(len);
@@ -440,8 +459,12 @@ impl SpdkBdev {
         if len == 0 {
             return Ok(());
         }
-        let buf_cap = self.write_buf.capacity();
-        let dma_buf = self.write_buf.as_ptr();
+        let write_buf = self
+            .write_buf
+            .as_mut()
+            .expect("SPDK write buffer missing before drop");
+        let buf_cap = write_buf.capacity();
+        let dma_buf = write_buf.as_ptr();
 
         let bs = self.block_size as usize;
         let mut written = 0usize;
@@ -721,12 +744,27 @@ impl Display for SpdkBdev {
 
 impl Drop for SpdkBdev {
     fn drop(&mut self) {
-        // Retire the qpair first. If the poller force-completed I/O and moved
-        // callbacks to stale, retirement reclaims them and releases DMA refs
-        // before the wait loop below observes `inflight`.
+        // Retire the qpair before waiting on `inflight` below. Retirement
+        // reclaims stale callback contexts, which is what releases DMA refs
+        // after force-completion; if this ran after the wait loop, the loop
+        // could never observe inflight == 0 for a force-completed qpair.
         let env = crate::spdk_env::SpdkEnv::global_including_shutdown();
         if let Some(env) = env {
             env.retire_qpair(self.ctrlr, self.io_channel.qpair);
+        } else {
+            // Unreachable: every live SpdkBdev is constructed via open(), which requires
+            // SpdkEnv::global_or_err() to succeed first, and SPDK_ENV is never cleared.
+            // Without an env there is no safe force-complete/stale-reclaim path, so leak
+            // the qpair instead of freeing it while SPDK may still reference it.
+            debug_assert!(
+                false,
+                "SpdkBdev dropped with no global SpdkEnv; invariant violated"
+            );
+            error!(
+                "SpdkBdev '{}': no global SpdkEnv during drop; leaking qpair {:p} \
+                 because there is no safe teardown path without an env",
+                self.name, self.io_channel.qpair
+            );
         }
 
         // Wait for in-flight I/O.
@@ -745,15 +783,12 @@ impl Drop for SpdkBdev {
             if std::time::Instant::now() >= deadline {
                 error!(
                     "SpdkBdev '{}': {} in-flight I/O(s) still pending after {}s. \
-                         Leaking DMA buffers to prevent use-after-free.",
+                         Deferring DMA buffer free until callbacks drain.",
                     self.name,
                     count,
                     max_wait.as_secs()
                 );
-                // Poison pointers so DmaBuf::drop is a no-op.
-                self.read_buf.ptr = std::ptr::null_mut();
-                self.write_buf.ptr = std::ptr::null_mut();
-                // TODO: leak qpair and handle on timeout because reusing a qpair with retired callbacks causes use after free.
+                self.defer_dma_buffers();
                 break;
             }
             if !logged {
@@ -766,21 +801,24 @@ impl Drop for SpdkBdev {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        // Release handle.
         if let Some(env) = env {
             env.release_handle();
-        } else {
-            let rc = unsafe { crate::spdk_ffi::curvine_spdk_free_io_qpair(self.io_channel.qpair) };
-            if rc != 0 {
-                error!(
-                    "SpdkBdev '{}': failed to free SPDK qpair during drop: rc={}",
-                    self.name, rc
-                );
-            }
         }
+
         debug!(
-            "SpdkBdev '{}' closed (qpair returned to pool, DMA buffers freed)",
+            "SpdkBdev '{}' closed (qpair retired, DMA buffers released or leaked)",
             self.name
+        );
+    }
+}
+
+impl SpdkBdev {
+    fn defer_dma_buffers(&mut self) {
+        self.retired_dma.defer(
+            self.name.clone(),
+            self.read_buf.take(),
+            self.write_buf.take(),
+            self.inflight.clone(),
         );
     }
 }
@@ -788,10 +826,12 @@ impl Drop for SpdkBdev {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::spdk_env::RetiredDmaRegistry;
     use crate::spdk_env::SpdkEnv;
     use crate::spdk_poller::IoCompletion;
     use curvine_io::SpdkConf;
     use nix::sys::eventfd::EfdFlags;
+    use std::mem::ManuallyDrop;
 
     fn ensure_spdk_init() {
         if SpdkEnv::global().is_some() {
@@ -850,6 +890,45 @@ mod test {
             err
         );
         assert_eq!(inflight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn defer_dma_buffers_moves_bdev_buffers_to_retired_registry() {
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let retired_dma = RetiredDmaRegistry::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let eventfd = Arc::new(EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK).unwrap());
+        let mut bdev = ManuallyDrop::new(SpdkBdev {
+            name: "test-bdev".to_string(),
+            size: 4096,
+            block_size: 4096,
+            pos: 0,
+            writable: true,
+            read_buf: Some(DmaBuf::null_for_test(4096, 4096)),
+            write_buf: Some(DmaBuf::null_for_test(4096, 4096)),
+            ns: std::ptr::null_mut(),
+            io_channel: SpdkIoChannel {
+                qpair: std::ptr::null_mut(),
+                poller_tx: tx,
+                eventfd,
+                poller_is_sleeping: Arc::new(AtomicBool::new(false)),
+                qpair_dead: Arc::new(AtomicBool::new(false)),
+            },
+            ctrlr: std::ptr::null_mut(),
+            io_timeout_ms: 1,
+            inflight: inflight.clone(),
+            retired_dma: retired_dma.clone(),
+        });
+
+        bdev.defer_dma_buffers();
+
+        assert_eq!(retired_dma.count(), 1);
+        assert!(bdev.read_buf.is_none());
+        assert!(bdev.write_buf.is_none());
+        assert_eq!(retired_dma.reclaim(), 0);
+        inflight.store(0, Ordering::Release);
+        assert_eq!(retired_dma.reclaim(), 1);
+        assert_eq!(retired_dma.count(), 0);
     }
 
     #[test]
