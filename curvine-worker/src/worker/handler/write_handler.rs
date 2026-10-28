@@ -763,9 +763,11 @@ mod tests {
         Ok(())
     }
 
-    // `complete()` must route an uncertain flush failure through abort_block_uncertain.
+    // On non-SPDK storage, `abort_block_uncertain` degrades to a plain
+    // `abort_block`, so this only proves error propagation + cleanup, not
+    // quarantine routing itself (see the SPDK-specific test below for that).
     #[test]
-    fn complete_routes_uncertain_flush_failure_through_abort_uncertain() -> FsResult<()> {
+    fn complete_routes_uncertain_flush_failure_removes_block_on_non_spdk_storage() -> FsResult<()> {
         let block_size = 1024_i64;
         let block = ExtendedBlock::new(42, 0, StorageType::Disk, FileType::File);
 
@@ -822,6 +824,85 @@ mod tests {
         assert!(
             store.get_block(meta.id).is_err(),
             "block must be cleaned up after uncertain flush failure"
+        );
+
+        Ok(())
+    }
+
+    // SPDK: uncertain flush must quarantine, not remove the block.
+    // Detector itself is tested separately in curvine-storage-spdk::spdk_bdev.
+    #[test]
+    fn complete_routes_uncertain_flush_failure_to_quarantine_on_spdk() -> FsResult<()> {
+        let block_size = 4096_i64;
+        let block = ExtendedBlock::new(42, block_size, StorageType::SpdkDisk, FileType::File);
+
+        // Just to init worker metrics; dataset/store below bypass this conf.
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec!["[MEM:1KB]../testing/write-handler-spdk-quarantine".to_string()],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)
+            .map_err(FsError::from)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        let meta = store.open_block(&block).map_err(FsError::from)?;
+        assert!(store.get_block(meta.id).is_ok());
+
+        let file = BlockWriteContext::new(FailingFlushUncertainBlockIO, 0, block_size, 0)?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+        };
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        let err = handler.complete(&msg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("flush timed out"),
+            "unexpected error: {err}"
+        );
+
+        // Block must be quarantined, not removed: extent stays reserved.
+        let meta_after = store.get_block(meta.id).map_err(FsError::from)?;
+        assert_eq!(
+            meta_after.state(),
+            &curvine_storage_local::BlockState::Quarantined,
+            "uncertain flush failure on SPDK must quarantine the block, not remove it"
         );
 
         Ok(())
