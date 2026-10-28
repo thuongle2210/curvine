@@ -82,6 +82,30 @@ impl BatchWriteHandler {
         }
     }
 
+    /// Rolls back every batch block except `skip_index` (quarantines SPDK,
+    /// aborts others), then resets handler state so it can't be reused.
+    fn abort_batch_siblings(&mut self, skip_index: Option<usize>) {
+        let contexts = self.context.take().unwrap_or_default();
+        let mut files = self.file.take().unwrap_or_default();
+        for (i, context) in contexts.iter().enumerate() {
+            if Some(i) == skip_index {
+                continue;
+            }
+            if let Some(slot) = files.get_mut(i) {
+                slot.take();
+            }
+            if let Err(e) = self.store.abort_block_uncertain(&context.block) {
+                log::warn!(
+                    "failed to abort batch block {} during whole-batch rollback: {}",
+                    context.block.id,
+                    e
+                );
+            }
+        }
+        self.is_commit = true;
+        self.leases.clear();
+    }
+
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
         let header: BlocksBatchWriteRequest = msg.parse_header()?;
         let mut responses = Vec::with_capacity(header.blocks.len());
@@ -187,49 +211,92 @@ impl BatchWriteHandler {
             return err_box!("batch commit without open files");
         };
         if contexts.len() != header.blocks.len() || files.len() != header.blocks.len() {
-            return err_box!(
+            // Nothing flushed yet: roll back the whole batch before returning.
+            let result: FsResult<Message> = err_box!(
                 "batch commit block count mismatch: blocks={}, contexts={}, files={}",
                 header.blocks.len(),
                 contexts.len(),
                 files.len()
             );
+            self.abort_batch_siblings(None);
+            return result;
         }
 
         let mut commit_blocks = Vec::with_capacity(header.blocks.len());
         for (i, block_proto) in header.blocks.into_iter().enumerate() {
             let Some(context) = contexts.get(i) else {
-                return err_box!("missing batch write context at index {}", i);
+                let result: FsResult<Message> =
+                    err_box!("missing batch write context at index {}", i);
+                self.abort_batch_siblings(None);
+                return result;
             };
             let expected_req_id = msg.req_id() + i as i64;
-            Self::check_context(context, expected_req_id)?;
+            if let Err(e) = Self::check_context(context, expected_req_id) {
+                self.abort_batch_siblings(None);
+                return Err(e);
+            }
 
             let block = ProtoUtils::extend_block_from_pb(block_proto);
             if block.id != context.block.id
                 || block.storage_type != context.block.storage_type
                 || block.file_type != context.block.file_type
             {
-                return err_box!(
+                let result: FsResult<Message> = err_box!(
                     "batch commit block mismatch at index {}: opened={:?}, committed={:?}",
                     i,
                     context.block,
                     block
                 );
+                self.abort_batch_siblings(None);
+                return result;
             }
             if block.len > context.block_size {
-                return err_box!(
+                let result: FsResult<Message> = err_box!(
                     "Invalid block length: {}, block size: {}",
                     block.len,
                     context.block_size
                 );
+                self.abort_batch_siblings(None);
+                return result;
             }
             commit_blocks.push(block);
         }
 
-        for file in files.iter_mut() {
+        // Fresh borrow: NLL ended the earlier one at each early return above.
+        let contexts = self.context.as_ref().expect("checked above");
+        let files = self.file.as_mut().expect("checked above");
+
+        let mut failure: Option<(usize, curvine_error::FsError)> = None;
+        for (i, (file, context)) in files.iter_mut().zip(contexts.iter()).enumerate() {
             if let Some(file) = file.as_mut() {
-                file.flush()?;
+                if let Err(flush_err) = file.flush() {
+                    // Uncertain (timed-out) flush: quarantine, don't release.
+                    let uncertain = file.has_uncertain_writes();
+                    let abort_result = if uncertain {
+                        self.store.abort_block_uncertain(&context.block)
+                    } else {
+                        self.store.abort_block(&context.block)
+                    };
+                    if let Err(abort_err) = abort_result {
+                        log::warn!(
+                            "failed to abort batch block {} after flush error: {}",
+                            context.block.id,
+                            abort_err
+                        );
+                    }
+                    failure = Some((i, flush_err.into()));
+                    break;
+                }
             }
         }
+
+        if let Some((failed_index, err)) = failure {
+            // Roll back the rest of the batch; this block was already handled.
+            self.abort_batch_siblings(Some(failed_index));
+            return Err(err);
+        }
+
+        let files = self.file.as_mut().expect("checked above");
         for file in files.iter_mut() {
             file.take();
         }
@@ -387,5 +454,211 @@ impl BatchWriteHandler {
             RequestStatus::Cancel => self.complete_batch(msg, false),
             _ => err_box!("Unsupported request type"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BatchWriteHandler;
+    use crate::worker::block::BlockStore;
+    use crate::worker::handler::WriteContext;
+    use crate::worker::storage::BlockWriteContext;
+    use crate::worker::Worker;
+    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_error::FsResult;
+    use curvine_io::{BlockIO, DataSlice, IOError, IOResult};
+    use curvine_model::{ExtendedBlock, ProtoUtils, StorageType};
+    use curvine_proto::BlocksBatchCommitRequest;
+    use curvine_rpc::message::{Builder, RequestStatus};
+
+    fn create_test_store(name: &str) -> FsResult<BlockStore> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec![format!("[MEM:1KB]../testing/batch-write-handler-{name}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        let _worker = Worker::with_conf(conf.clone())?;
+        BlockStore::new("test", &conf).map_err(curvine_error::FsError::from)
+    }
+
+    /// Always-OK flush, for the siblings that shouldn't be the one failing.
+    struct OkBlockIO;
+
+    impl BlockIO for OkBlockIO {
+        fn read_region(&mut self, _: bool, _: i32) -> IOResult<DataSlice> {
+            Err(IOError::new(std::io::Error::other("read not supported")))
+        }
+        fn write_region(&mut self, _: &DataSlice) -> IOResult<()> {
+            Ok(())
+        }
+        fn write_all(&mut self, _: &[u8]) -> IOResult<()> {
+            Ok(())
+        }
+        fn read_all(&mut self, _: &mut [u8]) -> IOResult<()> {
+            Err(IOError::new(std::io::Error::other("read not supported")))
+        }
+        fn flush(&mut self) -> IOResult<()> {
+            Ok(())
+        }
+        fn seek(&mut self, pos: i64) -> IOResult<i64> {
+            Ok(pos)
+        }
+        fn pos(&self) -> i64 {
+            0
+        }
+        fn len(&self) -> i64 {
+            0
+        }
+        fn path(&self) -> &str {
+            "ok"
+        }
+        fn resize(&mut self, _: bool, _: i64, _: i64, _: i32) -> IOResult<()> {
+            Err(IOError::new(std::io::Error::other("resize not supported")))
+        }
+    }
+
+    /// Confirmed flush failure — triggers the whole-batch rollback.
+    struct FailingFlushBlockIO;
+
+    impl BlockIO for FailingFlushBlockIO {
+        fn read_region(&mut self, _: bool, _: i32) -> IOResult<DataSlice> {
+            Err(IOError::new(std::io::Error::other("read not supported")))
+        }
+        fn write_region(&mut self, _: &DataSlice) -> IOResult<()> {
+            Ok(())
+        }
+        fn write_all(&mut self, _: &[u8]) -> IOResult<()> {
+            Ok(())
+        }
+        fn read_all(&mut self, _: &mut [u8]) -> IOResult<()> {
+            Err(IOError::new(std::io::Error::other("read not supported")))
+        }
+        fn flush(&mut self) -> IOResult<()> {
+            Err(IOError::new(std::io::Error::other("flush failed")))
+        }
+        fn seek(&mut self, pos: i64) -> IOResult<i64> {
+            Ok(pos)
+        }
+        fn pos(&self) -> i64 {
+            0
+        }
+        fn len(&self) -> i64 {
+            0
+        }
+        fn path(&self) -> &str {
+            "failing-flush"
+        }
+        fn resize(&mut self, _: bool, _: i64, _: i64, _: i32) -> IOResult<()> {
+            Err(IOError::new(std::io::Error::other("resize not supported")))
+        }
+    }
+
+    // Regression: block N of M fails to flush must not leave siblings
+    // dangling in `Writing` — the whole batch must roll back atomically.
+    #[test]
+    fn complete_batch_aborts_all_blocks_on_partial_flush_failure() -> FsResult<()> {
+        let block_size = 1024_i64;
+        let store = create_test_store("partial-flush-failure")?;
+
+        let blocks: Vec<ExtendedBlock> = (1..=3)
+            .map(|id| ExtendedBlock::new(id, 0, StorageType::Disk, curvine_model::FileType::File))
+            .collect();
+        for block in &blocks {
+            store.open_block(block)?;
+        }
+        for block in &blocks {
+            assert!(
+                store.get_block(block.id).is_ok(),
+                "block {} must exist after open",
+                block.id
+            );
+        }
+
+        let outer_req_id = 100_i64;
+        let contexts: Vec<WriteContext> = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, block)| WriteContext {
+                block: block.clone(),
+                req_id: outer_req_id + i as i64,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+            })
+            .collect();
+
+        // Block index 1 (block id 2) is the one that fails; 0 and 2 succeed.
+        let files = vec![
+            Some(BlockWriteContext::new(OkBlockIO, 0, block_size, 0)?),
+            Some(BlockWriteContext::new(
+                FailingFlushBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            Some(BlockWriteContext::new(OkBlockIO, 0, block_size, 0)?),
+        ];
+
+        let mut handler = BatchWriteHandler {
+            store: store.clone(),
+            context: Some(contexts),
+            file: Some(files),
+            leases: vec![None, None, None],
+            is_commit: false,
+            write_handler: crate::worker::handler::WriteHandler::new(
+                store.clone(),
+                "test".to_string(),
+            )?,
+        };
+
+        let header = BlocksBatchCommitRequest {
+            blocks: blocks
+                .iter()
+                .cloned()
+                .map(ProtoUtils::extend_block_to_pb)
+                .collect(),
+            off: 0,
+            block_size,
+            req_id: outer_req_id,
+            seq_id: 1,
+            cancel: false,
+            component_info: None,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(outer_req_id)
+            .seq_id(1)
+            .proto_header(header)
+            .build();
+
+        let err = handler.complete_batch(&msg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("flush failed"),
+            "unexpected error: {err}"
+        );
+
+        for block in &blocks {
+            assert!(
+                store.get_block(block.id).is_err(),
+                "block {} must be rolled back, not left in Writing",
+                block.id
+            );
+        }
+        assert!(
+            handler.is_commit,
+            "handler must be marked done after rollback"
+        );
+        assert!(
+            handler.leases.iter().all(Option::is_none),
+            "leases must be cleared after rollback"
+        );
+
+        Ok(())
     }
 }
