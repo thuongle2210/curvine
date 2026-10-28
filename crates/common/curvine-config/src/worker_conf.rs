@@ -188,6 +188,15 @@ pub struct WorkerConf {
     // SPDK over NVMe-oF/RDMA configuration.
     pub spdk_disk: SpdkConf,
 
+    /// Reject new SPDK allocation once quarantined bytes reach this limit.
+    /// Byte string (e.g. `"10GB"`); `"0"` (default) disables the limit, so
+    /// quarantine can grow without bound and only `spdk_quarantined_bytes`
+    /// observability signals an operator to investigate. Quarantined extents
+    /// are never released because they're old (see the quarantine design
+    /// doc); this limit exists purely to stop capacity pressure before it's
+    /// exhausted, not to recover already-quarantined bytes.
+    pub spdk_quarantine_limit: String,
+
     /// Version compatibility policy applied to client peers on data-plane
     /// connections (diagnose by default; enforce only when explicitly
     /// configured). `min_worker_version` is ignored for a worker; the client
@@ -204,6 +213,11 @@ impl WorkerConf {
     pub fn io_timeout_ms(&self) -> u64 {
         let dur = DurationUnit::from_str(&self.io_timeout).unwrap();
         dur.as_millis()
+    }
+
+    /// Parsed `spdk_quarantine_limit` in bytes; `0` means disabled.
+    pub fn spdk_quarantine_limit_bytes(&self) -> CommonResult<u64> {
+        Ok(ByteUnit::from_str(&self.spdk_quarantine_limit)?.as_byte())
     }
 }
 
@@ -239,6 +253,7 @@ impl Default for WorkerConf {
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
             spdk_disk: SpdkConf::default(),
+            spdk_quarantine_limit: "0".to_string(),
             compatibility: CompatibilityConf::default(),
         }
     }
@@ -280,5 +295,37 @@ data_dir = ["[SSD]/data/data1"]
 "#;
         let conf: WorkerConf = toml::from_str(toml).unwrap();
         assert_eq!(conf.free_ratio, 0.0);
+    }
+
+    #[test]
+    fn spdk_quarantine_limit_defaults_to_disabled() {
+        let conf = WorkerConf::default();
+        assert_eq!(conf.spdk_quarantine_limit, "0");
+        assert_eq!(conf.spdk_quarantine_limit_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn spdk_quarantine_limit_parses_from_toml() {
+        let toml = r#"
+dir_reserved = "0"
+spdk_quarantine_limit = "10GB"
+data_dir = ["[SSD]/data/data1"]
+"#;
+        let conf: WorkerConf = toml::from_str(toml).unwrap();
+        assert_eq!(
+            conf.spdk_quarantine_limit_bytes().unwrap(),
+            10 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn spdk_quarantine_limit_absent_defaults_to_disabled() {
+        // Backward compat: old configs without this field must still parse.
+        let toml = r#"
+dir_reserved = "0"
+data_dir = ["[SSD]/data/data1"]
+"#;
+        let conf: WorkerConf = toml::from_str(toml).unwrap();
+        assert_eq!(conf.spdk_quarantine_limit_bytes().unwrap(), 0);
     }
 }

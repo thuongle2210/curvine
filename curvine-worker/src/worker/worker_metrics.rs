@@ -48,6 +48,11 @@ pub struct WorkerMetrics {
     pub(crate) disk_free_ratio: GaugeVec,
     /// Writes rejected because storage admission reported insufficient capacity.
     pub(crate) disk_full_rejected_writes: Counter,
+
+    /// Number of blocks currently quarantined (uncertain SPDK write/flush).
+    pub(crate) spdk_quarantined_blocks: Gauge,
+    /// Physical bytes held by quarantined blocks; reduces usable SPDK capacity.
+    pub(crate) spdk_quarantined_bytes: Gauge,
 }
 
 impl WorkerMetrics {
@@ -106,6 +111,15 @@ impl WorkerMetrics {
                 "disk_full_rejected_writes",
                 "Writes rejected because the storage layer reported insufficient capacity",
             )?,
+
+            spdk_quarantined_blocks: m::new_gauge(
+                "spdk_quarantined_blocks",
+                "Number of SPDK blocks currently quarantined (uncertain write/flush outcome)",
+            )?,
+            spdk_quarantined_bytes: m::new_gauge(
+                "spdk_quarantined_bytes",
+                "Physical bytes held by quarantined SPDK blocks; unusable until released",
+            )?,
         };
 
         Ok(wm)
@@ -133,6 +147,10 @@ impl WorkerMetrics {
                 .set((d.free_ratio * 10000.0) as i64);
         }
 
+        self.spdk_quarantined_blocks
+            .set(state.quarantined_block_count() as i64);
+        self.spdk_quarantined_bytes.set(state.quarantined_bytes());
+
         #[cfg(feature = "spdk")]
         if let Some(env) = curvine_storage_spdk::SpdkEnv::global_including_shutdown() {
             env.publish_metrics();
@@ -145,5 +163,35 @@ impl WorkerMetrics {
 impl Debug for WorkerMetrics {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "WorkerMetrics")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::worker::Worker;
+    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_core_error::CommonResult;
+
+    // Metrics are a process-wide singleton (OnceCell); this only asserts the
+    // gauges exist in scraped output, not specific values, so it's safe
+    // regardless of which test in this binary initializes them first.
+    #[test]
+    fn quarantine_metrics_exposed() -> CommonResult<()> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec!["[MEM:1KB]../testing/worker-metrics-quarantine".to_string()],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        let _worker = Worker::with_conf(conf)?;
+        let metrics = Worker::get_metrics()?;
+
+        let text = metrics.text_output()?;
+        assert!(text.contains("spdk_quarantined_blocks"));
+        assert!(text.contains("spdk_quarantined_bytes"));
+        Ok(())
     }
 }

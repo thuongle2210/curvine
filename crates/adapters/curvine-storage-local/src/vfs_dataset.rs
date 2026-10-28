@@ -63,6 +63,8 @@ pub struct VfsDataset {
     committed_rewrites: HashMap<i64, BlockMeta>,
     layouts: BlockLayouts,
     num_blocks_to_delete: AtomicUsize,
+    /// Reject new SPDK allocation once quarantined bytes reach this; `0` disables.
+    spdk_quarantine_limit_bytes: u64,
 }
 
 pub struct RemovedBlockState {
@@ -143,6 +145,7 @@ impl VfsDataset {
             committed_rewrites: HashMap::new(),
             layouts: BlockLayouts::new(spdk_meta),
             num_blocks_to_delete: AtomicUsize::new(0),
+            spdk_quarantine_limit_bytes: 0,
         };
         ds.initialize()?;
         Ok(ds)
@@ -213,7 +216,9 @@ impl VfsDataset {
             None
         };
 
-        Self::new(cluster_id, dir_list, spdk_meta)
+        let mut ds = Self::new(cluster_id, dir_list, spdk_meta)?;
+        ds.spdk_quarantine_limit_bytes = conf.worker.spdk_quarantine_limit_bytes()?;
+        Ok(ds)
     }
 
     // Initialize.
@@ -584,6 +589,26 @@ impl VfsDataset {
             })
             .collect()
     }
+
+    /// Number of blocks currently `Quarantined`, for the `spdk_quarantined_blocks` metric.
+    pub fn quarantined_block_count(&self) -> usize {
+        self.meta
+            .all_blocks()
+            .iter()
+            .filter(|m| m.is_quarantined())
+            .count()
+    }
+
+    /// Total physical bytes held by `Quarantined` blocks, for the
+    /// `spdk_quarantined_bytes` metric and admission control.
+    pub fn quarantined_bytes(&self) -> i64 {
+        self.meta
+            .all_blocks()
+            .iter()
+            .filter(|m| m.is_quarantined())
+            .map(|m| m.physical_bytes())
+            .sum()
+    }
 }
 
 impl Dataset for VfsDataset {
@@ -669,6 +694,18 @@ impl Dataset for VfsDataset {
             }
 
             None => {
+                if block.storage_type == StorageType::SpdkDisk
+                    && self.spdk_quarantine_limit_bytes > 0
+                    && self.quarantined_bytes() as u64 >= self.spdk_quarantine_limit_bytes
+                {
+                    return err_box!(
+                        "Not enough SpdkDisk storage capacity for new allocation: \
+                         quarantined bytes {} reached worker.spdk_quarantine_limit {}",
+                        self.quarantined_bytes(),
+                        self.spdk_quarantine_limit_bytes
+                    );
+                }
+
                 let dir = self
                     .dir_list
                     .choose_dir(StorageRequest::new(block.storage_type, block.len)?)?;
@@ -1728,6 +1765,71 @@ mod test {
             size: 4096,
         };
         assert!(!ds.release_quarantined_block_with_proof(&missing_proof)?);
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_metrics_reflect_state() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        assert_eq!(ds.quarantined_block_count(), 0);
+        assert_eq!(ds.quarantined_bytes(), 0);
+
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.open_block(&b2)?;
+        ds.abort_block_uncertain(&b1)?;
+        ds.abort_block_uncertain(&b2)?;
+
+        assert_eq!(ds.quarantined_block_count(), 2);
+        assert_eq!(ds.quarantined_bytes(), 8192);
+
+        // Releasing one must decrement both metrics.
+        ds.release_quarantined_block_with_proof(&QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        })?;
+        assert_eq!(ds.quarantined_block_count(), 1);
+        assert_eq!(ds.quarantined_bytes(), 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_rejected_when_quarantine_limit_exceeded() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        // Limit smaller than one block's extent (4096): the very first
+        // quarantined block already reaches/exceeds it.
+        ds.spdk_quarantine_limit_bytes = 4096;
+
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+        assert_eq!(ds.quarantined_bytes(), 4096);
+
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let err = ds.open_block(&b2).unwrap_err();
+        assert!(err.to_string().contains("Not enough"));
+        assert!(err.to_string().contains("storage capacity"));
+        assert!(ds.get_block(2).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_allowed_when_quarantine_limit_disabled() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        assert_eq!(ds.spdk_quarantine_limit_bytes, 0, "default is disabled");
+
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+        assert_eq!(ds.quarantined_bytes(), 4096);
+
+        // No limit configured: further allocation must still succeed despite
+        // quarantined bytes being non-zero.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b2)?;
+        assert!(ds.get_block(2).is_some());
         Ok(())
     }
 }
