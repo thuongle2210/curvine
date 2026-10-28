@@ -1439,7 +1439,7 @@ mod test {
         let path = "../testing/spdk_capacity_restore";
         let _ = std::fs::remove_dir_all(path);
         let store = Arc::new(SpdkMetaStore::open(path, true)?);
-        store.put(1, 1, 0, 4096, 1, true)?;
+        store.put(1, 1, 0, 4096, 1, true, false)?;
 
         let dir = spdk_dir(1, spdk_state());
         let available = dir.available();

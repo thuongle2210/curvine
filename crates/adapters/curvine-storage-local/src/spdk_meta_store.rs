@@ -30,19 +30,8 @@ impl SpdkMetaStore {
         info!("SpdkMetaStore opened at {}", dir);
         Ok(Self { db })
     }
-    pub fn put(
-        &self,
-        block_id: i64,
-        dir_id: u32,
-        offset: i64,
-        size: i64,
-        len: i64,
-        finalized: bool,
-    ) -> CommonResult<()> {
-        self.put_with_state(block_id, dir_id, offset, size, len, finalized, false)
-    }
     #[allow(clippy::too_many_arguments)]
-    pub fn put_with_state(
+    pub fn put(
         &self,
         block_id: i64,
         dir_id: u32,
@@ -146,7 +135,7 @@ impl SpdkMetaStore {
 
 impl BlockMetaStore for SpdkMetaStore {
     fn put_block_meta(&self, meta: &BlockMeta) -> CommonResult<()> {
-        self.put_with_state(
+        self.put(
             meta.id(),
             meta.dir_id(),
             meta.bdev_offset,
@@ -172,8 +161,8 @@ mod test {
     #[test]
     fn put_get_delete() {
         let store = SpdkMetaStore::open(&test_dir("pgd"), true).unwrap();
-        store.put(1, 1, 0, 4096, 4096, true).unwrap();
-        store.put(2, 1, 4096, 8192, 6000, false).unwrap();
+        store.put(1, 1, 0, 4096, 4096, true, false).unwrap();
+        store.put(2, 1, 4096, 8192, 6000, false, false).unwrap();
         let r = store.get(1).unwrap().unwrap();
         assert_eq!(r.offset, 0);
         assert!(r.finalized);
@@ -182,11 +171,9 @@ mod test {
         assert!(store.get(1).unwrap().is_none());
     }
     #[test]
-    fn put_with_state_persists_quarantined() {
+    fn put_persists_quarantined() {
         let store = SpdkMetaStore::open(&test_dir("quarantined"), true).unwrap();
-        store
-            .put_with_state(1, 1, 0, 4096, 4096, false, true)
-            .unwrap();
+        store.put(1, 1, 0, 4096, 4096, false, true).unwrap();
         let r = store.get(1).unwrap().unwrap();
         assert!(!r.finalized);
         assert!(r.quarantined);
@@ -196,7 +183,7 @@ mod test {
         let store = SpdkMetaStore::open(&test_dir("scan"), true).unwrap();
         for i in 0..100 {
             store
-                .put(i, (i % 3) as u32, i * 4096, 4096, 4096, i % 2 == 0)
+                .put(i, (i % 3) as u32, i * 4096, 4096, 4096, i % 2 == 0, false)
                 .unwrap();
         }
         assert_eq!(store.scan_all().unwrap().len(), 100);
@@ -204,8 +191,8 @@ mod test {
     #[test]
     fn dir_id_preserved() {
         let store = SpdkMetaStore::open(&test_dir("dir"), true).unwrap();
-        store.put(1, 10, 0, 4096, 4096, true).unwrap();
-        store.put(2, 20, 4096, 4096, 4096, false).unwrap();
+        store.put(1, 10, 0, 4096, 4096, true, false).unwrap();
+        store.put(2, 20, 4096, 4096, 4096, false, false).unwrap();
         let records = store.scan_all().unwrap();
         assert_eq!(records.iter().filter(|r| r.dir_id == 10).count(), 1);
         assert_eq!(records.iter().filter(|r| r.dir_id == 20).count(), 1);
@@ -213,8 +200,8 @@ mod test {
     #[test]
     fn update_key() {
         let store = SpdkMetaStore::open(&test_dir("upd"), true).unwrap();
-        store.put(1, 1, 0, 4096, 4096, false).unwrap();
-        store.put(1, 1, 0, 4096, 2048, true).unwrap();
+        store.put(1, 1, 0, 4096, 4096, false, false).unwrap();
+        store.put(1, 1, 0, 4096, 2048, true, false).unwrap();
         assert_eq!(store.get(1).unwrap().unwrap().len, 2048);
     }
     #[test]
@@ -222,7 +209,7 @@ mod test {
         let dir = test_dir("reopen");
         {
             let s = SpdkMetaStore::open(&dir, true).unwrap();
-            s.put(1, 5, 0, 4096, 4096, true).unwrap();
+            s.put(1, 5, 0, 4096, 4096, true, false).unwrap();
         }
         let s = SpdkMetaStore::open(&dir, false).unwrap();
         assert_eq!(s.scan_all().unwrap().len(), 1);
