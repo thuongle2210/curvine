@@ -216,6 +216,31 @@ impl VfsDataset {
         Self::new(cluster_id, dir_list, spdk_meta)
     }
 
+    /// Synthetic SPDK dataset (no real bdev) for cross-crate unit tests.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_spdk_test_dataset(dir_id: u32, capacity: i64) -> CommonResult<Self> {
+        let state = Arc::new(crate::DirState {
+            bdev_name: Some("test-nvme0".into()),
+            bdev_capacity: capacity,
+            offset_alloc: crate::DirState::new_offset_alloc(StorageType::SpdkDisk, capacity, 4096),
+        });
+        let mut version = StorageVersion::with_cluster("test");
+        version.dir_id = dir_id;
+        let dir = VfsDir {
+            version,
+            stats: curvine_sys::FsStats::new("/tmp"),
+            storage_type: StorageType::SpdkDisk,
+            conf_capacity: capacity,
+            reserved_bytes: 0,
+            free_ratio: 0.0,
+            final_bytes: curvine_runtime::sync::AtomicLong::new(0),
+            tmp_bytes: curvine_runtime::sync::AtomicLong::new(0),
+            state,
+            check_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        Self::new("test", DirList::new(vec![dir])?, None)
+    }
+
     // Initialize.
     // 1. Scan all blocks in the directory (filesystem or RocksDB for SPDK)
     // 2. Block is added to meta store.
@@ -873,8 +898,7 @@ mod test {
     }
 
     fn spdk_dataset() -> CommonResult<VfsDataset> {
-        let st = spdk_state();
-        VfsDataset::new("t", DirList::new(vec![spdk_dir(1, st)])?, None)
+        VfsDataset::new_spdk_test_dataset(1, 1 << 30)
     }
 
     /// SPDK dir with controllable capacity, used bytes, and free_ratio, so the
