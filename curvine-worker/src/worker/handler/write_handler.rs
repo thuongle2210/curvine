@@ -332,6 +332,14 @@ impl WriteHandler {
                         abort_err
                     );
                 }
+                // Prevent a re-entrant completion call (e.g. the client's
+                // standard cancel()-on-failure cleanup) from reaching
+                // commit_block()/abort_block() again on this handler: for
+                // an uncertain SPDK failure the block was quarantined, not
+                // removed, so a second unconditional abort would bypass
+                // the quarantine's proof-matched release entirely.
+                self.is_commit = true;
+                self.lease.take();
                 return Err(flush_err.into());
             }
             drop(file);
@@ -345,6 +353,12 @@ impl WriteHandler {
                     abort_err
                 );
             }
+            // Same re-entrancy guard as above, for consistency: this block
+            // was already removed by abort_block, so a second call would be
+            // a harmless no-op today, but closing the guard here too avoids
+            // relying on that being true forever.
+            self.is_commit = true;
+            self.lease.take();
             return err_box!(
                 "Invalid block length: {}, block size: {}",
                 context.block.len,
@@ -903,6 +917,124 @@ mod tests {
             meta_after.state(),
             &curvine_storage_local::BlockState::Quarantined,
             "uncertain flush failure on SPDK must quarantine the block, not remove it"
+        );
+
+        Ok(())
+    }
+
+    // Regression for the re-entrancy bug: after an uncertain flush failure
+    // quarantines a block, a second completion call on the same handler
+    // (e.g. the client's standard cancel()-on-failure cleanup, which reuses
+    // the connection's existing handler per worker_handler.rs::get_handler)
+    // must be rejected by the is_commit guard, not reach commit_block()/
+    // abort_block() again and force-release the quarantined extent.
+    #[test]
+    fn complete_rejects_reentrant_call_after_uncertain_flush_quarantines_block() -> FsResult<()> {
+        let block_size = 4096_i64;
+        let block = ExtendedBlock::new(42, block_size, StorageType::SpdkDisk, FileType::File);
+
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec!["[MEM:1KB]../testing/write-handler-spdk-reentrancy".to_string()],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)
+            .map_err(FsError::from)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        let meta = store.open_block(&block).map_err(FsError::from)?;
+
+        let file = BlockWriteContext::new(FailingFlushUncertainBlockIO, 0, block_size, 0)?;
+        let context = WriteContext {
+            block: block.clone(),
+            req_id: 1,
+            chunk_size: 1024,
+            short_circuit: false,
+            off: 0,
+            block_size,
+        };
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(context),
+            file: Some(file),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+
+        // RPC 1: the client's normal completion attempt; flush times out,
+        // uncertain -> quarantine.
+        let err = handler.complete(&msg, true).unwrap_err();
+        assert!(
+            err.to_string().contains("flush timed out"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            store.get_block(meta.id).map_err(FsError::from)?.state(),
+            &curvine_storage_local::BlockState::Quarantined,
+        );
+
+        // RPC 2: simulates the client's cancel()-on-failure cleanup, reusing
+        // the same handler instance on the same connection (commit=false).
+        let cancel_msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .seq_id(2)
+            .proto_header(curvine_proto::BlockWriteRequest {
+                block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build();
+        let second = handler.complete(&cancel_msg, false);
+        // The is_commit guard treats an empty-data re-completion as an
+        // idempotent no-op success (matching real cancel() RPCs, which
+        // carry no payload) rather than an error -- the safety property
+        // we need is that it returns WITHOUT reaching commit_block(), not
+        // that it necessarily errors.
+        assert!(
+            second.is_ok(),
+            "re-entrant call with empty data should be treated as an idempotent \
+             no-op by the is_commit guard: {second:?}"
+        );
+
+        // The quarantined block must still be quarantined: the re-entrant
+        // call must never have reached commit_block()/abort_block() again.
+        assert_eq!(
+            store.get_block(meta.id).map_err(FsError::from)?.state(),
+            &curvine_storage_local::BlockState::Quarantined,
+            "re-entrant completion call must not force-release the quarantined extent"
         );
 
         Ok(())
