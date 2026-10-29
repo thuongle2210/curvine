@@ -14,7 +14,8 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
-    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset, QuarantineReleaseProof,
+    BlockDataset, BlockLayout, BlockReadContext, BlockWriteContext, Dataset,
+    QuarantineReleaseOutcome, QuarantineReleaseProof,
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
@@ -373,7 +374,7 @@ impl BlockStore {
     pub fn release_quarantined_block_with_proof(
         &self,
         proof: &QuarantineReleaseProof,
-    ) -> CommonResult<bool> {
+    ) -> CommonResult<QuarantineReleaseOutcome> {
         let _block_lock = self.block_lock(proof.block_id, "release_quarantine");
         self.with_dataset_write("release_quarantine", |state| {
             state.release_quarantined_block_with_proof(proof)

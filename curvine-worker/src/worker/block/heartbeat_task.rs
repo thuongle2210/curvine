@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockStore, MasterClient};
-use crate::worker::storage::Dataset;
+use crate::worker::storage::{Dataset, QuarantineReleaseOutcome, QuarantineReleaseProof};
+use crate::worker::Worker;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::ProtoUtils;
@@ -24,6 +25,13 @@ use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::{error, warn};
 use std::sync::{Arc, Mutex};
+
+/// A quarantine-release proof still waiting for an exact metadata match,
+/// plus how many heartbeat ticks it has been retried.
+pub(crate) struct PendingQuarantineProof {
+    pub(crate) proof: QuarantineReleaseProof,
+    pub(crate) attempts: u32,
+}
 
 pub struct HeartbeatTask {
     pub(crate) executor: Arc<GroupExecutor>,
@@ -36,8 +44,18 @@ pub struct HeartbeatTask {
     /// visible to this dataset generation, or a transient store error),
     /// retried every tick. See `Dataset::release_quarantined_block_with_proof`.
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
-    pub(crate) pending_quarantine_proofs:
-        Arc<Mutex<Vec<crate::worker::storage::QuarantineReleaseProof>>>,
+    pub(crate) pending_quarantine_proofs: Arc<Mutex<Vec<PendingQuarantineProof>>>,
+    /// Give up on a `Stale` proof after this many retries. `0` = unlimited.
+    /// See `WorkerConf::spdk_quarantine_proof_max_retries`.
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) quarantine_proof_stale_max_retries: u32,
+    /// Give up on a `NotYetQuarantined` proof after this many retries. `0`
+    /// = unlimited. Expected to be much larger than the stale cap, since
+    /// reaching it means the quarantine transition itself is stuck, not
+    /// that the proof is merely stale. See
+    /// `WorkerConf::spdk_quarantine_proof_stuck_max_retries`.
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) quarantine_proof_stuck_max_retries: u32,
 }
 
 impl HeartbeatTask {
@@ -136,8 +154,6 @@ impl HeartbeatTask {
     /// when the event arrived — see `pending_quarantine_proofs`).
     #[cfg(feature = "spdk")]
     fn process_quarantine_terminal_events(&self) {
-        use crate::worker::storage::QuarantineReleaseProof;
-
         let new_proofs: Vec<QuarantineReleaseProof> = curvine_storage_spdk::SpdkEnv::global()
             .map(|env| {
                 env.drain_terminal_events()
@@ -151,43 +167,122 @@ impl HeartbeatTask {
             })
             .unwrap_or_default();
 
-        let mut pending = match self.pending_quarantine_proofs.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        pending.extend(new_proofs);
-        if pending.is_empty() {
-            return;
-        }
-
-        pending.retain(|proof| {
-            match self.store.release_quarantined_block_with_proof(proof) {
-                Ok(true) => {
-                    log::info!(
-                        "released quarantined SPDK extent: block_id={} offset={} size={}",
-                        proof.block_id,
-                        proof.bdev_offset,
-                        proof.size
-                    );
-                    false
-                }
-                // No exact match yet (or ever): keep retrying. A stale proof
-                // whose block was since removed stays here harmlessly; see
-                // the design doc's documented recovery-workflow limitation.
-                Ok(false) => true,
-                Err(e) => {
-                    warn!(
-                        "release_quarantined_block_with_proof failed for block {}: {}",
-                        proof.block_id, e
-                    );
-                    true
-                }
-            }
-        });
+        Self::retry_pending_quarantine_proofs(
+            &self.store,
+            &self.pending_quarantine_proofs,
+            new_proofs,
+            self.quarantine_proof_stale_max_retries,
+            self.quarantine_proof_stuck_max_retries,
+        );
     }
 
     #[cfg(not(feature = "spdk"))]
     fn process_quarantine_terminal_events(&self) {}
+
+    /// Core retry logic, independent of the SPDK event source so it can be
+    /// unit tested without a real device. Extends `pending` with
+    /// `new_proofs`, then retries every pending proof once:
+    ///
+    /// - `Released`: drop, done.
+    /// - `NotYetQuarantined`: the block exists with the same identity but
+    ///   hasn't transitioned to `Quarantined` yet. Expected to resolve
+    ///   almost immediately; capped at `stuck_max_retries` (much larger
+    ///   than `stale_max_retries`) since reaching it means the transition
+    ///   itself is stuck, not that the proof is merely stale.
+    /// - `Stale`: the block's identity no longer matches at all; whatever
+    ///   this proof would have released has already been resolved
+    ///   elsewhere. Capped at `stale_max_retries`.
+    /// - `Err`: treated like `Stale` for capping purposes (a persistent
+    ///   store error is itself worth surfacing, not retried forever).
+    ///
+    /// `0` for either cap means unlimited (preserves infinite retry).
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) fn retry_pending_quarantine_proofs(
+        store: &BlockStore,
+        pending: &Mutex<Vec<PendingQuarantineProof>>,
+        new_proofs: Vec<QuarantineReleaseProof>,
+        stale_max_retries: u32,
+        stuck_max_retries: u32,
+    ) {
+        let mut pending = match pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.extend(
+            new_proofs
+                .into_iter()
+                .map(|proof| PendingQuarantineProof { proof, attempts: 0 }),
+        );
+        if pending.is_empty() {
+            return;
+        }
+
+        pending.retain_mut(
+            |p| match store.release_quarantined_block_with_proof(&p.proof) {
+                Ok(QuarantineReleaseOutcome::Released) => {
+                    log::info!(
+                        "released quarantined SPDK extent: block_id={} offset={} size={}",
+                        p.proof.block_id,
+                        p.proof.bdev_offset,
+                        p.proof.size
+                    );
+                    false
+                }
+                Ok(QuarantineReleaseOutcome::NotYetQuarantined) => {
+                    p.attempts += 1;
+                    if stuck_max_retries != 0 && p.attempts >= stuck_max_retries {
+                        log::error!(
+                            "block {} still Writing after {} retries following an uncertain \
+                             flush failure; abort_block_uncertain may be stuck or failing, \
+                             giving up on this quarantine release proof (offset={} size={})",
+                            p.proof.block_id,
+                            p.attempts,
+                            p.proof.bdev_offset,
+                            p.proof.size
+                        );
+                        if let Ok(metrics) = Worker::get_metrics() {
+                            metrics.spdk_quarantine_proof_dropped.inc();
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Ok(QuarantineReleaseOutcome::Stale) => {
+                    p.attempts += 1;
+                    if stale_max_retries != 0 && p.attempts >= stale_max_retries {
+                        warn!(
+                            "giving up on quarantine release proof for block {}: exceeded {} \
+                             retries (offset={} size={}); the extent it would have released \
+                             was already resolved through some other path",
+                            p.proof.block_id, p.attempts, p.proof.bdev_offset, p.proof.size
+                        );
+                        if let Ok(metrics) = Worker::get_metrics() {
+                            metrics.spdk_quarantine_proof_dropped.inc();
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Err(e) => {
+                    p.attempts += 1;
+                    warn!(
+                        "release_quarantined_block_with_proof failed for block {}: {}",
+                        p.proof.block_id, e
+                    );
+                    if stale_max_retries != 0 && p.attempts >= stale_max_retries {
+                        if let Ok(metrics) = Worker::get_metrics() {
+                            metrics.spdk_quarantine_proof_dropped.inc();
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                }
+            },
+        );
+    }
 }
 
 impl LoopTask for HeartbeatTask {
@@ -256,5 +351,205 @@ impl LoopTask for HeartbeatTask {
     fn terminate(&self) -> bool {
         let state: ServerState = self.worker_ctl.state();
         state == ServerState::Stop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PendingQuarantineProof, QuarantineReleaseProof};
+    use crate::worker::block::BlockStore;
+    use crate::worker::block::HeartbeatTask;
+    use crate::worker::Worker;
+    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_core_error::CommonResult;
+    use curvine_model::{ExtendedBlock, FileType, StorageType};
+    use std::sync::Mutex;
+
+    fn test_store(name: &str) -> CommonResult<BlockStore> {
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec![format!("[MEM:1KB]../testing/heartbeat-task-{name}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+        Ok(BlockStore::from_dataset_for_test(dataset))
+    }
+
+    #[test]
+    fn retry_releases_matching_proof_and_removes_from_pending() -> CommonResult<()> {
+        let store = test_store("release")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        store.abort_block_uncertain(&block)?;
+
+        let pending = Mutex::new(Vec::new());
+        let new_proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![new_proof], 0, 0);
+
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "a matching proof must be released and removed from the pending queue"
+        );
+        assert!(store.get_block(1).is_err(), "block must be fully released");
+        Ok(())
+    }
+
+    #[test]
+    fn retry_keeps_stale_proof_until_cap_then_drops_it() -> CommonResult<()> {
+        let store = test_store("stale-cap")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        store.abort_block_uncertain(&block)?;
+
+        // Release it once for real, so a second identical proof is genuinely
+        // Stale (the block no longer exists at all).
+        let proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let pending = Mutex::new(vec![PendingQuarantineProof { proof, attempts: 0 }]);
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, 0);
+        assert!(pending.lock().unwrap().is_empty(), "first proof releases");
+
+        // A second, duplicate proof for the same now-gone identity: Stale
+        // from the very first check.
+        let stale_proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let pending = Mutex::new(Vec::new());
+        let stale_cap = 3u32;
+
+        for tick in 1..stale_cap {
+            HeartbeatTask::retry_pending_quarantine_proofs(
+                &store,
+                &pending,
+                if tick == 1 { vec![stale_proof] } else { vec![] },
+                stale_cap,
+                0,
+            );
+            assert!(
+                !pending.lock().unwrap().is_empty(),
+                "stale proof must still be retried before reaching the cap (tick {tick})"
+            );
+        }
+
+        // One more tick reaches the cap and must drop it.
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], stale_cap, 0);
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "stale proof must be dropped once it exceeds the retry cap"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_never_drops_stale_proof_when_cap_is_zero() -> CommonResult<()> {
+        let store = test_store("stale-unlimited")?;
+        let proof = QuarantineReleaseProof {
+            block_id: 999,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let pending = Mutex::new(Vec::new());
+
+        for tick in 0..20 {
+            HeartbeatTask::retry_pending_quarantine_proofs(
+                &store,
+                &pending,
+                if tick == 0 { vec![proof] } else { vec![] },
+                0,
+                0,
+            );
+        }
+
+        assert_eq!(
+            pending.lock().unwrap().len(),
+            1,
+            "cap=0 must preserve infinite retry for a stale proof"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_keeps_not_yet_quarantined_proof_past_the_stale_cap() -> CommonResult<()> {
+        let store = test_store("not-yet-quarantined")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        // Not quarantined yet: still Writing, same identity as the proof.
+
+        let proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let pending = Mutex::new(Vec::new());
+        let stale_cap = 2u32;
+        let stuck_cap = 10u32;
+
+        // Retry well past the (tight) stale cap: must NOT be dropped, since
+        // this proof is NotYetQuarantined, not Stale.
+        for tick in 1..=(stale_cap * 3) {
+            HeartbeatTask::retry_pending_quarantine_proofs(
+                &store,
+                &pending,
+                if tick == 1 { vec![proof] } else { vec![] },
+                stale_cap,
+                stuck_cap,
+            );
+            assert!(
+                !pending.lock().unwrap().is_empty(),
+                "NotYetQuarantined proof must survive past the stale cap (tick {tick})"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retry_drops_not_yet_quarantined_proof_after_stuck_cap() -> CommonResult<()> {
+        let store = test_store("stuck-cap")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        // Never transitions to Quarantined in this test (simulates
+        // abort_block_uncertain persistently failing/never running).
+
+        let proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let pending = Mutex::new(Vec::new());
+        let stuck_cap = 3u32;
+
+        for tick in 1..stuck_cap {
+            HeartbeatTask::retry_pending_quarantine_proofs(
+                &store,
+                &pending,
+                if tick == 1 { vec![proof] } else { vec![] },
+                0,
+                stuck_cap,
+            );
+            assert!(
+                !pending.lock().unwrap().is_empty(),
+                "must still be retried before reaching the stuck cap (tick {tick})"
+            );
+        }
+
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, stuck_cap);
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "a persistently NotYetQuarantined proof must be dropped once it exceeds the stuck cap"
+        );
+        Ok(())
     }
 }

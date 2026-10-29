@@ -39,6 +39,31 @@ pub struct QuarantineReleaseProof {
     pub size: i64,
 }
 
+/// Result of attempting to release a quarantined block with a proof.
+/// Distinguishes two very different "didn't release" cases so callers can
+/// retry each correctly: `NotYetQuarantined` is expected to resolve almost
+/// immediately (the block is still catching up internally) and must never
+/// be treated as permanently unmatchable; `Stale` means the resource this
+/// proof targets has already been resolved through some other path (the
+/// block is gone, or exists under a different identity/storage type) and
+/// is always safe to give up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineReleaseOutcome {
+    /// Proof matched exactly; the block was released and its extent freed.
+    Released,
+    /// The block exists with the same identity (offset/size/storage type)
+    /// but hasn't transitioned to `Quarantined` yet. Expected to be
+    /// transient (bounded by lock contention, not "forever") in the normal
+    /// case; reaching an unusually high retry count here indicates the
+    /// quarantine transition itself may be stuck, not that the proof is
+    /// stale.
+    NotYetQuarantined,
+    /// The block doesn't exist, or exists with a different identity/state/
+    /// storage type than this proof describes. Whatever this proof would
+    /// have released has already been resolved elsewhere; safe to drop.
+    Stale,
+}
+
 // block data collection.
 pub trait Dataset {
     // Total capacity
@@ -80,14 +105,15 @@ pub trait Dataset {
     }
 
     /// Release a quarantined block only if `proof` exactly matches current
-    /// metadata. Returns `true` if released, `false` if not found/mismatched
-    /// (the block, if any, stays quarantined). Default: nothing to release.
+    /// metadata. Default: nothing to release (no quarantine concept for
+    /// this storage type), reported as `Stale` since there's nothing a
+    /// caller should keep retrying.
     fn release_quarantined_block_with_proof(
         &mut self,
         proof: &QuarantineReleaseProof,
-    ) -> CommonResult<bool> {
+    ) -> CommonResult<QuarantineReleaseOutcome> {
         let _ = proof;
-        Ok(false)
+        Ok(QuarantineReleaseOutcome::Stale)
     }
 
     // Delete a block.

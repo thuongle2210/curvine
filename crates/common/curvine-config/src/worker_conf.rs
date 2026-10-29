@@ -188,6 +188,25 @@ pub struct WorkerConf {
     // SPDK over NVMe-oF/RDMA configuration.
     pub spdk_disk: SpdkConf,
 
+    /// Give up retrying a quarantine-release proof after this many
+    /// heartbeat ticks if it's genuinely stale (the block it targets no
+    /// longer exists or has a different identity, meaning its fate was
+    /// already resolved through some other path). `0` (default) disables
+    /// the cap, preserving infinite retry. A dropped stale proof costs
+    /// nothing: the extent it would have released is already handled.
+    pub spdk_quarantine_proof_max_retries: u32,
+
+    /// Give up retrying a quarantine-release proof after this many
+    /// heartbeat ticks if the block is still stuck in `Writing` (never
+    /// transitioned to `Quarantined`). Expected to resolve within a tick
+    /// or two in the normal case (bounded by lock contention); a much
+    /// larger value than `spdk_quarantine_proof_max_retries` is intended
+    /// here, since reaching this cap means something is actually wrong
+    /// (e.g. `abort_block_uncertain` is persistently failing for this
+    /// block), not just a brief timing race. `0` (default) disables the
+    /// cap, preserving infinite retry.
+    pub spdk_quarantine_proof_stuck_max_retries: u32,
+
     /// Version compatibility policy applied to client peers on data-plane
     /// connections (diagnose by default; enforce only when explicitly
     /// configured). `min_worker_version` is ignored for a worker; the client
@@ -239,6 +258,8 @@ impl Default for WorkerConf {
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
             spdk_disk: SpdkConf::default(),
+            spdk_quarantine_proof_max_retries: 0,
+            spdk_quarantine_proof_stuck_max_retries: 0,
             compatibility: CompatibilityConf::default(),
         }
     }
@@ -280,5 +301,37 @@ data_dir = ["[SSD]/data/data1"]
 "#;
         let conf: WorkerConf = toml::from_str(toml).unwrap();
         assert_eq!(conf.free_ratio, 0.0);
+    }
+
+    #[test]
+    fn spdk_quarantine_proof_retry_caps_default_to_disabled() {
+        let conf = WorkerConf::default();
+        assert_eq!(conf.spdk_quarantine_proof_max_retries, 0);
+        assert_eq!(conf.spdk_quarantine_proof_stuck_max_retries, 0);
+    }
+
+    #[test]
+    fn spdk_quarantine_proof_retry_caps_parse_from_toml() {
+        let toml = r#"
+dir_reserved = "0"
+data_dir = ["[SSD]/data/data1"]
+spdk_quarantine_proof_max_retries = 30
+spdk_quarantine_proof_stuck_max_retries = 600
+"#;
+        let conf: WorkerConf = toml::from_str(toml).unwrap();
+        assert_eq!(conf.spdk_quarantine_proof_max_retries, 30);
+        assert_eq!(conf.spdk_quarantine_proof_stuck_max_retries, 600);
+    }
+
+    #[test]
+    fn spdk_quarantine_proof_retry_caps_absent_default_to_disabled() {
+        // Backward compat: old configs without these fields must still parse.
+        let toml = r#"
+dir_reserved = "0"
+data_dir = ["[SSD]/data/data1"]
+"#;
+        let conf: WorkerConf = toml::from_str(toml).unwrap();
+        assert_eq!(conf.spdk_quarantine_proof_max_retries, 0);
+        assert_eq!(conf.spdk_quarantine_proof_stuck_max_retries, 0);
     }
 }
