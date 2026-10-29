@@ -55,6 +55,35 @@ meta_dir = "testing/meta"
 # Worker selection policy: local, robin, random, load_based, or weighted.
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
+
+# Recycle bin. While enabled, deletes on Curvine-native paths move entries to
+# /.Trash instead of freeing blocks immediately. Mounted paths (cache_mode /
+# fs_mode) always bypass the bin, because the client removes the UFS object
+# first and a trash entry could never be restored. The /.Trash namespace is
+# reserved even while disabled.
+# trash_retention: how long entries stay in the bin before the master purges
+#   them; "0" disables automatic purging.
+# trash_check_interval: how often the master scans /.Trash for expired entries.
+# trash_purge_batch_inodes: inodes a single purge batch removes before the master
+#   releases the namespace lock again (default 4096).
+# trash_purge_yield_ms: milliseconds the purger yields between batches so
+#   foreground metadata operations are not starved (default 5).
+# trash_purge_interval: how often the master drains /.Trash/.pending, i.e. the
+#   entries staged by async deletes; runs even while trash_enabled is false.
+# trash_enabled = false
+# trash_retention = "7d"
+# trash_check_interval = "1h"
+# trash_purge_batch_inodes = 4096
+# trash_purge_yield_ms = 5
+# trash_purge_interval = "1s"
+# Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
+# max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
+# time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever
+#   fires first rotates the file.
+# With both options unset, files rotate by size only, at 100 MB. If max_file_size_mb = 0 and no
+#   valid time_rotation is set, files rotate daily so they cannot grow without limit.
+# max_log_files: number of rotated files to keep (default 10).
+# Example: log = { level = "info", log_dir = "logs", file_name = "master.log", max_file_size_mb = 200, time_rotation = "daily", max_log_files = 20 }
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
 # Version compatibility policy.
@@ -172,6 +201,13 @@ log = { level = "info", log_dir = "stdout", file_name = "transfer.log" }
 attr_timeout = "1s"       # kernel attribute cache; 0 disables it
 entry_timeout = "1s"      # kernel dentry (name lookup) cache; 0 disables it
 negative_timeout = 0      # negative-lookup (ENOENT) cache; 0 = disabled
+
+# Route unlink/rmdir through the master's async delete lane: the name leaves the
+# namespace immediately and the master reclaims the blocks in the background
+# through /.Trash/.pending (see master.trash_purge_interval). Off by default
+# because POSIX users expect the space to be free when the call returns. Mounted
+# paths always stay synchronous.
+# async_delete = false
 
 # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
 [log]

@@ -201,13 +201,113 @@ impl FsClient {
     }
 
     pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        self.delete_with_opts(path, recursive, false).await
+    }
+
+    /// Deletes without waiting for the master to reclaim the subtree: the entry
+    /// is staged under `/.Trash/.pending` and purged in the background, so the
+    /// returned counts are zero and the space is released later.
+    pub async fn delete_async(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, false, true).await
+    }
+
+    pub async fn delete_with_opts(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, skip_trash, false).await
+    }
+
+    async fn delete_mode(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+        async_delete: bool,
+    ) -> FsResult<DeleteResult> {
         let header = DeleteRequest {
             path: path.encode(),
             recursive,
+            skip_trash: Some(skip_trash),
+            async_delete: Some(async_delete),
         };
 
         let rep: DeleteResponse = self.rpc(RpcCode::Delete, header).await?;
-        Ok(ProtoUtils::delete_res_from_pb(rep.res.unwrap_or_default()))
+        let trashed = rep.trashed();
+        let purge_pending = rep.purge_pending();
+        let mut res = ProtoUtils::delete_res_from_pb(rep.res.unwrap_or_default());
+        res.trashed = trashed;
+        res.purge_pending = purge_pending;
+        Ok(res)
+    }
+
+    pub async fn list_trash_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<(Vec<TrashEntry>, Option<String>)> {
+        let req = ListTrashRequest {
+            page_token,
+            page_size,
+        };
+        let rep: ListTrashResponse = self.rpc(RpcCode::ListTrash, req).await?;
+        let entries = rep
+            .entries
+            .into_iter()
+            .map(ProtoUtils::trash_entry_from_pb)
+            .collect();
+        let next_page_token = rep.next_page_token.filter(|token| !token.is_empty());
+        Ok((entries, next_page_token))
+    }
+
+    pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        let mut entries = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let (page, next_token) = self.list_trash_page(page_token, None).await?;
+            entries.extend(page);
+            match next_token {
+                Some(token) => page_token = Some(token),
+                None => return Ok(entries),
+            }
+        }
+    }
+
+    pub async fn restore_trash(
+        &self,
+        path: &Path,
+        dst: Option<&Path>,
+        overwrite: bool,
+    ) -> FsResult<RestoreTrashResult> {
+        let req = RestoreTrashRequest {
+            path: path.encode(),
+            dst: dst.map(|value| value.encode()),
+            overwrite: Some(overwrite),
+        };
+        let rep: RestoreTrashResponse = self.rpc(RpcCode::RestoreTrash, req).await?;
+        Ok(ProtoUtils::restore_trash_res_from_pb(rep))
+    }
+
+    /// Empties the recycle bin and waits for the reclamation, reporting the real
+    /// counts. Callers that can proceed while the purger works should use
+    /// [`Self::empty_trash_async`] instead.
+    pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
+        Ok(self.empty_trash_mode(true).await?.1)
+    }
+
+    /// Empties the recycle bin by staging the entries for the background purger
+    /// and returns `(accepted, reclaimed)`; reclamation still reports zeros
+    /// because the purge has not run yet.
+    pub async fn empty_trash_async(&self) -> FsResult<(u64, DeleteResult)> {
+        self.empty_trash_mode(false).await
+    }
+
+    async fn empty_trash_mode(&self, wait: bool) -> FsResult<(u64, DeleteResult)> {
+        let req = EmptyTrashRequest { wait: Some(wait) };
+        let rep: EmptyTrashResponse = self.rpc(RpcCode::EmptyTrash, req).await?;
+        Ok((rep.accepted(), ProtoUtils::delete_res_from_pb(rep.res)))
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
@@ -865,6 +965,19 @@ impl FsClient {
         };
         let rep: SetLockResponse = self.rpc(RpcCode::SetLock, req).await?;
         Ok(rep.conflict.map(ProtoUtils::file_lock_from_pb))
+    }
+
+    pub async fn create_leader_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        let rep: CreateLeaderSnapshotResponse = self
+            .rpc(
+                RpcCode::CreateLeaderSnapshot,
+                CreateLeaderSnapshotRequest { force },
+            )
+            .await?;
+        Ok(LeaderSnapshotInfo {
+            dir: rep.dir,
+            cost_ms: rep.cost_ms,
+        })
     }
 
     pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>

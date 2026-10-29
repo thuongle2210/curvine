@@ -88,6 +88,13 @@ pub enum RpcCode {
 
     MetricsReport = 60,
 
+    // recycle bin.
+    ListTrash = 61,
+    RestoreTrash = 62,
+    EmptyTrash = 63,
+
+    CreateLeaderSnapshot = 70,
+
     // block interface.
     WriteBlock = 80,
     ReadBlock = 81,
