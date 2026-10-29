@@ -84,6 +84,22 @@ impl BlockStore {
         Ok(block_store)
     }
 
+    /// Wraps a pre-built dataset, bypassing `ClusterConf` (for synthetic
+    /// SPDK test datasets, which have no config-string form).
+    #[cfg(test)]
+    pub fn from_dataset_for_test(dataset: BlockDataset) -> Self {
+        BlockStore {
+            state: Arc::new(RwLock::new(dataset)),
+            uses: Arc::new(
+                (0..BLOCK_LOCK_STRIPES)
+                    .map(|_| Mutex::new(HashMap::new()))
+                    .collect(),
+            ),
+            replication_owner: None,
+            block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
+        }
+    }
+
     fn block_uses(&self, block_id: i64) -> &Mutex<HashMap<i64, BlockUse>> {
         &self.uses[block_id as u64 as usize % self.uses.len()]
     }
