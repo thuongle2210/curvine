@@ -177,6 +177,18 @@ pub struct SpdkConf {
     pub terminal_watcher_watchdog_str: String,
     #[serde(skip)]
     pub terminal_watcher_watchdog_ms: u64,
+    /// Bounded wait a timeout-watcher thread gives a *targeted* NVMe Abort
+    /// of just the one stuck command, tried before falling back to
+    /// `terminal_watcher_watchdog_ms`'s qpair-wide force-complete. Narrower
+    /// blast radius: only the specific stuck command is affected, not
+    /// every other command in flight on the same qpair. Empty/`0` =
+    /// disabled (skip straight to the qpair-wide watchdog, today's
+    /// behavior). Only takes effect if `terminal_watcher_watchdog_ms` is
+    /// also set — this is a narrower first attempt, not a replacement.
+    #[serde(alias = "terminal_watcher_abort_timeout")]
+    pub terminal_watcher_abort_timeout_str: String,
+    #[serde(skip)]
+    pub terminal_watcher_abort_timeout_ms: u64,
 }
 
 impl SpdkConf {
@@ -207,6 +219,11 @@ impl SpdkConf {
         if !self.terminal_watcher_watchdog_str.is_empty() {
             let watchdog = DurationUnit::from_str(&self.terminal_watcher_watchdog_str)?;
             self.terminal_watcher_watchdog_ms = watchdog.as_millis();
+        }
+
+        if !self.terminal_watcher_abort_timeout_str.is_empty() {
+            let abort_timeout = DurationUnit::from_str(&self.terminal_watcher_abort_timeout_str)?;
+            self.terminal_watcher_abort_timeout_ms = abort_timeout.as_millis();
         }
 
         for target in &mut self.targets {
@@ -335,6 +352,8 @@ impl Default for SpdkConf {
             dma_buffer_bytes: 1024 * 1024,
             terminal_watcher_watchdog_str: String::new(),
             terminal_watcher_watchdog_ms: 0,
+            terminal_watcher_abort_timeout_str: String::new(),
+            terminal_watcher_abort_timeout_ms: 0,
         }
     }
 }
@@ -450,5 +469,41 @@ mod tests {
         };
         conf.init().unwrap();
         assert_eq!(conf.terminal_watcher_watchdog_ms, 0);
+    }
+
+    #[test]
+    fn terminal_watcher_abort_timeout_defaults_to_disabled() {
+        let conf = SpdkConf::default();
+        assert_eq!(conf.terminal_watcher_abort_timeout_str, "");
+        assert_eq!(conf.terminal_watcher_abort_timeout_ms, 0);
+    }
+
+    #[test]
+    fn terminal_watcher_abort_timeout_parses_from_toml() {
+        let toml_str = r#"
+            enabled = true
+            terminal_watcher_abort_timeout = "2s"
+        "#;
+        let mut conf: SpdkConf = toml::from_str(toml_str).unwrap();
+        assert_eq!(conf.terminal_watcher_abort_timeout_str, "2s");
+        assert_eq!(
+            conf.terminal_watcher_abort_timeout_ms, 0,
+            "not parsed until init()"
+        );
+
+        conf.init().unwrap();
+        assert_eq!(conf.terminal_watcher_abort_timeout_ms, 2_000);
+    }
+
+    #[test]
+    fn terminal_watcher_abort_timeout_absent_stays_disabled_after_init() {
+        let mut conf = SpdkConf {
+            enabled: true,
+            hugepage_str: "1024MB".to_string(),
+            targets: vec![],
+            ..SpdkConf::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.terminal_watcher_abort_timeout_ms, 0);
     }
 }

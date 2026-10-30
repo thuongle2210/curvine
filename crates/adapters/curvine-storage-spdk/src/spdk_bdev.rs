@@ -232,6 +232,11 @@ pub struct SpdkBdev {
     /// to dead. `0` = disabled (watcher waits forever, preserving prior
     /// behavior). See `spawn_terminal_watcher`.
     terminal_watcher_watchdog_ms: u64,
+    /// Bounded wait for a targeted NVMe Abort of just the stuck command,
+    /// tried before `terminal_watcher_watchdog_ms`'s qpair-wide escalation.
+    /// `0` = disabled (skip straight to the qpair-wide watchdog). See
+    /// `spawn_terminal_watcher`.
+    terminal_watcher_abort_timeout_ms: u64,
 }
 
 // SAFETY: owns qpair and DMA buffers exclusively
@@ -328,6 +333,7 @@ impl SpdkBdev {
             };
             let io_timeout_ms = info.io_timeout_ms;
             let terminal_watcher_watchdog_ms = info.terminal_watcher_watchdog_ms;
+            let terminal_watcher_abort_timeout_ms = info.terminal_watcher_abort_timeout_ms;
             Ok(Self {
                 name: name.to_string(),
                 size,
@@ -348,6 +354,7 @@ impl SpdkBdev {
                 block_extent_size: 0,
                 terminal_tx: env.terminal_event_sender(),
                 terminal_watcher_watchdog_ms,
+                terminal_watcher_abort_timeout_ms,
             })
         }
     }
@@ -391,38 +398,72 @@ impl SpdkBdev {
         let bdev_offset = self.block_bdev_offset;
         let size = self.block_extent_size;
         let tx = self.terminal_tx.clone();
-        // Raw pointers aren't `Send`; carry the qpair identity as a plain
-        // integer across the thread boundary and reconstruct it inside the
+        // Raw pointers aren't `Send`; carry identities as plain integers
+        // across the thread boundary and reconstruct them inside the
         // closure, same as how qpair identity is already treated as a
         // `usize` key elsewhere (e.g. `spdk_poller.rs`'s `qpair_state` map).
         let qpair_key = self.io_channel.qpair as usize;
+        let ctrlr_key = self.ctrlr as usize;
         let watchdog_ms = self.terminal_watcher_watchdog_ms;
+        let abort_timeout_ms = self.terminal_watcher_abort_timeout_ms;
         std::thread::spawn(move || {
             let status = if watchdog_ms == 0 {
                 // Disabled: preserve the original unbounded-wait behavior.
                 completion.wait(0)
             } else {
-                let watchdog_us = watchdog_ms.saturating_mul(1000);
-                let first = completion.wait(watchdog_us);
-                if first == -libc::ETIMEDOUT {
-                    warn!(
-                        "terminal watcher for block {} exceeded its {}ms watchdog with no \
-                         qpair-level failure detected; escalating qpair to dead",
-                        block_id, watchdog_ms
-                    );
-                    if let Some(env) = crate::spdk_env::SpdkEnv::global() {
-                        let qpair = qpair_key as *mut crate::spdk_ffi::spdk_nvme_qpair;
-                        let _ = env.escalate_qpair_from_poller(qpair);
+                // Sentinel: if the abort tier below is disabled or skipped,
+                // this makes the watchdog-wait block run unconditionally,
+                // exactly matching the single-wait behavior from before
+                // this tier existed.
+                let mut status = -libc::ETIMEDOUT;
+
+                if abort_timeout_ms != 0 {
+                    let abort_us = abort_timeout_ms.saturating_mul(1000);
+                    status = completion.wait(abort_us);
+                    if status == -libc::ETIMEDOUT {
+                        warn!(
+                            "block {} exceeded its {}ms abort-timeout with no qpair-level \
+                             failure detected; attempting a targeted NVMe abort of just \
+                             this command before falling back to qpair-wide escalation",
+                            block_id, abort_timeout_ms
+                        );
+                        if let Some(env) = crate::spdk_env::SpdkEnv::global() {
+                            let ctrlr = ctrlr_key as *mut crate::spdk_ffi::spdk_nvme_ctrlr;
+                            let qpair = qpair_key as *mut crate::spdk_ffi::spdk_nvme_qpair;
+                            let _ = env.abort_command_from_poller(ctrlr, qpair, completion.clone());
+                        }
+                        // The abort attempt (if it ran) is asynchronous —
+                        // its outcome arrives via the target's own
+                        // completion, not here. Fall through to the
+                        // watchdog-wait tier below to give it a chance to
+                        // land before escalating the whole qpair.
                     }
-                    // Escalation (if it ran) already force-completed this
-                    // exact completion via the poller; this returns
-                    // immediately. If escalation couldn't run (no global
-                    // env, e.g. mid-shutdown), this falls back to waiting
-                    // indefinitely, same as the watchdog-disabled path.
-                    completion.wait(0)
-                } else {
-                    first
                 }
+
+                if status == -libc::ETIMEDOUT {
+                    let watchdog_us = watchdog_ms.saturating_mul(1000);
+                    status = completion.wait(watchdog_us);
+                    if status == -libc::ETIMEDOUT {
+                        warn!(
+                            "terminal watcher for block {} exceeded its {}ms watchdog with no \
+                             qpair-level failure detected; escalating qpair to dead",
+                            block_id, watchdog_ms
+                        );
+                        if let Some(env) = crate::spdk_env::SpdkEnv::global() {
+                            let qpair = qpair_key as *mut crate::spdk_ffi::spdk_nvme_qpair;
+                            let _ = env.escalate_qpair_from_poller(qpair);
+                        }
+                        // Escalation (if it ran) already force-completed
+                        // this exact completion via the poller; this
+                        // returns immediately. If escalation couldn't run
+                        // (no global env, e.g. mid-shutdown), this falls
+                        // back to waiting indefinitely, same as the
+                        // watchdog-disabled path.
+                        status = completion.wait(0);
+                    }
+                }
+
+                status
             };
             let _ = tx.send(crate::spdk_env::SpdkCommandTerminalEvent {
                 block_id,
@@ -1131,6 +1172,7 @@ mod test {
             block_extent_size: 0,
             terminal_tx: crossbeam::channel::unbounded().0,
             terminal_watcher_watchdog_ms: 0,
+            terminal_watcher_abort_timeout_ms: 0,
         })
     }
 
@@ -1340,6 +1382,7 @@ mod test {
             block_extent_size: 0,
             terminal_tx: crossbeam::channel::unbounded().0,
             terminal_watcher_watchdog_ms: 0,
+            terminal_watcher_abort_timeout_ms: 0,
         };
         (bdev, rx)
     }
@@ -1498,6 +1541,54 @@ mod test {
         assert_eq!(event.block_id, 42);
         assert_eq!(event.bdev_offset, 1000);
         assert_eq!(event.size, 4096);
+        assert!(event.success);
+
+        std::mem::forget(bdev);
+    }
+
+    /// With both the abort tier and the qpair-escalation watchdog enabled,
+    /// the watcher thread must still correctly report the real late
+    /// completion once it arrives — exercising the full tier chain
+    /// (`IoOp::AbortCommand` -> `IoOp::EscalateQpair`) end-to-end against
+    /// the real, live poller thread (not a mock), for a qpair this poller
+    /// never actually registered (the fake-channel harness bypasses real
+    /// submission). Both tiers correctly resolve to `NotFound`/no-op for
+    /// this qpair without panicking, deadlocking, or double-completing —
+    /// proving the new message-passing wiring is sound even though the
+    /// true "abort finds and cancels a real in-flight command" happy path
+    /// can't be deterministically raced in a unit test.
+    #[test]
+    fn spdk_write_timeout_with_abort_tier_enabled_still_reports_late_completion() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        bdev.set_block_identity(42, 1000, 4096);
+        bdev.terminal_watcher_abort_timeout_ms = 1;
+        bdev.terminal_watcher_watchdog_ms = 50;
+        let (term_tx, term_rx) = crossbeam::channel::unbounded();
+        bdev.terminal_tx = term_tx;
+
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should time out");
+        assert!(err.to_string().contains("NVMe write failed"), "{}", err);
+
+        let req = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("write should have submitted exactly once");
+
+        // Give the watcher thread's abort tier and watchdog tier both a
+        // chance to run against the real poller thread before we complete
+        // this ourselves — this qpair (0x1234) was never registered with
+        // the real poller, so both tiers must resolve to a safe no-op
+        // (NotFound / unknown-qpair ack) rather than panicking or hanging.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Simulate the real SPDK callback finally firing.
+        assert!(req.completion.complete(0), "first completion call must win");
+
+        let event = term_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("terminal event must still be reported once the real completion arrives");
+        assert_eq!(event.block_id, 42);
         assert!(event.success);
 
         std::mem::forget(bdev);

@@ -140,4 +140,20 @@ extern "C" {
         cb: curvine_async_cb,
         cb_arg: *mut c_void,
     );
+
+    /// Abort a specific previously-submitted command, matched by the
+    /// callback argument it was originally submitted with (not a numeric
+    /// CID). Must be called on the same thread that owns `qpair`'s
+    /// completions (the poller thread), per SPDK's single-thread-per-qpair
+    /// rule. Returns 0 if the abort request was itself successfully
+    /// submitted — that does NOT mean the target command was actually
+    /// aborted, only that the abort request was accepted; its outcome
+    /// (and the target command's own eventual completion) arrive
+    /// separately via each command's own callback.
+    pub fn curvine_spdk_ctrlr_abort_cmd(
+        ctrlr: *mut spdk_nvme_ctrlr,
+        qpair: *mut spdk_nvme_qpair,
+        cmd_cb_arg: *mut c_void,
+        ctx: *mut curvine_async_ctx,
+    ) -> c_int;
 }
