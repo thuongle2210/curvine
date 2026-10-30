@@ -56,6 +56,39 @@ pub struct HeartbeatTask {
     /// `WorkerConf::spdk_quarantine_proof_stuck_max_retries`.
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
     pub(crate) quarantine_proof_stuck_max_retries: u32,
+    /// Flag the SPDK poller thread as stalled after this many consecutive
+    /// heartbeat ticks with no observed progress. `0` = disabled. See
+    /// `WorkerConf::spdk_poller_stall_max_ticks` and
+    /// `check_spdk_poller_liveness`.
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) spdk_poller_stall_max_ticks: u32,
+    /// Tracking state for the poller-liveness check, across ticks.
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) poller_liveness: Mutex<PollerLivenessState>,
+}
+
+/// Tracking state for `check_poller_liveness`, carried across heartbeat
+/// ticks. `last_progress` is the poller's progress counter as last
+/// observed; `stalled_ticks` counts consecutive ticks with no change;
+/// `alerted` ensures the "newly detected" log/metric transition fires
+/// only once per stall episode, not on every tick while it persists.
+#[derive(Default)]
+pub(crate) struct PollerLivenessState {
+    pub(crate) last_progress: u64,
+    pub(crate) stalled_ticks: u32,
+    pub(crate) alerted: bool,
+}
+
+/// Outcome of one `check_poller_liveness` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollerLivenessOutcome {
+    /// Progress observed since last tick, or the check is disabled, or
+    /// still below the stall threshold.
+    Healthy,
+    /// Just crossed the stall threshold this tick — log/alert once.
+    StalledNewlyDetected,
+    /// Already past the threshold on a previous tick; still stalled.
+    StalledContinuing,
 }
 
 impl HeartbeatTask {
@@ -179,6 +212,99 @@ impl HeartbeatTask {
     #[cfg(not(feature = "spdk"))]
     fn process_quarantine_terminal_events(&self) {}
 
+    /// Check whether the SPDK poller thread itself is still making
+    /// progress. This is the one failure mode nothing else in the SPDK
+    /// adapter can recover from: every other recovery path
+    /// (`force_complete_qpair`, the terminal-watcher escalation, the
+    /// deferred-qpair retry) works by sending the poller a message and
+    /// waiting for it to process it — if the poller thread itself is
+    /// dead/hung, all of those are equally powerless. Detection only:
+    /// this does not attempt any automatic recovery, only surfaces a
+    /// metric and an error log so an operator can intervene.
+    #[cfg(feature = "spdk")]
+    fn check_spdk_poller_liveness(&self) {
+        if self.spdk_poller_stall_max_ticks == 0 {
+            return;
+        }
+        let Some(env) = curvine_storage_spdk::SpdkEnv::global() else {
+            return;
+        };
+        let current_progress = env.poller_progress();
+        let mut state = match self.poller_liveness.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match Self::check_poller_liveness(
+            current_progress,
+            &mut state,
+            self.spdk_poller_stall_max_ticks,
+        ) {
+            PollerLivenessOutcome::Healthy => {
+                if let Ok(metrics) = Worker::get_metrics() {
+                    metrics.spdk_poller_stalled.set(0);
+                }
+            }
+            PollerLivenessOutcome::StalledNewlyDetected => {
+                error!(
+                    "SPDK poller thread appears stalled: its liveness counter has not \
+                     advanced for {} consecutive heartbeat ticks (threshold={}). This \
+                     cannot self-heal — every recovery path requires sending the poller \
+                     a message and waiting for it to process it. Manual intervention \
+                     required (restart the worker process).",
+                    state.stalled_ticks, self.spdk_poller_stall_max_ticks
+                );
+                if let Ok(metrics) = Worker::get_metrics() {
+                    metrics.spdk_poller_stalled.set(1);
+                }
+            }
+            PollerLivenessOutcome::StalledContinuing => {
+                if let Ok(metrics) = Worker::get_metrics() {
+                    metrics.spdk_poller_stalled.set(1);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "spdk"))]
+    fn check_spdk_poller_liveness(&self) {}
+
+    /// Core liveness-check logic, independent of the SPDK poller's real
+    /// counter so it can be unit tested without a real device. `0` for
+    /// `stall_max_ticks` disables the check (always `Healthy`, tracking
+    /// state still updated so a later non-zero threshold starts clean).
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) fn check_poller_liveness(
+        current_progress: u64,
+        state: &mut PollerLivenessState,
+        stall_max_ticks: u32,
+    ) -> PollerLivenessOutcome {
+        if stall_max_ticks == 0 {
+            state.last_progress = current_progress;
+            state.stalled_ticks = 0;
+            state.alerted = false;
+            return PollerLivenessOutcome::Healthy;
+        }
+
+        if current_progress != state.last_progress {
+            state.last_progress = current_progress;
+            state.stalled_ticks = 0;
+            state.alerted = false;
+            return PollerLivenessOutcome::Healthy;
+        }
+
+        state.stalled_ticks = state.stalled_ticks.saturating_add(1);
+        if state.stalled_ticks < stall_max_ticks {
+            return PollerLivenessOutcome::Healthy;
+        }
+
+        if state.alerted {
+            PollerLivenessOutcome::StalledContinuing
+        } else {
+            state.alerted = true;
+            PollerLivenessOutcome::StalledNewlyDetected
+        }
+    }
+
     /// Core retry logic, independent of the SPDK event source so it can be
     /// unit tested without a real device. Extends `pending` with
     /// `new_proofs`, then retries every pending proof once:
@@ -290,6 +416,7 @@ impl LoopTask for HeartbeatTask {
 
     fn run(&self) -> FsResult<()> {
         self.process_quarantine_terminal_events();
+        self.check_spdk_poller_liveness();
 
         // Perform heartbeat sending.
         let info = match self.store.get_and_check_storages() {
@@ -551,5 +678,87 @@ mod tests {
             "a persistently NotYetQuarantined proof must be dropped once it exceeds the stuck cap"
         );
         Ok(())
+    }
+
+    use super::{PollerLivenessOutcome, PollerLivenessState};
+
+    #[test]
+    fn poller_liveness_disabled_by_default_is_always_healthy() {
+        let mut state = PollerLivenessState::default();
+        // Same progress value every tick, cap=0 (disabled) — must never flag.
+        for _ in 0..10 {
+            let outcome = HeartbeatTask::check_poller_liveness(42, &mut state, 0);
+            assert_eq!(outcome, PollerLivenessOutcome::Healthy);
+        }
+    }
+
+    #[test]
+    fn poller_liveness_healthy_while_progress_counter_keeps_advancing() {
+        let mut state = PollerLivenessState::default();
+        for tick in 0..20u64 {
+            // Advances every tick — never stalls, regardless of cap.
+            let outcome = HeartbeatTask::check_poller_liveness(tick, &mut state, 3);
+            assert_eq!(outcome, PollerLivenessOutcome::Healthy);
+        }
+    }
+
+    #[test]
+    fn poller_liveness_flags_newly_detected_exactly_once_then_continuing() {
+        let mut state = PollerLivenessState::default();
+        let stall_max_ticks = 3u32;
+
+        // Prime the baseline: the first observation of any value is always
+        // treated as "progress" (nothing to compare against yet).
+        let primed = HeartbeatTask::check_poller_liveness(7, &mut state, stall_max_ticks);
+        assert_eq!(primed, PollerLivenessOutcome::Healthy);
+
+        // Progress counter frozen at 7 forever from here on (simulated dead poller).
+        for tick in 1..stall_max_ticks {
+            let outcome = HeartbeatTask::check_poller_liveness(7, &mut state, stall_max_ticks);
+            assert_eq!(
+                outcome,
+                PollerLivenessOutcome::Healthy,
+                "must stay healthy before reaching the stall threshold (tick {tick})"
+            );
+        }
+
+        let outcome = HeartbeatTask::check_poller_liveness(7, &mut state, stall_max_ticks);
+        assert_eq!(
+            outcome,
+            PollerLivenessOutcome::StalledNewlyDetected,
+            "must fire exactly once on the tick that crosses the threshold"
+        );
+
+        // Still frozen — must report "continuing", not "newly detected" again.
+        for _ in 0..5 {
+            let outcome = HeartbeatTask::check_poller_liveness(7, &mut state, stall_max_ticks);
+            assert_eq!(outcome, PollerLivenessOutcome::StalledContinuing);
+        }
+    }
+
+    #[test]
+    fn poller_liveness_recovers_once_progress_resumes() {
+        let mut state = PollerLivenessState::default();
+        let stall_max_ticks = 2u32;
+
+        // Prime the baseline, then stall long enough to be flagged.
+        HeartbeatTask::check_poller_liveness(1, &mut state, stall_max_ticks);
+        HeartbeatTask::check_poller_liveness(1, &mut state, stall_max_ticks);
+        let outcome = HeartbeatTask::check_poller_liveness(1, &mut state, stall_max_ticks);
+        assert_eq!(outcome, PollerLivenessOutcome::StalledNewlyDetected);
+
+        // Progress resumes (poller was just slow, not dead) — must clear
+        // back to Healthy, and a subsequent fresh stall must re-alert
+        // (not suppressed by the earlier `alerted` flag).
+        let outcome = HeartbeatTask::check_poller_liveness(2, &mut state, stall_max_ticks);
+        assert_eq!(outcome, PollerLivenessOutcome::Healthy);
+
+        HeartbeatTask::check_poller_liveness(2, &mut state, stall_max_ticks);
+        let outcome = HeartbeatTask::check_poller_liveness(2, &mut state, stall_max_ticks);
+        assert_eq!(
+            outcome,
+            PollerLivenessOutcome::StalledNewlyDetected,
+            "a second, independent stall episode must re-alert"
+        );
     }
 }

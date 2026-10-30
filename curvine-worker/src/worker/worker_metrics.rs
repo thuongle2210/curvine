@@ -54,6 +54,13 @@ pub struct WorkerMetrics {
     /// See `HeartbeatTask::retry_pending_quarantine_proofs`.
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
     pub(crate) spdk_quarantine_proof_dropped: Counter,
+
+    /// `1` if the SPDK poller thread's liveness counter has not advanced
+    /// for `spdk_poller_stall_max_ticks` consecutive heartbeat ticks, `0`
+    /// otherwise. Detection only — this failure mode has no automatic
+    /// recovery. See `HeartbeatTask::check_spdk_poller_liveness`.
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) spdk_poller_stalled: Gauge,
 }
 
 impl WorkerMetrics {
@@ -116,6 +123,11 @@ impl WorkerMetrics {
             spdk_quarantine_proof_dropped: m::new_counter(
                 "spdk_quarantine_proof_dropped",
                 "Quarantine-release proofs given up on after exceeding their retry cap",
+            )?,
+            spdk_poller_stalled: m::new_gauge(
+                "spdk_poller_stalled",
+                "1 if the SPDK poller thread's liveness counter has not advanced for the \
+                 configured number of heartbeat ticks (no automatic recovery), 0 otherwise",
             )?,
         };
 

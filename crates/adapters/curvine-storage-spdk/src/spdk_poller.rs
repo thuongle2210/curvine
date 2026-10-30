@@ -16,7 +16,7 @@ use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -380,7 +380,20 @@ pub struct SpdkPoller {
 
 impl SpdkPoller {
     /// Spawn a new poller thread with the given config.
-    pub(crate) fn start(config: PollerConfig, retired: Arc<RetiredQpairRegistry>) -> Self {
+    ///
+    /// `progress` is a liveness counter the poller thread increments once
+    /// per outer loop iteration (regardless of whether there was work to
+    /// do), so an external watcher (see `HeartbeatTask`'s poller-liveness
+    /// check) can detect "the poller thread itself is no longer making
+    /// progress" — a failure mode nothing else in this file can recover
+    /// from, since every other recovery path (`force_complete_qpair`,
+    /// `escalate_qpair`, `resolve_deferred_qpairs`) requires sending the
+    /// poller a message and waiting for it to process it.
+    pub(crate) fn start(
+        config: PollerConfig,
+        retired: Arc<RetiredQpairRegistry>,
+        progress: Arc<AtomicU64>,
+    ) -> Self {
         let (tx, rx) = crossbeam::channel::unbounded::<IoRequest>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -403,6 +416,7 @@ impl SpdkPoller {
                     eventfd_raw,
                     config,
                     retired,
+                    progress,
                 );
             })
             .expect("Failed to spawn SPDK poller thread");
@@ -587,6 +601,7 @@ impl SpdkPoller {
         eventfd: RawFd,
         mut config: PollerConfig,
         retired: Arc<RetiredQpairRegistry>,
+        progress: Arc<AtomicU64>,
     ) {
         let mut active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
@@ -603,6 +618,13 @@ impl SpdkPoller {
         // Poll interval for keep-alive check (parameterized to detect disconnects)
         let poll_interval = config.poll_interval_ms as i32;
         loop {
+            // Liveness heartbeat: incremented every outer-loop iteration,
+            // regardless of whether there was work to do, so an external
+            // watcher can detect "this thread stopped iterating entirely"
+            // (e.g. deadlock, infinite loop in a single iteration, crashed
+            // without unwinding) as distinct from "idle, no work."
+            progress.fetch_add(1, Ordering::Relaxed);
+
             // Check shutdown first
             if Self::should_exit_on_shutdown(&shutdown, rx.is_empty(), &qpair_state) {
                 break;
@@ -2253,7 +2275,7 @@ mod test {
             io_queue_depth: 8,
             ctrlrs: Vec::new(),
         };
-        let poller = SpdkPoller::start(config, retired);
+        let poller = SpdkPoller::start(config, retired, Arc::new(AtomicU64::new(0)));
         let ctrlr = CtrlHandle(0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr);
 
         let result = poller.unregister_ctrlr(ctrlr);
@@ -2270,7 +2292,7 @@ mod test {
             io_queue_depth: 8,
             ctrlrs: Vec::new(),
         };
-        let mut poller = SpdkPoller::start(config, retired);
+        let mut poller = SpdkPoller::start(config, retired, Arc::new(AtomicU64::new(0)));
         poller.stop();
         let ctrlr = CtrlHandle(0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr);
 

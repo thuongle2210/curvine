@@ -207,6 +207,20 @@ pub struct WorkerConf {
     /// cap, preserving infinite retry.
     pub spdk_quarantine_proof_stuck_max_retries: u32,
 
+    /// Give up waiting and flag the SPDK poller thread as stalled after
+    /// this many consecutive heartbeat ticks with no observed progress
+    /// (its internal liveness counter unchanged since the last tick).
+    /// `0` (default) disables the check entirely. This detects the one
+    /// failure mode nothing else can recover from — a genuinely dead/hung
+    /// poller thread, as opposed to a merely slow one — since every
+    /// recovery path (force-completing a qpair, escalating a stuck
+    /// watcher, retrying a deferred qpair unregister) requires sending
+    /// the poller a message and waiting for it to process it. Detection
+    /// only: there is no automatic recovery, this only surfaces a metric
+    /// and an error log so an operator can intervene (restart the worker
+    /// process).
+    pub spdk_poller_stall_max_ticks: u32,
+
     /// Version compatibility policy applied to client peers on data-plane
     /// connections (diagnose by default; enforce only when explicitly
     /// configured). `min_worker_version` is ignored for a worker; the client
@@ -260,6 +274,7 @@ impl Default for WorkerConf {
             spdk_disk: SpdkConf::default(),
             spdk_quarantine_proof_max_retries: 0,
             spdk_quarantine_proof_stuck_max_retries: 0,
+            spdk_poller_stall_max_ticks: 0,
             compatibility: CompatibilityConf::default(),
         }
     }
@@ -333,5 +348,32 @@ data_dir = ["[SSD]/data/data1"]
         let conf: WorkerConf = toml::from_str(toml).unwrap();
         assert_eq!(conf.spdk_quarantine_proof_max_retries, 0);
         assert_eq!(conf.spdk_quarantine_proof_stuck_max_retries, 0);
+    }
+
+    #[test]
+    fn spdk_poller_stall_max_ticks_defaults_to_disabled() {
+        let conf = WorkerConf::default();
+        assert_eq!(conf.spdk_poller_stall_max_ticks, 0);
+    }
+
+    #[test]
+    fn spdk_poller_stall_max_ticks_parses_from_toml() {
+        let toml = r#"
+dir_reserved = "0"
+data_dir = ["[SSD]/data/data1"]
+spdk_poller_stall_max_ticks = 5
+"#;
+        let conf: WorkerConf = toml::from_str(toml).unwrap();
+        assert_eq!(conf.spdk_poller_stall_max_ticks, 5);
+    }
+
+    #[test]
+    fn spdk_poller_stall_max_ticks_absent_defaults_to_disabled() {
+        let toml = r#"
+dir_reserved = "0"
+data_dir = ["[SSD]/data/data1"]
+"#;
+        let conf: WorkerConf = toml::from_str(toml).unwrap();
+        assert_eq!(conf.spdk_poller_stall_max_ticks, 0);
     }
 }
