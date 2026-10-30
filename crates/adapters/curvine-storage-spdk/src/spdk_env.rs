@@ -725,6 +725,10 @@ pub struct BdevInfo {
     pub ctrlr: usize,       // raw pointer for SpdkBdev
     pub ns: usize,          // raw pointer for SpdkBdev
     pub io_timeout_ms: u64, // per-target I/O timeout in ms
+    /// Extra bounded wait a timeout-watcher thread gives a stuck command
+    /// before proactively declaring its qpair dead. `0` = disabled (watcher
+    /// waits forever). See `SpdkConf::terminal_watcher_watchdog_ms`.
+    pub terminal_watcher_watchdog_ms: u64,
 }
 
 struct RetiredDma {
@@ -1890,6 +1894,24 @@ impl SpdkEnv {
         }
     }
 
+    /// Proactively declare `qpair` dead via the poller, blocking until
+    /// acknowledged. Called by a timeout-watcher thread
+    /// (`SpdkBdev::spawn_terminal_watcher`) after its own watchdog deadline
+    /// elapses on a qpair that never reported an error. Reuses
+    /// `force_complete_qpair` on the poller thread, the same safe path a
+    /// real transport failure already takes.
+    pub(crate) fn escalate_qpair_from_poller(
+        &self,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) -> UnregisterResult {
+        let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(poller) = poller.as_ref() {
+            poller.escalate_qpair(qpair)
+        } else {
+            UnregisterResult::Disconnected
+        }
+    }
+
     pub(crate) fn unregister_ctrlr_from_poller(&self, ctrlr: CtrlHandle) -> UnregisterResult {
         #[cfg(test)]
         if let Some(hook) = &self.test_hooks.unregister_ctrlr {
@@ -2120,6 +2142,7 @@ impl SpdkEnv {
                     ctrlr: ctrlr as usize,
                     ns: ns as usize,
                     io_timeout_ms,
+                    terminal_watcher_watchdog_ms: self.conf.terminal_watcher_watchdog_ms,
                 });
             }
             if bdevs.is_empty() {
@@ -2280,6 +2303,7 @@ mod test {
             ctrlr,
             ns: ctrlr + 0x1000,
             io_timeout_ms: 1000,
+            terminal_watcher_watchdog_ms: 0,
         });
         env.controllers.push(ControllerEntry {
             target_idx,
@@ -2498,6 +2522,7 @@ mod test {
             ctrlr: 0x1000,
             ns: 0x2000,
             io_timeout_ms: 1000,
+            terminal_watcher_watchdog_ms: 0,
         });
         env.bdevs.push(BdevInfo {
             name: "nvme-b".into(),
@@ -2508,6 +2533,7 @@ mod test {
             ctrlr: 0x3000,
             ns: 0x4000,
             io_timeout_ms: 1000,
+            terminal_watcher_watchdog_ms: 0,
         });
         env.controllers.push(ControllerEntry {
             target_idx: 0,
@@ -3540,6 +3566,7 @@ mod test {
             ctrlr,
             ns: 0,
             io_timeout_ms: 0,
+            terminal_watcher_watchdog_ms: 0,
         });
         env.qpair_pool.register_limit(ctrlr, 1);
         assert_eq!(
@@ -3632,6 +3659,7 @@ mod test {
             ctrlr,
             ns: 0,
             io_timeout_ms: 0,
+            terminal_watcher_watchdog_ms: 0,
         });
         env.qpair_pool.register_limit(ctrlr, 1);
         assert_eq!(
