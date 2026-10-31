@@ -60,6 +60,21 @@ impl PendingQuarantineProof {
             true
         }
     }
+
+    /// Shared bookkeeping for every path that permanently gives up on a
+    /// proof (`NotYetQuarantined` past its cap, `Stale`, or `Err` past its
+    /// cap): increments `spdk_quarantine_proof_dropped`, and clears
+    /// `spdk_quarantine_proof_stuck` if this proof had previously been
+    /// flagged as stuck. Call this exactly once, right before returning
+    /// `false` from the `retain_mut` closure for a proof being dropped.
+    fn record_dropped(&self) {
+        if let Ok(metrics) = Worker::get_metrics() {
+            metrics.spdk_quarantine_proof_dropped.inc();
+            if self.warned {
+                metrics.spdk_quarantine_proof_stuck.dec();
+            }
+        }
+    }
 }
 
 pub struct HeartbeatTask {
@@ -318,12 +333,7 @@ impl HeartbeatTask {
                             p.proof.bdev_offset,
                             p.proof.size
                         );
-                        if let Ok(metrics) = Worker::get_metrics() {
-                            metrics.spdk_quarantine_proof_dropped.inc();
-                            if p.warned {
-                                metrics.spdk_quarantine_proof_stuck.dec();
-                            }
-                        }
+                        p.record_dropped();
                         false
                     } else {
                         true
@@ -345,12 +355,7 @@ impl HeartbeatTask {
                          released was already resolved through some other path",
                         p.proof.block_id, p.proof.bdev_offset, p.proof.size
                     );
-                    if let Ok(metrics) = Worker::get_metrics() {
-                        metrics.spdk_quarantine_proof_dropped.inc();
-                        if p.warned {
-                            metrics.spdk_quarantine_proof_stuck.dec();
-                        }
-                    }
+                    p.record_dropped();
                     false
                 }
                 Err(e) => {
@@ -367,12 +372,7 @@ impl HeartbeatTask {
                         );
                     }
                     if store_err_max_retries != 0 && p.attempts >= store_err_max_retries {
-                        if let Ok(metrics) = Worker::get_metrics() {
-                            metrics.spdk_quarantine_proof_dropped.inc();
-                            if p.warned {
-                                metrics.spdk_quarantine_proof_stuck.dec();
-                            }
-                        }
+                        p.record_dropped();
                         false
                     } else {
                         true
@@ -848,5 +848,63 @@ mod tests {
                 "must not log again on subsequent occurrences (iteration {i})"
             );
         }
+    }
+
+    #[test]
+    fn record_dropped_always_increments_counter_and_conditionally_clears_gauge() -> CommonResult<()>
+    {
+        let _store = test_store("record-dropped")?;
+        let _guard = GAUGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let metrics = Worker::get_metrics()?;
+        let counter_before = metrics.spdk_quarantine_proof_dropped.get();
+        let gauge_before = metrics.spdk_quarantine_proof_stuck.get();
+
+        // Not previously warned: counter increments, gauge untouched.
+        let not_warned = PendingQuarantineProof {
+            proof: QuarantineReleaseProof {
+                block_id: 1,
+                bdev_offset: 0,
+                size: 4096,
+            },
+            attempts: 1,
+            warned: false,
+            err_warned: false,
+        };
+        not_warned.record_dropped();
+        assert_eq!(
+            metrics.spdk_quarantine_proof_dropped.get(),
+            counter_before + 1
+        );
+        assert_eq!(
+            metrics.spdk_quarantine_proof_stuck.get(),
+            gauge_before,
+            "gauge must be untouched when the dropped proof was never warned"
+        );
+
+        // Previously warned: counter increments again, AND the gauge
+        // (which the caller is assumed to have already incremented when
+        // the proof was first warned) is cleared back down by exactly 1.
+        metrics.spdk_quarantine_proof_stuck.inc(); // simulate the earlier warn-time increment
+        let warned = PendingQuarantineProof {
+            proof: QuarantineReleaseProof {
+                block_id: 2,
+                bdev_offset: 4096,
+                size: 4096,
+            },
+            attempts: 1,
+            warned: true,
+            err_warned: false,
+        };
+        warned.record_dropped();
+        assert_eq!(
+            metrics.spdk_quarantine_proof_dropped.get(),
+            counter_before + 2
+        );
+        assert_eq!(
+            metrics.spdk_quarantine_proof_stuck.get(),
+            gauge_before,
+            "gauge must be cleared back down when the dropped proof had been warned"
+        );
+        Ok(())
     }
 }
