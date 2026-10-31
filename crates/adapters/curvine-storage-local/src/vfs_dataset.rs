@@ -601,6 +601,17 @@ impl VfsDataset {
 
     /// Total physical bytes held by `Quarantined` blocks, for the
     /// `spdk_quarantined_bytes` metric and admission control.
+    // TODO: O(total_blocks) full scan on every call -- this runs on the
+    // open_block hot path (under the single global dataset write lock)
+    // whenever spdk_quarantine_limit is enabled, and scales with the
+    // worker's entire block inventory, not just the quarantined subset.
+    // Convert to an incrementally-maintained running counter instead:
+    // +=physical_bytes() in abort_block_uncertain() (the only place a
+    // block transitions into Quarantined), -=physical_bytes() in
+    // remove_block_by_id() (the single low-level removal primitive used
+    // by both release_quarantined_block_with_proof and remove_block),
+    // plus a one-time computation in initialize() to seed it at startup.
+    // Verified no other mutation path touches quarantined metadata.
     pub fn quarantined_bytes(&self) -> i64 {
         self.meta
             .all_blocks()
