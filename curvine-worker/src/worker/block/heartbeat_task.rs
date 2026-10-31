@@ -37,6 +37,29 @@ pub(crate) struct PendingQuarantineProof {
     /// proof, and so the gauge can be correctly decremented whenever this
     /// proof eventually leaves the pending queue (released or dropped).
     pub(crate) warned: bool,
+    /// Set once a persistent store `Err` has been logged for this proof,
+    /// so repeated `Err` results on later ticks don't re-log every tick
+    /// (which would otherwise flood logs for as long as the underlying
+    /// store error persists, since `store_err_max_retries` defaults to
+    /// unlimited). `attempts`/the retry cap are still tracked and applied
+    /// normally regardless of this flag -- only the per-tick log line is
+    /// suppressed after the first occurrence.
+    pub(crate) err_warned: bool,
+}
+
+impl PendingQuarantineProof {
+    /// Returns `true` only the first time this is called for a given
+    /// proof; `false` on every subsequent call. Used to gate the
+    /// persistent-store-`Err` log line to a single occurrence per proof
+    /// instead of once per heartbeat tick.
+    fn should_log_store_err(&mut self) -> bool {
+        if self.err_warned {
+            false
+        } else {
+            self.err_warned = true;
+            true
+        }
+    }
 }
 
 pub struct HeartbeatTask {
@@ -224,7 +247,10 @@ impl HeartbeatTask {
     ///   a definitive answer about the proof itself, so it genuinely is
     ///   worth retrying a bounded number of times before giving up. Capped
     ///   at `store_err_max_retries`. If dropped while previously flagged as
-    ///   stuck, clears the gauge for it.
+    ///   stuck, clears the gauge for it. The warning log for this case is
+    ///   emitted only once per proof (see `PendingQuarantineProof::err_warned`),
+    ///   not every tick, since `store_err_max_retries` defaults to
+    ///   unlimited and a persistent error would otherwise flood logs.
     ///
     /// `0` for any of the three thresholds means disabled/unlimited
     /// (preserves infinite retry / no early warning).
@@ -246,6 +272,7 @@ impl HeartbeatTask {
             proof,
             attempts: 0,
             warned: false,
+            err_warned: false,
         }));
         if pending.is_empty() {
             return;
@@ -328,10 +355,17 @@ impl HeartbeatTask {
                 }
                 Err(e) => {
                     p.attempts += 1;
-                    warn!(
-                        "release_quarantined_block_with_proof failed for block {}: {}",
-                        p.proof.block_id, e
-                    );
+                    // Log only the first time this proof hits a store
+                    // error, not every heartbeat tick -- store_err_max_retries
+                    // defaults to unlimited, so without this guard a
+                    // persistent error would flood logs indefinitely at
+                    // the heartbeat interval.
+                    if p.should_log_store_err() {
+                        warn!(
+                            "release_quarantined_block_with_proof failed for block {}: {}",
+                            p.proof.block_id, e
+                        );
+                    }
                     if store_err_max_retries != 0 && p.attempts >= store_err_max_retries {
                         if let Ok(metrics) = Worker::get_metrics() {
                             metrics.spdk_quarantine_proof_dropped.inc();
@@ -493,6 +527,7 @@ mod tests {
             proof,
             attempts: 0,
             warned: false,
+            err_warned: false,
         }]);
         HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, 0, 0);
         assert!(pending.lock().unwrap().is_empty(), "first proof releases");
@@ -788,5 +823,30 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn should_log_store_err_fires_exactly_once_per_proof() {
+        let mut p = PendingQuarantineProof {
+            proof: QuarantineReleaseProof {
+                block_id: 1,
+                bdev_offset: 0,
+                size: 4096,
+            },
+            attempts: 0,
+            warned: false,
+            err_warned: false,
+        };
+
+        assert!(
+            p.should_log_store_err(),
+            "must log on the first occurrence of a store error"
+        );
+        for i in 0..20 {
+            assert!(
+                !p.should_log_store_err(),
+                "must not log again on subsequent occurrences (iteration {i})"
+            );
+        }
     }
 }
