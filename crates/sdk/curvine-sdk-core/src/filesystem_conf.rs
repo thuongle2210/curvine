@@ -120,6 +120,12 @@ pub struct FilesystemConf {
     /// Client-side Transfer routing only. Service-side store and scheduler settings remain
     /// owned by the Transfer process configuration.
     pub transfer: TransferClientConf,
+
+    // Forward-seek absorption window (byte-size string, e.g. "4MB"); "0"
+    // disables it. See ClientConf::seek_absorb_window for the preconditions
+    // (enable_smart_prefetch and read_chunk_num > 1) and side effects.
+    // Appended last: new public fields go at the end of the struct.
+    pub seek_absorb_window: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +164,9 @@ impl FilesystemConf {
             return err_box!("master_addrs can not be empty");
         }
         let log = LogConf::default();
+        // Derive the retry policy from the shared ClientConf defaults so a default
+        // change cannot leave this constructor on stale literals.
+        let rpc_defaults = ClientConf::default();
         Ok(Self {
             master_addrs: master_addrs.join(","),
             io_threads: 16,
@@ -166,6 +175,12 @@ impl FilesystemConf {
             conn_timeout_ms: 30_000,
             rpc_timeout_ms: 120_000,
             data_timeout_ms: 120_000,
+            conn_retry_max_duration_ms: rpc_defaults.conn_retry_max_duration_ms,
+            conn_retry_min_sleep_ms: rpc_defaults.conn_retry_min_sleep_ms,
+            conn_retry_max_sleep_ms: rpc_defaults.conn_retry_max_sleep_ms,
+            rpc_retry_max_duration_ms: rpc_defaults.rpc_retry_max_duration_ms,
+            rpc_retry_min_sleep_ms: rpc_defaults.rpc_retry_min_sleep_ms,
+            rpc_retry_max_sleep_ms: rpc_defaults.rpc_retry_max_sleep_ms,
             block_size: "128MB".to_string(),
             write_chunk_size: "128KB".to_string(),
             read_chunk_size: "128KB".to_string(),
@@ -183,6 +198,7 @@ impl FilesystemConf {
             block_conn_idle_time_ms: 30_000,
             small_file_size: "1MB".to_string(),
             large_file_size: "64MB".to_string(),
+            seek_absorb_window: "0".to_string(),
             log_level: log.level,
             log_dir: log.log_dir,
             log_file_name: log.file_name,
@@ -280,6 +296,14 @@ impl FilesystemConf {
             max_read_parallel: self.max_read_parallel,
             sequential_read_threshold: self.sequential_read_threshold,
 
+            // The derived FilesystemConf::default() leaves the string empty,
+            // which ClientConf::init() rejects; treat empty as "disabled".
+            seek_absorb_window_str: if self.seek_absorb_window.trim().is_empty() {
+                "0".to_string()
+            } else {
+                self.seek_absorb_window
+            },
+
             ..Default::default()
         };
 
@@ -314,6 +338,7 @@ impl FilesystemConf {
 #[cfg(test)]
 mod tests {
     use super::{FilesystemConf, TransferClientConf};
+    use curvine_config::ClientConf;
 
     #[test]
     fn default_master_conn_pool_size_is_one() {
@@ -322,6 +347,69 @@ mod tests {
 
         let cluster = conf.into_cluster_conf().unwrap();
         assert_eq!(cluster.client.master_conn_pool_size, 1);
+    }
+
+    #[test]
+    fn with_master_addrs_sets_default_retry_policy() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        let defaults = ClientConf::default();
+
+        assert_eq!(
+            cluster.client.conn_retry_max_duration_ms,
+            defaults.conn_retry_max_duration_ms
+        );
+        assert_eq!(
+            cluster.client.conn_retry_min_sleep_ms,
+            defaults.conn_retry_min_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.conn_retry_max_sleep_ms,
+            defaults.conn_retry_max_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_min_sleep_ms,
+            defaults.rpc_retry_min_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_max_sleep_ms,
+            defaults.rpc_retry_max_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_max_duration_ms,
+            defaults.rpc_retry_max_duration_ms
+        );
+    }
+
+    #[test]
+    fn explicit_retry_policy_is_not_replaced() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.rpc_retry_min_sleep_ms = 200;
+        conf.rpc_retry_max_sleep_ms = 1_500;
+        conf.rpc_retry_max_duration_ms = 30_000;
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert_eq!(cluster.client.rpc_retry_min_sleep_ms, 200);
+        assert_eq!(cluster.client.rpc_retry_max_sleep_ms, 1_500);
+        assert_eq!(cluster.client.rpc_retry_max_duration_ms, 30_000);
+    }
+
+    #[test]
+    fn maps_seek_absorb_window_into_client_conf() {
+        // An explicit value flows through to ClientConf and parses.
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.seek_absorb_window = "4MB".to_string();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.seek_absorb_window, 4 * 1024 * 1024);
+
+        // Unset (the derived default is an empty string) means disabled, not
+        // an init error.
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.seek_absorb_window = String::new();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.seek_absorb_window, 0);
     }
 
     #[test]

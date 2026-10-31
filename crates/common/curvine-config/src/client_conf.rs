@@ -14,7 +14,7 @@
 
 use crate::state::{StorageType, TtlAction};
 use curvine_common_macros::ClientCliArgs;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_net::net::InetAddr;
 use curvine_rpc::client::ClientConf as RpcConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
@@ -204,6 +204,20 @@ pub struct ClientConf {
     #[client_cli]
     pub clean_task_interval_ms: u64,
 
+    // Client session lease heartbeat interval, in milliseconds.
+    //
+    // Every client sends a `ClientHeartbeat` on this cadence so the master can
+    // tell a live client from a crashed one and reclaim what it owns (file locks,
+    // writer markers). Keep `master.client_session_timeout` at about 5x this
+    // value; the master enforces its own window and warns on a mismatch.
+    //
+    // 0 disables the heartbeat: this client then keeps the legacy
+    // `lock_expire_time` behaviour for its locks and nothing it owns is reclaimed
+    // when it crashes.
+    #[serde(alias = "heartbeat_interval")]
+    #[client_cli]
+    pub heartbeat_interval_ms: u64,
+
     #[client_cli]
     pub close_timeout_secs: u64,
 
@@ -262,6 +276,22 @@ pub struct ClientConf {
     // Sequential read check threshold
     #[client_cli]
     pub sequential_read_threshold: u64,
+
+    // Forward-seek absorption window size (bytes). When a forward seek lands within
+    // this distance of the prefetch buffer, the read is served from the buffer
+    // instead of discarding it. Default is 0 (disabled).
+    // Preconditions: absorption requires enable_smart_prefetch = true AND
+    // read_chunk_num > 1 (buffered lanes); with either missing the window is
+    // silently ignored and no seek is ever absorbed.
+    // Side effect: any non-zero window also changes Random-mode seeks to
+    // reposition only the base reader (lanes are drained once on the
+    // sequential->random flip and left idle until the pattern flips back),
+    // instead of repositioning every lane on every seek.
+    #[serde(skip)]
+    pub seek_absorb_window: i64,
+    #[serde(alias = "seek_absorb_window")]
+    #[client_cli]
+    pub seek_absorb_window_str: String,
 }
 
 impl ClientConf {
@@ -272,6 +302,14 @@ impl ClientConf {
     pub const DEFAULT_FILE_SYSTEM_MODE: u32 = 0o777;
 
     pub const DEFAULT_CLEAN_TASK_INTERVAL_MS: u64 = 60 * 1000;
+
+    /// Default client session heartbeat cadence: `master.client_session_timeout`
+    /// defaults to 60s, i.e. 5 missed heartbeats before a session expires.
+    pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 12 * 1000;
+
+    /// Lowest accepted heartbeat cadence; 0 means "disabled" rather than "as fast
+    /// as possible".
+    pub const MIN_HEARTBEAT_INTERVAL_MS: u64 = 100;
 
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
@@ -317,6 +355,9 @@ impl ClientConf {
             self.enable_read_ahead = false
         }
 
+        self.seek_absorb_window =
+            ByteUnit::from_str(&self.seek_absorb_window_str)?.as_byte() as i64;
+
         self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
 
         self.ttl_ms = DurationUnit::from_str(&self.ttl_ms_str)?.as_millis() as i64;
@@ -325,6 +366,18 @@ impl ClientConf {
 
         // Process smart prefetch configuration
         self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
+
+        // Keep 0 as the explicit "disabled" value instead of clamping it, but
+        // refuse a cadence that can only hammer the master.
+        if self.heartbeat_interval_ms > 0
+            && self.heartbeat_interval_ms < Self::MIN_HEARTBEAT_INTERVAL_MS
+        {
+            return err_box!(
+                "client.heartbeat_interval_ms must be 0 (disabled) or at least {}, got {}",
+                Self::MIN_HEARTBEAT_INTERVAL_MS,
+                self.heartbeat_interval_ms
+            );
+        }
 
         Ok(())
     }
@@ -404,7 +457,7 @@ impl Default for ClientConf {
 
             rpc_retry_max_duration_ms: 120 * 1000,
             rpc_retry_min_sleep_ms: 100,
-            rpc_retry_max_sleep_ms: 10 * 1000,
+            rpc_retry_max_sleep_ms: 3 * 1000,
 
             rpc_close_idle: true,
             conn_timeout_ms: 30 * 1000,
@@ -434,6 +487,8 @@ impl Default for ClientConf {
 
             clean_task_interval_ms: Self::DEFAULT_CLEAN_TASK_INTERVAL_MS,
 
+            heartbeat_interval_ms: Self::DEFAULT_HEARTBEAT_INTERVAL_MS,
+
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
 
             metadata_operation_buckets: vec![
@@ -461,9 +516,67 @@ impl Default for ClientConf {
             large_file_size_str: "10GB".to_string(),
             max_read_parallel: Self::DEFAULT_MAX_READ_PARALLEL,
             sequential_read_threshold: 7,
+            seek_absorb_window: 0,
+            seek_absorb_window_str: "0".to_string(),
         };
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_interval_defaults_to_five_missed_beats_per_minute() {
+        let conf = ClientConf::default();
+        assert_eq!(conf.heartbeat_interval_ms, 12_000);
+        // Five heartbeats must fit in the default master window (60s), otherwise
+        // every default client would flap between alive and expired.
+        assert_eq!(conf.heartbeat_interval_ms * 5, 60_000);
+    }
+
+    #[test]
+    fn heartbeat_interval_zero_disables_the_lease() {
+        let conf = ClientConf {
+            heartbeat_interval_ms: 0,
+            ..Default::default()
+        };
+        conf.clone().init().unwrap();
+        assert_eq!(
+            conf.heartbeat_interval_ms, 0,
+            "0 must stay 0 (disabled), never be clamped into a live heartbeat"
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_rejects_a_hot_loop() {
+        let mut conf = ClientConf {
+            heartbeat_interval_ms: 1,
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("a sub-100ms cadence can only hammer the master");
+        assert!(error.to_string().contains("heartbeat_interval_ms"));
+    }
+
+    #[test]
+    fn test_seek_absorb_window_default_off() {
+        let conf = ClientConf::default();
+        assert_eq!(conf.seek_absorb_window, 0);
+    }
+
+    #[test]
+    fn test_seek_absorb_window_parse() {
+        let mut conf = ClientConf {
+            seek_absorb_window_str: "4MB".to_string(),
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.seek_absorb_window, 4 * 1024 * 1024);
     }
 }

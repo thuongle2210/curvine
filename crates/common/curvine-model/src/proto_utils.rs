@@ -28,7 +28,7 @@ impl ProtoUtils {
         StorageInfoProto {
             dir_id: item.dir_id,
             storage_id: item.storage_id,
-            failed: false,
+            failed: item.failed,
             capacity: item.capacity,
             fs_used: item.fs_used,
             non_fs_used: item.non_fs_used,
@@ -44,7 +44,7 @@ impl ProtoUtils {
         StorageInfo {
             dir_id: item.dir_id,
             storage_id: item.storage_id,
-            failed: false,
+            failed: item.failed,
             capacity: item.capacity,
             fs_used: item.fs_used,
             non_fs_used: item.non_fs_used,
@@ -864,6 +864,7 @@ impl ProtoUtils {
             lock_flags: lock.lock_flags as i32,
             start: lock.start,
             end: lock.end,
+            session_owned: Some(lock.session_owned),
         }
     }
 
@@ -877,6 +878,7 @@ impl ProtoUtils {
             lock_flags: LockFlags::from(lock.lock_flags as u8),
             start: lock.start,
             end: lock.end,
+            session_owned: lock.session_owned.unwrap_or(false),
         }
     }
 
@@ -904,11 +906,16 @@ impl ProtoUtils {
     }
 
     pub fn trash_entry_to_pb(src: TrashEntry) -> TrashEntryProto {
+        let mut status = Self::file_status_to_pb(src.status);
+        // Trash listings never expose user xattrs, and one entry carrying a
+        // large metadata blob would otherwise consume the whole ListTrash
+        // response budget (or even exceed the RPC frame limit).
+        status.x_attr.clear();
         TrashEntryProto {
             path: src.path,
             origin: src.origin,
             delete_ms: src.delete_ms,
-            status: Self::file_status_to_pb(src.status),
+            status,
         }
     }
 
@@ -940,12 +947,31 @@ impl ProtoUtils {
 mod tests {
     use crate::proto::CompatibilityModeProto;
     use crate::state::{
-        AccessMode, FileStatus, MountInfo, MountOptions, RestoreTrashResult, TrashEntry,
-        INTERNAL_CTIME_XATTR,
+        AccessMode, FileStatus, MountInfo, MountOptions, RestoreTrashResult, StorageInfo,
+        TrashEntry, INTERNAL_CTIME_XATTR,
     };
     use crate::utils::ProtoUtils;
     use curvine_sys::version::ComponentVersion;
     use std::collections::HashMap;
+
+    #[test]
+    fn storage_info_failed_round_trip() {
+        let info = StorageInfo {
+            dir_id: 3,
+            storage_id: "v1-3".to_string(),
+            failed: true,
+            capacity: 1024,
+            dir_path: "/data/3".to_string(),
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::storage_info_to_pb(info.clone());
+        assert!(pb.failed);
+
+        let round_trip = ProtoUtils::storage_info_from_pb(pb);
+        assert!(round_trip.failed, "failed state must reach the master");
+        assert_eq!(round_trip.dir_id, info.dir_id);
+    }
 
     #[test]
     fn test_mount_info_proto_round_trip_auto_cache_and_access_mode() {
@@ -993,6 +1019,7 @@ mod tests {
                 id: 7,
                 path: "/.Trash/123-7".to_string(),
                 name: "123-7".to_string(),
+                x_attr: HashMap::from([("user.meta".to_string(), vec![b'x'; 32])]),
                 ..Default::default()
             },
         };
@@ -1001,6 +1028,10 @@ mod tests {
         assert_eq!(pb.path, "/.Trash/123-7");
         assert_eq!(pb.origin, "/data/a.log");
         assert_eq!(pb.delete_ms, 123);
+        assert!(
+            pb.status.x_attr.is_empty(),
+            "trash listings must not carry user xattrs"
+        );
 
         let round_trip = ProtoUtils::trash_entry_from_pb(pb);
         assert_eq!(round_trip.path, "/.Trash/123-7");

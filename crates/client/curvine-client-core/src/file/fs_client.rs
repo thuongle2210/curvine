@@ -204,22 +204,42 @@ impl FsClient {
         self.delete_with_opts(path, recursive, false).await
     }
 
+    /// Deletes without waiting for the master to reclaim the subtree: the entry
+    /// is staged under `/.Trash/.pending` and purged in the background, so the
+    /// returned counts are zero and the space is released later.
+    pub async fn delete_async(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, false, true).await
+    }
+
     pub async fn delete_with_opts(
         &self,
         path: &Path,
         recursive: bool,
         skip_trash: bool,
     ) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, skip_trash, false).await
+    }
+
+    async fn delete_mode(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+        async_delete: bool,
+    ) -> FsResult<DeleteResult> {
         let header = DeleteRequest {
             path: path.encode(),
             recursive,
             skip_trash: Some(skip_trash),
+            async_delete: Some(async_delete),
         };
 
         let rep: DeleteResponse = self.rpc(RpcCode::Delete, header).await?;
         let trashed = rep.trashed();
+        let purge_pending = rep.purge_pending();
         let mut res = ProtoUtils::delete_res_from_pb(rep.res.unwrap_or_default());
         res.trashed = trashed;
+        res.purge_pending = purge_pending;
         Ok(res)
     }
 
@@ -270,10 +290,24 @@ impl FsClient {
         Ok(ProtoUtils::restore_trash_res_from_pb(rep))
     }
 
+    /// Empties the recycle bin and waits for the reclamation, reporting the real
+    /// counts. Callers that can proceed while the purger works should use
+    /// [`Self::empty_trash_async`] instead.
     pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
-        let req = EmptyTrashRequest {};
+        Ok(self.empty_trash_mode(true).await?.1)
+    }
+
+    /// Empties the recycle bin by staging the entries for the background purger
+    /// and returns `(accepted, reclaimed)`; reclamation still reports zeros
+    /// because the purge has not run yet.
+    pub async fn empty_trash_async(&self) -> FsResult<(u64, DeleteResult)> {
+        self.empty_trash_mode(false).await
+    }
+
+    async fn empty_trash_mode(&self, wait: bool) -> FsResult<(u64, DeleteResult)> {
+        let req = EmptyTrashRequest { wait: Some(wait) };
         let rep: EmptyTrashResponse = self.rpc(RpcCode::EmptyTrash, req).await?;
-        Ok(ProtoUtils::delete_res_from_pb(rep.res))
+        Ok((rep.accepted(), ProtoUtils::delete_res_from_pb(rep.res)))
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
@@ -925,12 +959,35 @@ impl FsClient {
     }
 
     pub async fn set_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
+        // Stamp session ownership at the RPC boundary: FUSE and SDK callers do not
+        // know whether a lease is confirmed, and the master needs the flag to
+        // decide between session-expiry and `lock_expire_time` reclamation. Only
+        // this context's own client id under a confirmed lease qualifies; a
+        // caller's explicit `true` for any other owner is cleared as well.
+        // `get_lock` deliberately does not stamp anything: it is a query, and the
+        // master judges the locks that already exist.
+        let mut lock = lock;
+        lock.session_owned = self.context.is_session_owner(&lock.client_id);
+
         let req = SetLockRequest {
             path: path.encode(),
             lock: ProtoUtils::file_lock_to_pb(lock),
         };
         let rep: SetLockResponse = self.rpc(RpcCode::SetLock, req).await?;
         Ok(rep.conflict.map(ProtoUtils::file_lock_from_pb))
+    }
+
+    pub async fn create_leader_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        let rep: CreateLeaderSnapshotResponse = self
+            .rpc(
+                RpcCode::CreateLeaderSnapshot,
+                CreateLeaderSnapshotRequest { force },
+            )
+            .await?;
+        Ok(LeaderSnapshotInfo {
+            dir: rep.dir,
+            cost_ms: rep.cost_ms,
+        })
     }
 
     pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>

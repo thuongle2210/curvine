@@ -132,6 +132,21 @@ pub struct MasterConf {
     #[serde(skip)]
     pub trash_check_interval_unit: DurationUnit,
 
+    // Maximum number of inodes a single trash purge batch removes before the
+    // namespace lock is released. Every path in a batch removes exactly one
+    // inode, so this also bounds the batch's journal record.
+    pub trash_purge_batch_inodes: usize,
+
+    // Milliseconds the purger yields between batches so foreground metadata
+    // operations can take the namespace lock.
+    pub trash_purge_yield_ms: u64,
+
+    // How often the master drains /.Trash/.pending, i.e. the entries staged by
+    // async deletes. Runs regardless of trash_enabled.
+    pub trash_purge_interval: String,
+    #[serde(skip)]
+    pub trash_purge_interval_unit: DurationUnit,
+
     // Eviction configuration
     pub enable_quota_eviction: bool,
     pub quota_eviction_mode: String,
@@ -155,6 +170,13 @@ pub struct MasterConf {
     pub lock_expire_time: String,
     #[serde(skip)]
     pub lock_expire_time_unit: DurationUnit,
+
+    // Client session lease: a client session that has not sent a ClientHeartbeat
+    // within this window is considered expired. Should be several times the
+    // client heartbeat interval (default 12s).
+    pub client_session_timeout: String,
+    #[serde(skip)]
+    pub client_session_timeout_unit: DurationUnit,
 
     pub buffer_size: usize,
 
@@ -189,6 +211,7 @@ impl MasterConf {
         self.ttl_retry_interval_unit = DurationUnit::from_str(&self.ttl_retry_interval)?;
         self.trash_retention_unit = DurationUnit::from_str(&self.trash_retention)?;
         self.trash_check_interval_unit = DurationUnit::from_str(&self.trash_check_interval)?;
+        self.trash_purge_interval_unit = DurationUnit::from_str(&self.trash_purge_interval)?;
         self.block_replication_retry_interval_unit =
             DurationUnit::from_str(&self.block_replication_retry_interval)?;
         self.block_replication_submit_timeout_unit =
@@ -199,12 +222,21 @@ impl MasterConf {
         // Initialize lock expiration time
         self.lock_expire_time_unit = DurationUnit::from_str(&self.lock_expire_time)?;
 
+        self.client_session_timeout_unit = DurationUnit::from_str(&self.client_session_timeout)?;
+        if self.client_session_timeout_unit.as_millis() == 0 {
+            return err_box!("client_session_timeout must be greater than zero");
+        }
+
         if self.heartbeat_interval_unit > self.worker_blacklist_interval_unit {
             return err_box!("Worker_blacklist_interval must be greater than heartbeat_interval");
         };
 
         if self.heartbeat_interval_unit > self.worker_lost_interval_unit {
             return err_box!("Worker_lost_interval must be greater than heartbeat_interval");
+        }
+
+        if self.worker_check_interval_unit >= self.worker_lost_interval_unit {
+            return err_box!("Worker_lost_interval must be greater than worker_check_interval");
         }
 
         if self.conn_limit == 0 {
@@ -225,6 +257,10 @@ impl MasterConf {
 
         if self.trash_check_interval_ms() == 0 {
             return err_box!("master.trash_check_interval must be greater than zero");
+        }
+
+        if self.trash_purge_interval_ms() == 0 {
+            return err_box!("master.trash_purge_interval must be greater than zero");
         }
 
         Ok(())
@@ -289,8 +325,16 @@ impl MasterConf {
         self.lock_expire_time_unit.as_millis()
     }
 
+    pub fn client_session_timeout_ms(&self) -> u64 {
+        self.client_session_timeout_unit.as_millis()
+    }
+
     pub fn trash_retention_ms(&self) -> u64 {
         self.trash_retention_unit.as_millis()
+    }
+
+    pub fn trash_purge_interval_ms(&self) -> u64 {
+        self.trash_purge_interval_unit.as_millis()
     }
 
     pub fn trash_check_interval_ms(&self) -> u64 {
@@ -372,7 +416,10 @@ impl Default for MasterConf {
             block_replication_submit_timeout_unit: Default::default(),
             block_replication_job_timeout: "30m".to_string(),
             block_replication_job_timeout_unit: Default::default(),
-            log: Default::default(),
+            log: LogConf {
+                file_name: "master.log".to_string(),
+                ..Default::default()
+            },
 
             ttl_checker_retry_attempts: 3,
 
@@ -395,6 +442,12 @@ impl Default for MasterConf {
             trash_check_interval: "1h".to_string(),
             trash_check_interval_unit: Default::default(),
 
+            trash_purge_batch_inodes: 4096,
+            trash_purge_yield_ms: 5,
+
+            trash_purge_interval: "1s".to_string(),
+            trash_purge_interval_unit: Default::default(),
+
             // Eviction configuration defaults
             enable_quota_eviction: false,
             quota_eviction_mode: "free".to_string(),
@@ -408,6 +461,9 @@ impl Default for MasterConf {
 
             lock_expire_time: "5m".to_string(),
             lock_expire_time_unit: Default::default(),
+
+            client_session_timeout: "60s".to_string(),
+            client_session_timeout_unit: Default::default(),
 
             buffer_size: 128 * 1024,
 
@@ -457,6 +513,21 @@ mod tests {
     }
 
     #[test]
+    fn worker_check_interval_must_be_shorter_than_lost_interval() {
+        let mut conf = MasterConf {
+            worker_check_interval: "15m".to_string(),
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("a check cadence slower than the lost interval must be rejected");
+        assert!(error
+            .to_string()
+            .contains("Worker_lost_interval must be greater than worker_check_interval"));
+    }
+
+    #[test]
     fn trash_defaults_are_disabled_with_one_week_retention() {
         let conf = MasterConf::default();
 
@@ -489,5 +560,28 @@ mod tests {
         assert!(error
             .to_string()
             .contains("trash_check_interval must be greater than zero"));
+    }
+
+    #[test]
+    fn client_session_timeout_defaults_to_sixty_seconds() {
+        let mut conf = MasterConf::default();
+        conf.init().unwrap();
+
+        assert_eq!(conf.client_session_timeout_ms(), 60_000);
+    }
+
+    #[test]
+    fn client_session_timeout_must_be_positive() {
+        let mut conf = MasterConf {
+            client_session_timeout: "0s".to_string(),
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("zero client session timeout must be rejected");
+        assert!(error
+            .to_string()
+            .contains("client_session_timeout must be greater than zero"));
     }
 }
