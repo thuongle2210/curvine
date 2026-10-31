@@ -189,11 +189,18 @@ pub struct WorkerConf {
     pub spdk_disk: SpdkConf,
 
     /// Give up retrying a quarantine-release proof after this many
-    /// heartbeat ticks if it's genuinely stale (the block it targets no
-    /// longer exists or has a different identity, meaning its fate was
-    /// already resolved through some other path). `0` (default) disables
-    /// the cap, preserving infinite retry. A dropped stale proof costs
-    /// nothing: the extent it would have released is already handled.
+    /// heartbeat ticks if the attempt failed with a persistent store-level
+    /// error (e.g. transient lock contention), not a definitive answer
+    /// about the proof itself. `0` (default) disables the cap, preserving
+    /// infinite retry.
+    ///
+    /// Note: a proof that is genuinely stale (the block it targets no
+    /// longer exists, or has a different identity -- its fate was already
+    /// resolved through some other path) is always dropped immediately on
+    /// first observation, not retried against this cap. A settled "stale"
+    /// answer can't change on a later tick, so there's nothing to wait
+    /// for and no risk in dropping it right away: the extent it would
+    /// have released is already handled.
     pub spdk_quarantine_proof_max_retries: u32,
 
     /// Give up retrying a quarantine-release proof after this many

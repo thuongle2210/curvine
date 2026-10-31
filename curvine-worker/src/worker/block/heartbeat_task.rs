@@ -45,15 +45,18 @@ pub struct HeartbeatTask {
     /// retried every tick. See `Dataset::release_quarantined_block_with_proof`.
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
     pub(crate) pending_quarantine_proofs: Arc<Mutex<Vec<PendingQuarantineProof>>>,
-    /// Give up on a `Stale` proof after this many retries. `0` = unlimited.
+    /// Give up on a persistent store `Err` after this many retries. `0` =
+    /// unlimited. `Stale` proofs are always dropped immediately (no retry
+    /// needed -- the answer can't change on a later tick), so this no
+    /// longer caps anything other than transient store errors.
     /// See `WorkerConf::spdk_quarantine_proof_max_retries`.
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
-    pub(crate) quarantine_proof_stale_max_retries: u32,
+    pub(crate) quarantine_proof_store_err_max_retries: u32,
     /// Give up on a `NotYetQuarantined` proof after this many retries. `0`
-    /// = unlimited. Expected to be much larger than the stale cap, since
-    /// reaching it means the quarantine transition itself is stuck, not
-    /// that the proof is merely stale. See
-    /// `WorkerConf::spdk_quarantine_proof_stuck_max_retries`.
+    /// = unlimited. Expected to be much larger than the store-err cap,
+    /// since reaching it means the quarantine transition itself is stuck,
+    /// not that the proof is merely stale (which drops immediately, see
+    /// above). See `WorkerConf::spdk_quarantine_proof_stuck_max_retries`.
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
     pub(crate) quarantine_proof_stuck_max_retries: u32,
 }
@@ -171,7 +174,7 @@ impl HeartbeatTask {
             &self.store,
             &self.pending_quarantine_proofs,
             new_proofs,
-            self.quarantine_proof_stale_max_retries,
+            self.quarantine_proof_store_err_max_retries,
             self.quarantine_proof_stuck_max_retries,
         );
     }
@@ -186,14 +189,19 @@ impl HeartbeatTask {
     /// - `Released`: drop, done.
     /// - `NotYetQuarantined`: the block exists with the same identity but
     ///   hasn't transitioned to `Quarantined` yet. Expected to resolve
-    ///   almost immediately; capped at `stuck_max_retries` (much larger
-    ///   than `stale_max_retries`) since reaching it means the transition
-    ///   itself is stuck, not that the proof is merely stale.
+    ///   almost immediately; capped at `stuck_max_retries` since reaching it
+    ///   means the transition itself is stuck, not that the proof is merely
+    ///   stale.
     /// - `Stale`: the block's identity no longer matches at all; whatever
     ///   this proof would have released has already been resolved
-    ///   elsewhere. Capped at `stale_max_retries`.
-    /// - `Err`: treated like `Stale` for capping purposes (a persistent
-    ///   store error is itself worth surfacing, not retried forever).
+    ///   elsewhere. This is a settled fact the moment it's observed --
+    ///   re-checking on a later tick cannot change the answer -- so it is
+    ///   dropped unconditionally on first observation, with no retry/cap
+    ///   needed.
+    /// - `Err`: a transient store-level failure (e.g. lock contention), not
+    ///   a definitive answer about the proof itself, so it genuinely is
+    ///   worth retrying a bounded number of times before giving up. Capped
+    ///   at `store_err_max_retries`.
     ///
     /// `0` for either cap means unlimited (preserves infinite retry).
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
@@ -201,7 +209,7 @@ impl HeartbeatTask {
         store: &BlockStore,
         pending: &Mutex<Vec<PendingQuarantineProof>>,
         new_proofs: Vec<QuarantineReleaseProof>,
-        stale_max_retries: u32,
+        store_err_max_retries: u32,
         stuck_max_retries: u32,
     ) {
         let mut pending = match pending.lock() {
@@ -249,21 +257,25 @@ impl HeartbeatTask {
                     }
                 }
                 Ok(QuarantineReleaseOutcome::Stale) => {
-                    p.attempts += 1;
-                    if stale_max_retries != 0 && p.attempts >= stale_max_retries {
-                        warn!(
-                            "giving up on quarantine release proof for block {}: exceeded {} \
-                             retries (offset={} size={}); the extent it would have released \
-                             was already resolved through some other path",
-                            p.proof.block_id, p.attempts, p.proof.bdev_offset, p.proof.size
-                        );
-                        if let Ok(metrics) = Worker::get_metrics() {
-                            metrics.spdk_quarantine_proof_dropped.inc();
-                        }
-                        false
-                    } else {
-                        true
+                    // Stale is a definitive, settled fact the moment it's
+                    // observed (the block is gone, or exists under a
+                    // different identity) -- re-checking on a later tick
+                    // cannot make it "more stale." Unlike NotYetQuarantined
+                    // (which genuinely needs to wait for a transition in
+                    // progress) or a transient store Err, there is nothing
+                    // to gain by retrying, so this drops unconditionally on
+                    // first observation instead of accumulating attempts
+                    // against a cap.
+                    warn!(
+                        "giving up on quarantine release proof for block {}: the block no \
+                         longer matches (offset={} size={}); the extent it would have \
+                         released was already resolved through some other path",
+                        p.proof.block_id, p.proof.bdev_offset, p.proof.size
+                    );
+                    if let Ok(metrics) = Worker::get_metrics() {
+                        metrics.spdk_quarantine_proof_dropped.inc();
                     }
+                    false
                 }
                 Err(e) => {
                     p.attempts += 1;
@@ -271,7 +283,7 @@ impl HeartbeatTask {
                         "release_quarantined_block_with_proof failed for block {}: {}",
                         p.proof.block_id, e
                     );
-                    if stale_max_retries != 0 && p.attempts >= stale_max_retries {
+                    if store_err_max_retries != 0 && p.attempts >= store_err_max_retries {
                         if let Ok(metrics) = Worker::get_metrics() {
                             metrics.spdk_quarantine_proof_dropped.inc();
                         }
@@ -403,8 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn retry_keeps_stale_proof_until_cap_then_drops_it() -> CommonResult<()> {
-        let store = test_store("stale-cap")?;
+    fn retry_drops_stale_proof_immediately() -> CommonResult<()> {
+        let store = test_store("stale-immediate")?;
         let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
         store.open_block(&block)?;
         store.abort_block_uncertain(&block)?;
@@ -421,62 +433,20 @@ mod tests {
         assert!(pending.lock().unwrap().is_empty(), "first proof releases");
 
         // A second, duplicate proof for the same now-gone identity: Stale
-        // from the very first check.
+        // from the very first check. No retry cap is configured (both args
+        // are 0), yet it must still be dropped on the very first attempt --
+        // Stale is a settled fact the moment it's observed, not something
+        // that needs a cap to eventually give up on.
         let stale_proof = QuarantineReleaseProof {
             block_id: 1,
             bdev_offset: 0,
             size: 4096,
         };
         let pending = Mutex::new(Vec::new());
-        let stale_cap = 3u32;
-
-        for tick in 1..stale_cap {
-            HeartbeatTask::retry_pending_quarantine_proofs(
-                &store,
-                &pending,
-                if tick == 1 { vec![stale_proof] } else { vec![] },
-                stale_cap,
-                0,
-            );
-            assert!(
-                !pending.lock().unwrap().is_empty(),
-                "stale proof must still be retried before reaching the cap (tick {tick})"
-            );
-        }
-
-        // One more tick reaches the cap and must drop it.
-        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], stale_cap, 0);
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![stale_proof], 0, 0);
         assert!(
             pending.lock().unwrap().is_empty(),
-            "stale proof must be dropped once it exceeds the retry cap"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn retry_never_drops_stale_proof_when_cap_is_zero() -> CommonResult<()> {
-        let store = test_store("stale-unlimited")?;
-        let proof = QuarantineReleaseProof {
-            block_id: 999,
-            bdev_offset: 0,
-            size: 4096,
-        };
-        let pending = Mutex::new(Vec::new());
-
-        for tick in 0..20 {
-            HeartbeatTask::retry_pending_quarantine_proofs(
-                &store,
-                &pending,
-                if tick == 0 { vec![proof] } else { vec![] },
-                0,
-                0,
-            );
-        }
-
-        assert_eq!(
-            pending.lock().unwrap().len(),
-            1,
-            "cap=0 must preserve infinite retry for a stale proof"
+            "a stale proof must be dropped on first observation, with no retry needed"
         );
         Ok(())
     }

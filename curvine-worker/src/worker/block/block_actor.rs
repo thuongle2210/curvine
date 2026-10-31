@@ -130,7 +130,7 @@ pub struct BlockActor {
     // 2. Add a new block.
     report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
     pending_deletes: Arc<DashSet<i64>>,
-    quarantine_proof_stale_max_retries: u32,
+    quarantine_proof_store_err_max_retries: u32,
     quarantine_proof_stuck_max_retries: u32,
 }
 
@@ -171,7 +171,7 @@ impl BlockActor {
             block_report_limit,
             report_blocks: Arc::new(DashMap::new()),
             pending_deletes: Arc::new(DashSet::new()),
-            quarantine_proof_stale_max_retries: conf.worker.spdk_quarantine_proof_max_retries,
+            quarantine_proof_store_err_max_retries: conf.worker.spdk_quarantine_proof_max_retries,
             quarantine_proof_stuck_max_retries: conf.worker.spdk_quarantine_proof_stuck_max_retries,
         })
     }
@@ -198,7 +198,7 @@ impl BlockActor {
             self.report_blocks.clone(),
             self.pending_deletes.clone(),
             self.heartbeat_interval_ms,
-            self.quarantine_proof_stale_max_retries,
+            self.quarantine_proof_store_err_max_retries,
             self.quarantine_proof_stuck_max_retries,
         )?;
         Ok(())
@@ -277,7 +277,7 @@ impl BlockActor {
         report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
         pending_deletes: Arc<DashSet<i64>>,
         heartbeat_interval_ms: u64,
-        quarantine_proof_stale_max_retries: u32,
+        quarantine_proof_store_err_max_retries: u32,
         quarantine_proof_stuck_max_retries: u32,
     ) -> CommonResult<()> {
         let scheduler = ScheduledExecutor::new("worker-heartbeat", heartbeat_interval_ms);
@@ -290,7 +290,7 @@ impl BlockActor {
             report_blocks,
             pending_deletes,
             pending_quarantine_proofs: Arc::new(std::sync::Mutex::new(Vec::new())),
-            quarantine_proof_stale_max_retries,
+            quarantine_proof_store_err_max_retries,
             quarantine_proof_stuck_max_retries,
         };
 
