@@ -197,3 +197,15 @@ void curvine_spdk_async_ctx_init(struct curvine_async_ctx *ctx, curvine_async_cb
     ctx->cb = cb;
     ctx->cb_arg = cb_arg;
 }
+
+// Abort a specific previously-submitted command, matched by its callback
+// argument (cmd_cb_arg) rather than numeric CID — the Rust side already
+// identifies in-flight commands by the pointer to their `curvine_async_ctx`,
+// which is exactly what's passed as cb_arg to spdk_nvme_ns_cmd_*. Reuses
+// curvine_async_cb_fn so the abort's own completion reports through the
+// same ctx/cb mechanism as ordinary I/O, keeping spdk_nvme_cpl entirely out
+// of the Rust side.
+int curvine_spdk_ctrlr_abort_cmd(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair,
+                                  void *cmd_cb_arg, struct curvine_async_ctx *ctx) {
+    return spdk_nvme_ctrlr_cmd_abort_ext(ctrlr, qpair, cmd_cb_arg, curvine_async_cb_fn, ctx);
+}

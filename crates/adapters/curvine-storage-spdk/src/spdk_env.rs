@@ -8,6 +8,7 @@ use crate::spdk_poller::{
     poller_callback_for_test, retired_qpair_with_stale_callback_for_test,
     retired_qpair_with_stale_inflight_for_test,
 };
+use crate::spdk_poller::{AbortOutcome, IoCompletion};
 use crate::spdk_poller::{CtrlHandle, PollerConfig};
 use crate::spdk_poller::{
     IoRequest, RetiredQpair, RetiredQpairCleanup, RetiredQpairPollOutcome, RetiredQpairRegistry,
@@ -729,6 +730,11 @@ pub struct BdevInfo {
     /// before proactively declaring its qpair dead. `0` = disabled (watcher
     /// waits forever). See `SpdkConf::terminal_watcher_watchdog_ms`.
     pub terminal_watcher_watchdog_ms: u64,
+    /// Bounded wait for a targeted NVMe Abort of just the stuck command,
+    /// tried before the qpair-wide watchdog above. `0` = disabled (skip
+    /// straight to the qpair-wide watchdog). See
+    /// `SpdkConf::terminal_watcher_abort_timeout_ms`.
+    pub terminal_watcher_abort_timeout_ms: u64,
 }
 
 struct RetiredDma {
@@ -1933,6 +1939,20 @@ impl SpdkEnv {
         }
     }
 
+    /// Request a targeted abort of `target` on `qpair`, blocking until
+    /// acknowledged (or `None` if the request couldn't even be delivered).
+    /// Called by a timeout-watcher thread as its first, narrower-blast-
+    /// radius attempt before falling back to `escalate_qpair_from_poller`.
+    pub(crate) fn abort_command_from_poller(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        target: Arc<IoCompletion>,
+    ) -> Option<AbortOutcome> {
+        let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+        poller.as_ref()?.abort_command(ctrlr, qpair, target)
+    }
+
     pub(crate) fn unregister_ctrlr_from_poller(&self, ctrlr: CtrlHandle) -> UnregisterResult {
         #[cfg(test)]
         if let Some(hook) = &self.test_hooks.unregister_ctrlr {
@@ -2164,6 +2184,7 @@ impl SpdkEnv {
                     ns: ns as usize,
                     io_timeout_ms,
                     terminal_watcher_watchdog_ms: self.conf.terminal_watcher_watchdog_ms,
+                    terminal_watcher_abort_timeout_ms: self.conf.terminal_watcher_abort_timeout_ms,
                 });
             }
             if bdevs.is_empty() {
@@ -2325,6 +2346,7 @@ mod test {
             ns: ctrlr + 0x1000,
             io_timeout_ms: 1000,
             terminal_watcher_watchdog_ms: 0,
+            terminal_watcher_abort_timeout_ms: 0,
         });
         env.controllers.push(ControllerEntry {
             target_idx,
@@ -2544,6 +2566,7 @@ mod test {
             ns: 0x2000,
             io_timeout_ms: 1000,
             terminal_watcher_watchdog_ms: 0,
+            terminal_watcher_abort_timeout_ms: 0,
         });
         env.bdevs.push(BdevInfo {
             name: "nvme-b".into(),
@@ -2555,6 +2578,7 @@ mod test {
             ns: 0x4000,
             io_timeout_ms: 1000,
             terminal_watcher_watchdog_ms: 0,
+            terminal_watcher_abort_timeout_ms: 0,
         });
         env.controllers.push(ControllerEntry {
             target_idx: 0,
@@ -3588,6 +3612,7 @@ mod test {
             ns: 0,
             io_timeout_ms: 0,
             terminal_watcher_watchdog_ms: 0,
+            terminal_watcher_abort_timeout_ms: 0,
         });
         env.qpair_pool.register_limit(ctrlr, 1);
         assert_eq!(
@@ -3681,6 +3706,7 @@ mod test {
             ns: 0,
             io_timeout_ms: 0,
             terminal_watcher_watchdog_ms: 0,
+            terminal_watcher_abort_timeout_ms: 0,
         });
         env.qpair_pool.register_limit(ctrlr, 1);
         assert_eq!(

@@ -22,6 +22,7 @@ pub(crate) struct SpdkMetrics {
     qpair_release_freed_retired: Counter,
     qpair_shutdown_total: Counter,
     terminal_watcher_escalated: Counter,
+    terminal_watcher_abort_submitted: Counter,
 }
 
 static SPDK_METRICS: OnceLock<Option<SpdkMetrics>> = OnceLock::new();
@@ -81,6 +82,12 @@ impl SpdkMetrics {
                 "spdk_terminal_watcher_escalated_total",
                 "Terminal-watcher threads that proactively force-completed their qpair \
                  after a watchdog timeout, with no qpair-level failure ever detected",
+            )?,
+            terminal_watcher_abort_submitted: m::new_counter(
+                "spdk_terminal_watcher_abort_submitted_total",
+                "Targeted NVMe Abort commands successfully submitted by a terminal-watcher \
+                 thread for one specific stuck command, before falling back to the \
+                 qpair-wide escalation",
             )?,
         })
     }
@@ -148,4 +155,8 @@ pub(crate) fn record_qpair_shutdown() {
 
 pub(crate) fn record_terminal_watcher_escalated() {
     with_metrics(|m| m.terminal_watcher_escalated.inc());
+}
+
+pub(crate) fn record_terminal_watcher_abort_submitted() {
+    with_metrics(|m| m.terminal_watcher_abort_submitted.inc());
 }

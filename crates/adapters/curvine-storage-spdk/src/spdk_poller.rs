@@ -75,6 +75,37 @@ pub enum IoOp {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
         ack: mpsc::Sender<()>,
     },
+    /// Abort one specific previously-submitted command, identified by the
+    /// `Arc<IoCompletion>` it was submitted with (matched against the
+    /// `CallbackCtx.completion` of each entry still in `qpair_state`'s
+    /// pending list). Narrower blast radius than `EscalateQpair`: only
+    /// this one command is targeted, every other command in flight on the
+    /// same qpair is left untouched. Sent by a timeout-watcher thread as
+    /// its first, narrower attempt before falling back to `EscalateQpair`
+    /// if the abort doesn't resolve things in time.
+    AbortCommand {
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        target: Arc<IoCompletion>,
+        ack: mpsc::Sender<AbortOutcome>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortOutcome {
+    /// The abort request was itself successfully submitted to the
+    /// controller. This does NOT mean the target command was actually
+    /// cancelled — only that the request was accepted. The target
+    /// command's own completion (already being awaited by the caller)
+    /// is the real signal of whether anything actually resolved.
+    Submitted,
+    /// The target command was no longer in the pending list by the time
+    /// this ran — it already resolved through some other path (a real
+    /// completion, or a prior `force_complete_qpair`/`EscalateQpair`).
+    /// Nothing to abort; this is not an error.
+    NotFound,
+    /// The abort request itself failed to submit (negated errno).
+    SubmitFailed(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,6 +576,36 @@ impl SpdkPoller {
         }
     }
 
+    /// Request a targeted abort of `target` on `qpair`, blocking until
+    /// acknowledged. `None` means the request could not even be delivered
+    /// (poller gone or didn't ack within 100ms) — the caller should treat
+    /// that the same as any other failed/uncertain abort attempt and fall
+    /// back to its own next tier.
+    pub(crate) fn abort_command(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        target: Arc<IoCompletion>,
+    ) -> Option<AbortOutcome> {
+        let (ack_tx, ack_rx) = mpsc::channel::<AbortOutcome>();
+        let req = IoRequest {
+            op: IoOp::AbortCommand {
+                ctrlr,
+                qpair,
+                target,
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        let tx = self.tx.as_ref()?;
+        if tx.send(req).is_err() {
+            return None;
+        }
+        let _ = self.eventfd.write(1);
+        ack_rx.recv_timeout(Duration::from_millis(100)).ok()
+    }
+
     pub(crate) fn poll_retired_qpair(
         &self,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -654,6 +715,9 @@ impl SpdkPoller {
                         IoOp::EscalateQpair { .. } => {
                             Self::handle_escalate_qpair(&req, &mut qpair_state, &retired);
                         }
+                        IoOp::AbortCommand { .. } => {
+                            Self::handle_abort_command(&req, &qpair_state);
+                        }
                         _ => {
                             Self::submit_one(
                                 &req,
@@ -751,6 +815,9 @@ impl SpdkPoller {
                                 }
                                 IoOp::EscalateQpair { .. } => {
                                     Self::handle_escalate_qpair(&req, &mut qpair_state, &retired);
+                                }
+                                IoOp::AbortCommand { .. } => {
+                                    Self::handle_abort_command(&req, &qpair_state);
                                 }
                                 _ => {
                                     Self::submit_one(
@@ -900,6 +967,73 @@ impl SpdkPoller {
         }
     }
 
+    /// Attempt a targeted abort of exactly one pending command (identified
+    /// by `target`'s `Arc<IoCompletion>` identity), without touching any
+    /// other command in flight on the same qpair. Always acks, even if the
+    /// target was already resolved by the time this ran (`NotFound` is the
+    /// expected, harmless outcome in that race).
+    fn handle_abort_command(req: &IoRequest, qpair_state: &HashMap<usize, Box<QpairState>>) {
+        if let IoOp::AbortCommand {
+            ctrlr,
+            qpair,
+            target,
+            ack,
+        } = &req.op
+        {
+            let outcome = Self::try_abort_pending_entry(*ctrlr, *qpair, qpair_state, target);
+            let _ = ack.send(outcome);
+        }
+    }
+
+    fn try_abort_pending_entry(
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        qpair_state: &HashMap<usize, Box<QpairState>>,
+        target: &Arc<IoCompletion>,
+    ) -> AbortOutcome {
+        let key = qpair as usize;
+        let Some(qs) = qpair_state.get(&key) else {
+            return AbortOutcome::NotFound;
+        };
+        let found = qs
+            .pending
+            .iter()
+            .find(|&&p| unsafe { Arc::ptr_eq(&(*p).completion, target) });
+        let Some(&cb_ptr) = found else {
+            return AbortOutcome::NotFound;
+        };
+
+        let abort_ctx = Box::new(AbortCbCtx {
+            async_ctx: unsafe { std::mem::zeroed() },
+            qpair_key: key,
+        });
+        let abort_ctx_ptr = Box::into_raw(abort_ctx);
+        unsafe {
+            spdk_ffi::curvine_spdk_async_ctx_init(
+                &mut (*abort_ctx_ptr).async_ctx,
+                abort_completion_callback,
+                abort_ctx_ptr as *mut c_void,
+            );
+        }
+        let cmd_cb_arg = unsafe { &mut (*cb_ptr).async_ctx as *mut _ as *mut c_void };
+        let rc = unsafe {
+            spdk_ffi::curvine_spdk_ctrlr_abort_cmd(
+                ctrlr,
+                qpair,
+                cmd_cb_arg,
+                &mut (*abort_ctx_ptr).async_ctx,
+            )
+        };
+        if rc == 0 {
+            spdk_metrics::record_terminal_watcher_abort_submitted();
+            AbortOutcome::Submitted
+        } else {
+            // Submit itself failed: no callback will ever fire for this ctx.
+            unsafe { drop(Box::from_raw(abort_ctx_ptr)) };
+            AbortOutcome::SubmitFailed(rc)
+        }
+    }
+
     /// Submit a single I/O request on the poller thread.
     fn submit_one(
         req: &IoRequest,
@@ -913,7 +1047,8 @@ impl SpdkPoller {
             IoOp::Flush { qpair, .. } => *qpair,
             IoOp::UnregisterQpair { .. }
             | IoOp::PollRetiredQpair { .. }
-            | IoOp::EscalateQpair { .. } => {
+            | IoOp::EscalateQpair { .. }
+            | IoOp::AbortCommand { .. } => {
                 unreachable!("control request handled before submit_one")
             }
             IoOp::UnregisterCtrlr { .. } => {
@@ -1012,6 +1147,9 @@ impl SpdkPoller {
                 unreachable!("control request handled before submit_one")
             }
             IoOp::EscalateQpair { .. } => {
+                unreachable!("control request handled before submit_one")
+            }
+            IoOp::AbortCommand { .. } => {
                 unreachable!("control request handled before submit_one")
             }
             IoOp::UnregisterCtrlr { .. } => {
@@ -1194,6 +1332,33 @@ unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
         drop(Box::from_raw(cb_arg as *mut CallbackCtx));
     } else {
         ctx.release_dma_ref();
+    }
+}
+
+/// Minimal heap-allocated context for logging an NVMe Abort command's own
+/// completion status — distinct from `CallbackCtx`, since an abort command
+/// isn't itself a queued I/O needing DMA-ref/pending-list bookkeeping, just
+/// its own fire-and-forget completion. Freed by its own callback once that
+/// fires, or immediately (by the caller) if the submit itself failed,
+/// since no callback will ever arrive for that case.
+struct AbortCbCtx {
+    async_ctx: spdk_ffi::curvine_async_ctx,
+    qpair_key: usize,
+}
+
+/// Reports whether the abort *command itself* completed without an NVMe
+/// error — NOT whether the target command was actually cancelled. The
+/// target command's own completion (already being awaited separately by
+/// the watcher thread) is the real signal for that.
+unsafe extern "C" fn abort_completion_callback(cb_arg: *mut c_void, status: i32) {
+    let ctx = Box::from_raw(cb_arg as *mut AbortCbCtx);
+    if status != 0 {
+        warn!(
+            "NVMe abort command itself failed for qpair 0x{:x}: status={} \
+             (does not necessarily mean the target command is still stuck — \
+             it may complete on its own regardless)",
+            ctx.qpair_key, status
+        );
     }
 }
 
@@ -1513,6 +1678,95 @@ mod test {
 
         assert!(ack_rx.recv_timeout(Duration::from_millis(100)).is_ok());
         assert!(!retired.contains(DEAD));
+    }
+
+    #[test]
+    fn abort_command_on_absent_qpair_is_not_found_and_acks() {
+        // Qpair never seen by this poller at all (already force-completed
+        // or retired, or the watcher's info is simply stale) — must not
+        // touch any FFI, must still ack.
+        let qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+        let target = IoCompletion::new();
+        let (ack_tx, ack_rx) = mpsc::channel::<AbortOutcome>();
+        let req = IoRequest {
+            op: IoOp::AbortCommand {
+                ctrlr: 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr,
+                qpair: DEAD as *mut spdk_ffi::spdk_nvme_qpair,
+                target,
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_abort_command(&req, &qpair_state);
+
+        assert_eq!(
+            ack_rx.recv_timeout(Duration::from_millis(100)),
+            Ok(AbortOutcome::NotFound)
+        );
+    }
+
+    #[test]
+    fn abort_command_for_already_resolved_target_is_not_found_and_acks() {
+        // Qpair exists and has OTHER pending entries, but none of them
+        // match the specific target the watcher is asking to abort (it
+        // already completed/was removed by the time this ran) — must
+        // report NotFound for this specific target without touching the
+        // other, unrelated pending entries at all.
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let unrelated_completion = IoCompletion::new();
+        let mut qs = Box::new(QpairState {
+            dead: Arc::new(AtomicBool::new(false)),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: unrelated_completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs.pending.push(ctx);
+
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+        qpair_state.insert(LIVE, qs);
+
+        // Target is a different, unrelated IoCompletion — not in pending.
+        let target = IoCompletion::new();
+        let (ack_tx, ack_rx) = mpsc::channel::<AbortOutcome>();
+        let req = IoRequest {
+            op: IoOp::AbortCommand {
+                ctrlr: 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr,
+                qpair: LIVE as *mut spdk_ffi::spdk_nvme_qpair,
+                target,
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_abort_command(&req, &qpair_state);
+
+        assert_eq!(
+            ack_rx.recv_timeout(Duration::from_millis(100)),
+            Ok(AbortOutcome::NotFound)
+        );
+        // The unrelated entry must be completely untouched.
+        assert_eq!(unrelated_completion.wait(1000), -libc::ETIMEDOUT);
+        assert_eq!(qpair_state[&LIVE].pending.len(), 1);
+
+        // Clean up the unrelated entry.
+        if let Some(qs) = qpair_state.get_mut(&LIVE) {
+            for cb_ptr in qs.pending.drain(..) {
+                unsafe {
+                    (*cb_ptr).release_dma_ref();
+                    drop(Box::from_raw(cb_ptr));
+                };
+            }
+        }
     }
 
     #[test]
