@@ -227,6 +227,11 @@ pub struct SpdkBdev {
     /// Sender for late-arriving terminal completions; cloned from the global
     /// `SpdkEnv` at open time so timeout-watcher threads don't need a lookup.
     terminal_tx: crossbeam::channel::Sender<crate::spdk_env::SpdkCommandTerminalEvent>,
+    /// Extra bounded wait a timeout-watcher thread gives a stuck command,
+    /// on top of `io_timeout_ms`, before proactively escalating its qpair
+    /// to dead. `0` = disabled (watcher waits forever, preserving prior
+    /// behavior). See `spawn_terminal_watcher`.
+    terminal_watcher_watchdog_ms: u64,
 }
 
 // SAFETY: owns qpair and DMA buffers exclusively
@@ -322,6 +327,7 @@ impl SpdkBdev {
                 qpair_dead: qpair_dead.clone(),
             };
             let io_timeout_ms = info.io_timeout_ms;
+            let terminal_watcher_watchdog_ms = info.terminal_watcher_watchdog_ms;
             Ok(Self {
                 name: name.to_string(),
                 size,
@@ -341,6 +347,7 @@ impl SpdkBdev {
                 block_bdev_offset: 0,
                 block_extent_size: 0,
                 terminal_tx: env.terminal_event_sender(),
+                terminal_watcher_watchdog_ms,
             })
         }
     }
@@ -361,11 +368,21 @@ impl SpdkBdev {
     /// reports a `SpdkCommandTerminalEvent`. Only called after a write/flush
     /// `ETIMEDOUT`, and only if this handle has known block identity.
     ///
-    /// This thread can in principle live forever if SPDK never produces a
-    /// terminal completion for the qpair (e.g. hung controller with no
-    /// reset) — see the design doc's documented limitation. It is not
-    /// cancelled early because there is no safe way to abandon an in-flight
-    /// DMA buffer without a real terminal signal.
+    /// By default (`terminal_watcher_watchdog_ms == 0`) this thread can in
+    /// principle live forever if SPDK never produces a terminal completion
+    /// for the qpair (e.g. hung controller with no reset) — see the design
+    /// doc's documented limitation. It is not cancelled early in that case
+    /// because there is no safe way to abandon an in-flight DMA buffer
+    /// without a real terminal signal.
+    ///
+    /// If `terminal_watcher_watchdog_ms > 0`, this thread instead bounds
+    /// that wait: once the watchdog elapses with no qpair-level failure
+    /// ever detected by `poll_and_sweep` (i.e. the qpair still looks
+    /// healthy), it proactively escalates — asking the poller to
+    /// force-complete the whole qpair via `force_complete_qpair`, the same
+    /// safe mechanism already used for real transport failures. This
+    /// closes the one remaining unbounded case: a single command whose
+    /// completion was silently lost on an otherwise-healthy-looking qpair.
     fn spawn_terminal_watcher(&self, completion: Arc<crate::spdk_poller::IoCompletion>) {
         if self.block_id == 0 {
             return;
@@ -374,8 +391,39 @@ impl SpdkBdev {
         let bdev_offset = self.block_bdev_offset;
         let size = self.block_extent_size;
         let tx = self.terminal_tx.clone();
+        // Raw pointers aren't `Send`; carry the qpair identity as a plain
+        // integer across the thread boundary and reconstruct it inside the
+        // closure, same as how qpair identity is already treated as a
+        // `usize` key elsewhere (e.g. `spdk_poller.rs`'s `qpair_state` map).
+        let qpair_key = self.io_channel.qpair as usize;
+        let watchdog_ms = self.terminal_watcher_watchdog_ms;
         std::thread::spawn(move || {
-            let status = completion.wait(0);
+            let status = if watchdog_ms == 0 {
+                // Disabled: preserve the original unbounded-wait behavior.
+                completion.wait(0)
+            } else {
+                let watchdog_us = watchdog_ms.saturating_mul(1000);
+                let first = completion.wait(watchdog_us);
+                if first == -libc::ETIMEDOUT {
+                    warn!(
+                        "terminal watcher for block {} exceeded its {}ms watchdog with no \
+                         qpair-level failure detected; escalating qpair to dead",
+                        block_id, watchdog_ms
+                    );
+                    if let Some(env) = crate::spdk_env::SpdkEnv::global() {
+                        let qpair = qpair_key as *mut crate::spdk_ffi::spdk_nvme_qpair;
+                        let _ = env.escalate_qpair_from_poller(qpair);
+                    }
+                    // Escalation (if it ran) already force-completed this
+                    // exact completion via the poller; this returns
+                    // immediately. If escalation couldn't run (no global
+                    // env, e.g. mid-shutdown), this falls back to waiting
+                    // indefinitely, same as the watchdog-disabled path.
+                    completion.wait(0)
+                } else {
+                    first
+                }
+            };
             let _ = tx.send(crate::spdk_env::SpdkCommandTerminalEvent {
                 block_id,
                 bdev_offset,
@@ -1082,6 +1130,7 @@ mod test {
             block_bdev_offset: 0,
             block_extent_size: 0,
             terminal_tx: crossbeam::channel::unbounded().0,
+            terminal_watcher_watchdog_ms: 0,
         })
     }
 
@@ -1290,6 +1339,7 @@ mod test {
             block_bdev_offset: 0,
             block_extent_size: 0,
             terminal_tx: crossbeam::channel::unbounded().0,
+            terminal_watcher_watchdog_ms: 0,
         };
         (bdev, rx)
     }

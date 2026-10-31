@@ -2,6 +2,7 @@
 
 //! SPDK I/O poller thread - handles NVMe submit/poll on dedicated thread.
 use crate::spdk_ffi;
+use crate::spdk_metrics;
 /// Qpairs not thread-safe: submit + poll must on same thread.
 /// Single poller to demonstrate the correctness work.
 /// Uses eventfd for instant wake on new I/O submission.
@@ -61,6 +62,18 @@ pub enum IoOp {
     PollRetiredQpair {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
         ack: mpsc::Sender<i32>,
+    },
+    /// Proactively declare a qpair dead and force-complete all outstanding
+    /// I/O on it with `-EIO`, even though the qpair itself never reported
+    /// an error via `poll_and_sweep`. Sent by a timeout-watcher thread
+    /// (`spawn_terminal_watcher`) after its own watchdog deadline elapses,
+    /// so a command whose completion was silently lost on an
+    /// otherwise-healthy-looking qpair doesn't block that thread forever.
+    /// Reuses `force_complete_qpair`, the same mechanism `poll_and_sweep`
+    /// already uses for real qpair/transport failures — no new unsafety.
+    EscalateQpair {
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        ack: mpsc::Sender<()>,
     },
 }
 
@@ -492,6 +505,32 @@ impl SpdkPoller {
         }
     }
 
+    /// Proactively declare `qpair` dead and force-complete all outstanding
+    /// I/O on it with `-EIO`, blocking until acknowledged. Called by a
+    /// timeout-watcher thread after its own watchdog deadline elapses on an
+    /// otherwise-healthy-looking qpair. Safe to call even if the qpair was
+    /// already retired/removed by the time this runs (a no-op ack in that
+    /// case) — see `handle_escalate_qpair`.
+    pub(crate) fn escalate_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> UnregisterResult {
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let req = IoRequest {
+            op: IoOp::EscalateQpair { qpair, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        let Some(tx) = &self.tx else {
+            return UnregisterResult::Disconnected;
+        };
+        if tx.send(req).is_err() {
+            return UnregisterResult::Disconnected;
+        }
+        let _ = self.eventfd.write(1);
+        match ack_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => UnregisterResult::Acked,
+            Err(err) => unregister_ack_error_to_result(err),
+        }
+    }
+
     pub(crate) fn poll_retired_qpair(
         &self,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
@@ -590,6 +629,9 @@ impl SpdkPoller {
                         IoOp::PollRetiredQpair { .. } => {
                             Self::handle_poll_retired(&req);
                         }
+                        IoOp::EscalateQpair { .. } => {
+                            Self::handle_escalate_qpair(&req, &mut qpair_state, &retired);
+                        }
                         _ => {
                             Self::submit_one(
                                 &req,
@@ -684,6 +726,9 @@ impl SpdkPoller {
                                 }
                                 IoOp::PollRetiredQpair { .. } => {
                                     Self::handle_poll_retired(&req);
+                                }
+                                IoOp::EscalateQpair { .. } => {
+                                    Self::handle_escalate_qpair(&req, &mut qpair_state, &retired);
                                 }
                                 _ => {
                                     Self::submit_one(
@@ -802,6 +847,37 @@ impl SpdkPoller {
         }
     }
 
+    /// Proactively force-complete a qpair on a watcher thread's watchdog
+    /// request, reusing `force_complete_qpair` (the same path a real
+    /// transport failure already takes in `poll_and_sweep`). A no-op if the
+    /// qpair was already retired/removed by the time this runs (e.g. it
+    /// already failed naturally, or was already escalated once) — safe,
+    /// since there is then nothing left to force-complete.
+    fn handle_escalate_qpair(
+        req: &IoRequest,
+        qpair_state: &mut HashMap<usize, Box<QpairState>>,
+        retired: &RetiredQpairRegistry,
+    ) {
+        if let IoOp::EscalateQpair { qpair, ack } = &req.op {
+            let key = *qpair as usize;
+            if qpair_state.contains_key(&key) {
+                Self::force_complete_qpair(key, qpair_state);
+                if let Some(qs) = qpair_state.remove(&key) {
+                    qs.dead.store(true, Ordering::Release);
+                    retired.insert(key, Some(qs), true);
+                }
+                error!(
+                    "qpair 0x{:x} escalated to dead by a terminal-watcher watchdog \
+                     (command outstanding past the configured watchdog with no \
+                     qpair-level failure detected)",
+                    key
+                );
+                spdk_metrics::record_terminal_watcher_escalated();
+            }
+            let _ = ack.send(());
+        }
+    }
+
     /// Submit a single I/O request on the poller thread.
     fn submit_one(
         req: &IoRequest,
@@ -813,7 +889,9 @@ impl SpdkPoller {
             IoOp::Read { qpair, .. } => *qpair,
             IoOp::Write { qpair, .. } => *qpair,
             IoOp::Flush { qpair, .. } => *qpair,
-            IoOp::UnregisterQpair { .. } | IoOp::PollRetiredQpair { .. } => {
+            IoOp::UnregisterQpair { .. }
+            | IoOp::PollRetiredQpair { .. }
+            | IoOp::EscalateQpair { .. } => {
                 unreachable!("control request handled before submit_one")
             }
             IoOp::UnregisterCtrlr { .. } => {
@@ -909,6 +987,9 @@ impl SpdkPoller {
                 unreachable!("control request handled before submit_one")
             }
             IoOp::PollRetiredQpair { .. } => {
+                unreachable!("control request handled before submit_one")
+            }
+            IoOp::EscalateQpair { .. } => {
                 unreachable!("control request handled before submit_one")
             }
             IoOp::UnregisterCtrlr { .. } => {
@@ -1322,6 +1403,94 @@ mod test {
                 };
             }
         }
+    }
+
+    #[test]
+    fn escalate_qpair_force_completes_pending_and_retires_qpair() {
+        // Simulates a terminal-watcher watchdog firing: the qpair never
+        // reported an error via poll_and_sweep (unlike DEAD in the test
+        // above), but a watcher thread's watchdog elapsed anyway, so it
+        // sends IoOp::EscalateQpair instead.
+        let completion = IoCompletion::new();
+        let inflight = Arc::new(AtomicUsize::new(1));
+
+        let dead_flag = Arc::new(AtomicBool::new(false));
+        let mut qs = Box::new(QpairState {
+            dead: dead_flag.clone(),
+            pending: Vec::new(),
+            stale: Vec::new(),
+        });
+        let ctx = Box::into_raw(Box::new(CallbackCtx {
+            completion: completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            bdev_inflight: inflight.clone(),
+            dma_ref_released: AtomicBool::new(false),
+            qpair_state: &mut *qs as *mut QpairState,
+            pending_idx: 0,
+        }));
+        qs.pending.push(ctx);
+
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+        qpair_state.insert(LIVE, qs);
+
+        let retired = RetiredQpairRegistry::new();
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let req = IoRequest {
+            op: IoOp::EscalateQpair {
+                qpair: LIVE as *mut spdk_ffi::spdk_nvme_qpair,
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_escalate_qpair(&req, &mut qpair_state, &retired);
+
+        // Ack was sent so the watcher thread's escalate_qpair() call can
+        // return instead of blocking on recv_timeout.
+        assert!(ack_rx.recv_timeout(Duration::from_millis(100)).is_ok());
+
+        // The completion the watcher was blocked on is now force-completed,
+        // so its own subsequent wait(0) returns immediately instead of
+        // blocking forever.
+        assert_eq!(completion.wait(0), -libc::EIO);
+
+        // Qpair moved out of the active map into the retired registry —
+        // same end state poll_and_sweep leaves a real transport failure in.
+        assert!(!qpair_state.contains_key(&LIVE));
+        assert!(retired.contains(LIVE));
+        assert!(dead_flag.load(Ordering::Acquire));
+
+        // Clean up the moved CallbackCtx (normally freed by reclaim_stale
+        // once the qpair is actually freed).
+        if let Some(mut retired_entry) = retired.take(LIVE as *mut spdk_ffi::spdk_nvme_qpair) {
+            if let Some(qs) = retired_entry.state.as_mut() {
+                qs.reclaim_stale();
+            }
+        }
+    }
+
+    #[test]
+    fn escalate_qpair_on_already_retired_qpair_is_a_safe_no_op() {
+        // The qpair already failed naturally (or was already escalated
+        // once) by the time the watchdog request arrives — must not panic
+        // or double-free, and must still ack so the watcher doesn't hang.
+        let mut qpair_state: HashMap<usize, Box<QpairState>> = HashMap::new();
+        let retired = RetiredQpairRegistry::new();
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let req = IoRequest {
+            op: IoOp::EscalateQpair {
+                qpair: DEAD as *mut spdk_ffi::spdk_nvme_qpair,
+                ack: ack_tx,
+            },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+
+        SpdkPoller::handle_escalate_qpair(&req, &mut qpair_state, &retired);
+
+        assert!(ack_rx.recv_timeout(Duration::from_millis(100)).is_ok());
+        assert!(!retired.contains(DEAD));
     }
 
     #[test]

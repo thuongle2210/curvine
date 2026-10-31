@@ -21,6 +21,7 @@ pub(crate) struct SpdkMetrics {
     qpair_release_freed_pool_full: Counter,
     qpair_release_freed_retired: Counter,
     qpair_shutdown_total: Counter,
+    terminal_watcher_escalated: Counter,
 }
 
 static SPDK_METRICS: OnceLock<Option<SpdkMetrics>> = OnceLock::new();
@@ -75,6 +76,11 @@ impl SpdkMetrics {
             qpair_shutdown_total: m::new_counter(
                 "spdk_qpair_shutdown_total",
                 "Total SPDK qpair pool shutdown drains",
+            )?,
+            terminal_watcher_escalated: m::new_counter(
+                "spdk_terminal_watcher_escalated_total",
+                "Terminal-watcher threads that proactively force-completed their qpair \
+                 after a watchdog timeout, with no qpair-level failure ever detected",
             )?,
         })
     }
@@ -138,4 +144,8 @@ pub(crate) fn record_qpair_release(result: &'static str) {
 
 pub(crate) fn record_qpair_shutdown() {
     with_metrics(|m| m.qpair_shutdown_total.inc());
+}
+
+pub(crate) fn record_terminal_watcher_escalated() {
+    with_metrics(|m| m.terminal_watcher_escalated.inc());
 }
