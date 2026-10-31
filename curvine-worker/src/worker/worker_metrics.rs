@@ -52,6 +52,7 @@ pub struct WorkerMetrics {
     /// Quarantine-release proofs given up on after exceeding their retry
     /// cap (either genuinely stale, or stuck transitioning to Quarantined).
     /// See `HeartbeatTask::retry_pending_quarantine_proofs`.
+    // TODO: split by outcome (Stale/Err vs. NotYetQuarantined) so operators can tell benign cleanup apart from a stuck quarantine transition.
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
     pub(crate) spdk_quarantine_proof_dropped: Counter,
 }
