@@ -211,8 +211,21 @@ pub struct WorkerConf {
     /// here, since reaching this cap means something is actually wrong
     /// (e.g. `abort_block_uncertain` is persistently failing for this
     /// block), not just a brief timing race. `0` (default) disables the
-    /// cap, preserving infinite retry.
+    /// cap, preserving infinite retry. See also
+    /// `spdk_quarantine_proof_stuck_warn_retries` for an earlier,
+    /// non-terminal observability signal before this cap is reached.
     pub spdk_quarantine_proof_stuck_max_retries: u32,
+
+    /// Emit a one-time warning log and raise the `spdk_quarantine_proof_stuck`
+    /// gauge once a `NotYetQuarantined` quarantine-release proof has been
+    /// retried this many heartbeat ticks, without yet giving up on it. This
+    /// is purely an early observability signal -- the proof keeps retrying
+    /// exactly as before, up to `spdk_quarantine_proof_stuck_max_retries` --
+    /// intended to be set well below that final cap so operators learn a
+    /// block may be stuck well before it is actually dropped (or while it
+    /// is still retrying forever, if the final cap is left at its default
+    /// of unlimited). `0` (default) disables this early warning.
+    pub spdk_quarantine_proof_stuck_warn_retries: u32,
 
     /// Version compatibility policy applied to client peers on data-plane
     /// connections (diagnose by default; enforce only when explicitly
@@ -267,6 +280,7 @@ impl Default for WorkerConf {
             spdk_disk: SpdkConf::default(),
             spdk_quarantine_proof_max_retries: 0,
             spdk_quarantine_proof_stuck_max_retries: 0,
+            spdk_quarantine_proof_stuck_warn_retries: 0,
             compatibility: CompatibilityConf::default(),
         }
     }
@@ -315,6 +329,7 @@ data_dir = ["[SSD]/data/data1"]
         let conf = WorkerConf::default();
         assert_eq!(conf.spdk_quarantine_proof_max_retries, 0);
         assert_eq!(conf.spdk_quarantine_proof_stuck_max_retries, 0);
+        assert_eq!(conf.spdk_quarantine_proof_stuck_warn_retries, 0);
     }
 
     #[test]
@@ -324,10 +339,12 @@ dir_reserved = "0"
 data_dir = ["[SSD]/data/data1"]
 spdk_quarantine_proof_max_retries = 30
 spdk_quarantine_proof_stuck_max_retries = 600
+spdk_quarantine_proof_stuck_warn_retries = 60
 "#;
         let conf: WorkerConf = toml::from_str(toml).unwrap();
         assert_eq!(conf.spdk_quarantine_proof_max_retries, 30);
         assert_eq!(conf.spdk_quarantine_proof_stuck_max_retries, 600);
+        assert_eq!(conf.spdk_quarantine_proof_stuck_warn_retries, 60);
     }
 
     #[test]
@@ -340,5 +357,6 @@ data_dir = ["[SSD]/data/data1"]
         let conf: WorkerConf = toml::from_str(toml).unwrap();
         assert_eq!(conf.spdk_quarantine_proof_max_retries, 0);
         assert_eq!(conf.spdk_quarantine_proof_stuck_max_retries, 0);
+        assert_eq!(conf.spdk_quarantine_proof_stuck_warn_retries, 0);
     }
 }

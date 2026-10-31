@@ -49,11 +49,23 @@ pub struct WorkerMetrics {
     /// Writes rejected because storage admission reported insufficient capacity.
     pub(crate) disk_full_rejected_writes: Counter,
 
-    /// Quarantine-release proofs given up on after exceeding their retry
-    /// cap (either genuinely stale, or stuck transitioning to Quarantined).
-    /// See `HeartbeatTask::retry_pending_quarantine_proofs`.
+    /// Quarantine-release proofs given up on: either a genuinely stale
+    /// proof (dropped immediately, no cap involved) or one that exceeded
+    /// its retry cap (a persistent store `Err`, or a `NotYetQuarantined`
+    /// proof stuck past `spdk_quarantine_proof_stuck_max_retries`). See
+    /// `HeartbeatTask::retry_pending_quarantine_proofs`.
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
     pub(crate) spdk_quarantine_proof_dropped: Counter,
+
+    /// Live count of `NotYetQuarantined` quarantine-release proofs
+    /// currently flagged as suspiciously stuck: retried at least
+    /// `spdk_quarantine_proof_stuck_warn_retries` times without yet
+    /// transitioning to `Quarantined`, but not yet dropped via
+    /// `spdk_quarantine_proof_stuck_max_retries` either. A purely early,
+    /// non-terminal observability signal -- the proof keeps retrying
+    /// exactly as before. See `HeartbeatTask::retry_pending_quarantine_proofs`.
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) spdk_quarantine_proof_stuck: Gauge,
 }
 
 impl WorkerMetrics {
@@ -115,7 +127,13 @@ impl WorkerMetrics {
 
             spdk_quarantine_proof_dropped: m::new_counter(
                 "spdk_quarantine_proof_dropped",
-                "Quarantine-release proofs given up on after exceeding their retry cap",
+                "Quarantine-release proofs given up on (genuinely stale, or exceeded their retry cap)",
+            )?,
+
+            spdk_quarantine_proof_stuck: m::new_gauge(
+                "spdk_quarantine_proof_stuck",
+                "Live count of NotYetQuarantined quarantine-release proofs flagged as \
+                 suspiciously stuck (early warning, before the final give-up cap)",
             )?,
         };
 
@@ -184,6 +202,7 @@ mod tests {
 
         let text = metrics.text_output()?;
         assert!(text.contains("spdk_quarantine_proof_dropped"));
+        assert!(text.contains("spdk_quarantine_proof_stuck"));
         Ok(())
     }
 }

@@ -31,6 +31,12 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct PendingQuarantineProof {
     pub(crate) proof: QuarantineReleaseProof,
     pub(crate) attempts: u32,
+    /// Set once this proof has crossed `stuck_warn_retries` while still
+    /// `NotYetQuarantined`, so the one-time warning log and the
+    /// `spdk_quarantine_proof_stuck` gauge only fire/increment once per
+    /// proof, and so the gauge can be correctly decremented whenever this
+    /// proof eventually leaves the pending queue (released or dropped).
+    pub(crate) warned: bool,
 }
 
 pub struct HeartbeatTask {
@@ -59,6 +65,13 @@ pub struct HeartbeatTask {
     /// above). See `WorkerConf::spdk_quarantine_proof_stuck_max_retries`.
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
     pub(crate) quarantine_proof_stuck_max_retries: u32,
+    /// Emit a one-time warning + raise `spdk_quarantine_proof_stuck` once a
+    /// `NotYetQuarantined` proof has been retried this many ticks, as an
+    /// early, non-terminal signal before `quarantine_proof_stuck_max_retries`
+    /// is ever reached (or forever, if that cap is disabled). `0` =
+    /// disabled. See `WorkerConf::spdk_quarantine_proof_stuck_warn_retries`.
+    #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    pub(crate) quarantine_proof_stuck_warn_retries: u32,
 }
 
 impl HeartbeatTask {
@@ -176,6 +189,7 @@ impl HeartbeatTask {
             new_proofs,
             self.quarantine_proof_store_err_max_retries,
             self.quarantine_proof_stuck_max_retries,
+            self.quarantine_proof_stuck_warn_retries,
         );
     }
 
@@ -186,41 +200,53 @@ impl HeartbeatTask {
     /// unit tested without a real device. Extends `pending` with
     /// `new_proofs`, then retries every pending proof once:
     ///
-    /// - `Released`: drop, done.
+    /// - `Released`: drop, done. If this proof had previously been flagged
+    ///   as stuck (`p.warned`), clears the `spdk_quarantine_proof_stuck`
+    ///   gauge for it.
     /// - `NotYetQuarantined`: the block exists with the same identity but
     ///   hasn't transitioned to `Quarantined` yet. Expected to resolve
     ///   almost immediately; capped at `stuck_max_retries` since reaching it
     ///   means the transition itself is stuck, not that the proof is merely
-    ///   stale.
+    ///   stale. Separately, once this proof has been retried
+    ///   `stuck_warn_retries` times (expected to be well below
+    ///   `stuck_max_retries`) without yet hitting that final cap, a
+    ///   one-time warning is logged and `spdk_quarantine_proof_stuck` is
+    ///   raised -- purely an early, non-terminal observability signal, not
+    ///   a change in retry behavior.
     /// - `Stale`: the block's identity no longer matches at all; whatever
     ///   this proof would have released has already been resolved
     ///   elsewhere. This is a settled fact the moment it's observed --
     ///   re-checking on a later tick cannot change the answer -- so it is
     ///   dropped unconditionally on first observation, with no retry/cap
-    ///   needed.
+    ///   needed. If this proof had previously been flagged as stuck,
+    ///   clears the gauge for it.
     /// - `Err`: a transient store-level failure (e.g. lock contention), not
     ///   a definitive answer about the proof itself, so it genuinely is
     ///   worth retrying a bounded number of times before giving up. Capped
-    ///   at `store_err_max_retries`.
+    ///   at `store_err_max_retries`. If dropped while previously flagged as
+    ///   stuck, clears the gauge for it.
     ///
-    /// `0` for either cap means unlimited (preserves infinite retry).
+    /// `0` for any of the three thresholds means disabled/unlimited
+    /// (preserves infinite retry / no early warning).
     #[cfg_attr(not(feature = "spdk"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn retry_pending_quarantine_proofs(
         store: &BlockStore,
         pending: &Mutex<Vec<PendingQuarantineProof>>,
         new_proofs: Vec<QuarantineReleaseProof>,
         store_err_max_retries: u32,
         stuck_max_retries: u32,
+        stuck_warn_retries: u32,
     ) {
         let mut pending = match pending.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        pending.extend(
-            new_proofs
-                .into_iter()
-                .map(|proof| PendingQuarantineProof { proof, attempts: 0 }),
-        );
+        pending.extend(new_proofs.into_iter().map(|proof| PendingQuarantineProof {
+            proof,
+            attempts: 0,
+            warned: false,
+        }));
         if pending.is_empty() {
             return;
         }
@@ -234,10 +260,27 @@ impl HeartbeatTask {
                         p.proof.bdev_offset,
                         p.proof.size
                     );
+                    if p.warned {
+                        if let Ok(metrics) = Worker::get_metrics() {
+                            metrics.spdk_quarantine_proof_stuck.dec();
+                        }
+                    }
                     false
                 }
                 Ok(QuarantineReleaseOutcome::NotYetQuarantined) => {
                     p.attempts += 1;
+                    if !p.warned && stuck_warn_retries != 0 && p.attempts >= stuck_warn_retries {
+                        p.warned = true;
+                        warn!(
+                            "block {} has been Writing for {} retries following an uncertain \
+                             flush failure; may indicate abort_block_uncertain is stuck \
+                             (offset={} size={})",
+                            p.proof.block_id, p.attempts, p.proof.bdev_offset, p.proof.size
+                        );
+                        if let Ok(metrics) = Worker::get_metrics() {
+                            metrics.spdk_quarantine_proof_stuck.inc();
+                        }
+                    }
                     if stuck_max_retries != 0 && p.attempts >= stuck_max_retries {
                         log::error!(
                             "block {} still Writing after {} retries following an uncertain \
@@ -250,6 +293,9 @@ impl HeartbeatTask {
                         );
                         if let Ok(metrics) = Worker::get_metrics() {
                             metrics.spdk_quarantine_proof_dropped.inc();
+                            if p.warned {
+                                metrics.spdk_quarantine_proof_stuck.dec();
+                            }
                         }
                         false
                     } else {
@@ -274,6 +320,9 @@ impl HeartbeatTask {
                     );
                     if let Ok(metrics) = Worker::get_metrics() {
                         metrics.spdk_quarantine_proof_dropped.inc();
+                        if p.warned {
+                            metrics.spdk_quarantine_proof_stuck.dec();
+                        }
                     }
                     false
                 }
@@ -286,6 +335,9 @@ impl HeartbeatTask {
                     if store_err_max_retries != 0 && p.attempts >= store_err_max_retries {
                         if let Ok(metrics) = Worker::get_metrics() {
                             metrics.spdk_quarantine_proof_dropped.inc();
+                            if p.warned {
+                                metrics.spdk_quarantine_proof_stuck.dec();
+                            }
                         }
                         false
                     } else {
@@ -377,6 +429,15 @@ mod tests {
     use curvine_model::{ExtendedBlock, FileType, StorageType};
     use std::sync::Mutex;
 
+    // `WorkerMetrics` (including `spdk_quarantine_proof_stuck`) is a
+    // process-wide singleton (see `worker_metrics.rs`'s own note on this).
+    // Tests that assert exact gauge deltas must not run concurrently with
+    // each other, or their before/after snapshots can race against one
+    // another's increments/decrements. This lock serializes only those
+    // tests against each other, without affecting the rest of this file's
+    // parallelism.
+    static GAUGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn test_store(name: &str) -> CommonResult<BlockStore> {
         let _worker = Worker::with_conf(ClusterConf {
             format_worker: true,
@@ -404,7 +465,7 @@ mod tests {
             size: 4096,
         };
 
-        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![new_proof], 0, 0);
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![new_proof], 0, 0, 0);
 
         assert!(
             pending.lock().unwrap().is_empty(),
@@ -428,8 +489,12 @@ mod tests {
             bdev_offset: 0,
             size: 4096,
         };
-        let pending = Mutex::new(vec![PendingQuarantineProof { proof, attempts: 0 }]);
-        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, 0);
+        let pending = Mutex::new(vec![PendingQuarantineProof {
+            proof,
+            attempts: 0,
+            warned: false,
+        }]);
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, 0, 0);
         assert!(pending.lock().unwrap().is_empty(), "first proof releases");
 
         // A second, duplicate proof for the same now-gone identity: Stale
@@ -443,7 +508,14 @@ mod tests {
             size: 4096,
         };
         let pending = Mutex::new(Vec::new());
-        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![stale_proof], 0, 0);
+        HeartbeatTask::retry_pending_quarantine_proofs(
+            &store,
+            &pending,
+            vec![stale_proof],
+            0,
+            0,
+            0,
+        );
         assert!(
             pending.lock().unwrap().is_empty(),
             "a stale proof must be dropped on first observation, with no retry needed"
@@ -476,6 +548,7 @@ mod tests {
                 if tick == 1 { vec![proof] } else { vec![] },
                 stale_cap,
                 stuck_cap,
+                0,
             );
             assert!(
                 !pending.lock().unwrap().is_empty(),
@@ -508,6 +581,7 @@ mod tests {
                 if tick == 1 { vec![proof] } else { vec![] },
                 0,
                 stuck_cap,
+                0,
             );
             assert!(
                 !pending.lock().unwrap().is_empty(),
@@ -515,11 +589,204 @@ mod tests {
             );
         }
 
-        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, stuck_cap);
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, stuck_cap, 0);
         assert!(
             pending.lock().unwrap().is_empty(),
             "a persistently NotYetQuarantined proof must be dropped once it exceeds the stuck cap"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_warns_once_and_raises_gauge_when_crossing_warn_threshold() -> CommonResult<()> {
+        let _guard = GAUGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let store = test_store("stuck-warn")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        // Never transitions to Quarantined in this test.
+
+        let proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let pending = Mutex::new(Vec::new());
+        let warn_at = 2u32;
+        let metrics = Worker::get_metrics()?;
+        let gauge_before = metrics.spdk_quarantine_proof_stuck.get();
+
+        // Tick 1: below the warn threshold, gauge must not move yet.
+        HeartbeatTask::retry_pending_quarantine_proofs(
+            &store,
+            &pending,
+            vec![proof],
+            0,
+            0,
+            warn_at,
+        );
+        assert_eq!(
+            metrics.spdk_quarantine_proof_stuck.get(),
+            gauge_before,
+            "gauge must not rise before the warn threshold is reached"
+        );
+
+        // Tick 2: reaches the warn threshold, gauge must rise by exactly 1.
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, 0, warn_at);
+        assert_eq!(
+            metrics.spdk_quarantine_proof_stuck.get(),
+            gauge_before + 1,
+            "gauge must rise by exactly 1 on the tick the warn threshold is first crossed"
+        );
+
+        // Ticks 3-5: still NotYetQuarantined, well past the warn threshold.
+        // The gauge must NOT rise again -- the warning/gauge increment is
+        // one-time per proof, not re-fired every subsequent tick.
+        for _ in 0..3 {
+            HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, 0, warn_at);
+            assert_eq!(
+                metrics.spdk_quarantine_proof_stuck.get(),
+                gauge_before + 1,
+                "gauge must stay at +1 on every subsequent tick past the warn threshold"
+            );
+        }
+        assert!(
+            !pending.lock().unwrap().is_empty(),
+            "no final cap is configured, proof must still be pending"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_gauge_clears_when_warned_proof_finally_releases() -> CommonResult<()> {
+        let _guard = GAUGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let store = test_store("stuck-warn-then-release")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+
+        let proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let pending = Mutex::new(Vec::new());
+        let warn_at = 1u32;
+        let metrics = Worker::get_metrics()?;
+        let gauge_before = metrics.spdk_quarantine_proof_stuck.get();
+
+        // Crosses the warn threshold immediately (warn_at=1).
+        HeartbeatTask::retry_pending_quarantine_proofs(
+            &store,
+            &pending,
+            vec![proof],
+            0,
+            0,
+            warn_at,
+        );
+        assert_eq!(metrics.spdk_quarantine_proof_stuck.get(), gauge_before + 1);
+
+        // Now the block actually transitions to Quarantined (simulating
+        // abort_block_uncertain finally succeeding), and the next retry
+        // tick releases it for real.
+        store.abort_block_uncertain(&block)?;
+        HeartbeatTask::retry_pending_quarantine_proofs(&store, &pending, vec![], 0, 0, warn_at);
+
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "proof must be released once the block is actually Quarantined"
+        );
+        assert_eq!(
+            metrics.spdk_quarantine_proof_stuck.get(),
+            gauge_before,
+            "gauge must clear back down once a previously-warned proof releases"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_gauge_clears_when_warned_proof_hits_final_cap() -> CommonResult<()> {
+        let _guard = GAUGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let store = test_store("stuck-warn-then-drop")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        // Never transitions to Quarantined: will eventually hit stuck_cap.
+
+        let proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let pending = Mutex::new(Vec::new());
+        let warn_at = 1u32;
+        let stuck_cap = 2u32;
+        let metrics = Worker::get_metrics()?;
+        let gauge_before = metrics.spdk_quarantine_proof_stuck.get();
+
+        // Tick 1: crosses the warn threshold.
+        HeartbeatTask::retry_pending_quarantine_proofs(
+            &store,
+            &pending,
+            vec![proof],
+            0,
+            stuck_cap,
+            warn_at,
+        );
+        assert_eq!(metrics.spdk_quarantine_proof_stuck.get(), gauge_before + 1);
+        assert!(!pending.lock().unwrap().is_empty());
+
+        // Tick 2: hits the final stuck cap and is dropped. The gauge must
+        // be cleared in the same tick, since this proof was warned.
+        HeartbeatTask::retry_pending_quarantine_proofs(
+            &store,
+            &pending,
+            vec![],
+            0,
+            stuck_cap,
+            warn_at,
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "proof must be dropped once it exceeds the stuck cap"
+        );
+        assert_eq!(
+            metrics.spdk_quarantine_proof_stuck.get(),
+            gauge_before,
+            "gauge must clear back down once a previously-warned proof is dropped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_warn_threshold_disabled_by_default() -> CommonResult<()> {
+        let _guard = GAUGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let store = test_store("stuck-warn-disabled")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+
+        let proof = QuarantineReleaseProof {
+            block_id: 1,
+            bdev_offset: 0,
+            size: 4096,
+        };
+        let pending = Mutex::new(Vec::new());
+        let metrics = Worker::get_metrics()?;
+        let gauge_before = metrics.spdk_quarantine_proof_stuck.get();
+
+        // warn_at=0 means disabled; run several ticks, gauge must never move.
+        for tick in 0..10 {
+            HeartbeatTask::retry_pending_quarantine_proofs(
+                &store,
+                &pending,
+                if tick == 0 { vec![proof] } else { vec![] },
+                0,
+                0,
+                0,
+            );
+            assert_eq!(
+                metrics.spdk_quarantine_proof_stuck.get(),
+                gauge_before,
+                "warn_at=0 must never raise the gauge (tick {tick})"
+            );
+        }
         Ok(())
     }
 }

@@ -132,6 +132,7 @@ pub struct BlockActor {
     pending_deletes: Arc<DashSet<i64>>,
     quarantine_proof_store_err_max_retries: u32,
     quarantine_proof_stuck_max_retries: u32,
+    quarantine_proof_stuck_warn_retries: u32,
 }
 
 impl BlockActor {
@@ -173,6 +174,9 @@ impl BlockActor {
             pending_deletes: Arc::new(DashSet::new()),
             quarantine_proof_store_err_max_retries: conf.worker.spdk_quarantine_proof_max_retries,
             quarantine_proof_stuck_max_retries: conf.worker.spdk_quarantine_proof_stuck_max_retries,
+            quarantine_proof_stuck_warn_retries: conf
+                .worker
+                .spdk_quarantine_proof_stuck_warn_retries,
         })
     }
 
@@ -200,6 +204,7 @@ impl BlockActor {
             self.heartbeat_interval_ms,
             self.quarantine_proof_store_err_max_retries,
             self.quarantine_proof_stuck_max_retries,
+            self.quarantine_proof_stuck_warn_retries,
         )?;
         Ok(())
     }
@@ -279,6 +284,7 @@ impl BlockActor {
         heartbeat_interval_ms: u64,
         quarantine_proof_store_err_max_retries: u32,
         quarantine_proof_stuck_max_retries: u32,
+        quarantine_proof_stuck_warn_retries: u32,
     ) -> CommonResult<()> {
         let scheduler = ScheduledExecutor::new("worker-heartbeat", heartbeat_interval_ms);
 
@@ -292,6 +298,7 @@ impl BlockActor {
             pending_quarantine_proofs: Arc::new(std::sync::Mutex::new(Vec::new())),
             quarantine_proof_store_err_max_retries,
             quarantine_proof_stuck_max_retries,
+            quarantine_proof_stuck_warn_retries,
         };
 
         scheduler.start(task)?;
