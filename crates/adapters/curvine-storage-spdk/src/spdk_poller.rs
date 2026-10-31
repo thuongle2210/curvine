@@ -72,6 +72,7 @@ pub enum IoOp {
     /// Reuses `force_complete_qpair`, the same mechanism `poll_and_sweep`
     /// already uses for real qpair/transport failures — no new unsafety.
     EscalateQpair {
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
         ack: mpsc::Sender<()>,
     },
@@ -556,10 +557,18 @@ impl SpdkPoller {
     /// otherwise-healthy-looking qpair. Safe to call even if the qpair was
     /// already retired/removed by the time this runs (a no-op ack in that
     /// case) — see `handle_escalate_qpair`.
-    pub(crate) fn escalate_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> UnregisterResult {
+    pub(crate) fn escalate_qpair(
+        &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    ) -> UnregisterResult {
         let (ack_tx, ack_rx) = mpsc::channel::<()>();
         let req = IoRequest {
-            op: IoOp::EscalateQpair { qpair, ack: ack_tx },
+            op: IoOp::EscalateQpair {
+                ctrlr,
+                qpair,
+                ack: ack_tx,
+            },
             completion: IoCompletion::new(),
             bdev_inflight: Arc::new(AtomicUsize::new(0)),
         };
@@ -947,7 +956,7 @@ impl SpdkPoller {
         qpair_state: &mut HashMap<usize, Box<QpairState>>,
         retired: &RetiredQpairRegistry,
     ) {
-        if let IoOp::EscalateQpair { qpair, ack } = &req.op {
+        if let IoOp::EscalateQpair { ctrlr, qpair, ack } = &req.op {
             let key = *qpair as usize;
             if qpair_state.contains_key(&key) {
                 Self::force_complete_qpair(key, qpair_state);
@@ -961,7 +970,7 @@ impl SpdkPoller {
                      qpair-level failure detected)",
                     key
                 );
-                spdk_metrics::record_terminal_watcher_escalated();
+                spdk_metrics::record_terminal_watcher_escalated(&format!("{:#x}", *ctrlr as usize));
             }
             let _ = ack.send(());
         }
@@ -1025,7 +1034,10 @@ impl SpdkPoller {
             )
         };
         if rc == 0 {
-            spdk_metrics::record_terminal_watcher_abort_submitted();
+            spdk_metrics::record_terminal_watcher_abort_submitted(&format!(
+                "{:#x}",
+                ctrlr as usize
+            ));
             AbortOutcome::Submitted
         } else {
             // Submit itself failed: no callback will ever fire for this ctx.
@@ -1624,6 +1636,7 @@ mod test {
         let (ack_tx, ack_rx) = mpsc::channel::<()>();
         let req = IoRequest {
             op: IoOp::EscalateQpair {
+                ctrlr: 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr,
                 qpair: LIVE as *mut spdk_ffi::spdk_nvme_qpair,
                 ack: ack_tx,
             },
@@ -1667,6 +1680,7 @@ mod test {
         let (ack_tx, ack_rx) = mpsc::channel::<()>();
         let req = IoRequest {
             op: IoOp::EscalateQpair {
+                ctrlr: 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr,
                 qpair: DEAD as *mut spdk_ffi::spdk_nvme_qpair,
                 ack: ack_tx,
             },

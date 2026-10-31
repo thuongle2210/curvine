@@ -1,7 +1,7 @@
 #![cfg(feature = "spdk")]
 
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, Gauge, Histogram, Metrics as m};
+use curvine_metrics::{Counter, CounterVec, Gauge, Histogram, Metrics as m};
 use log::warn;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -21,8 +21,16 @@ pub(crate) struct SpdkMetrics {
     qpair_release_freed_pool_full: Counter,
     qpair_release_freed_retired: Counter,
     qpair_shutdown_total: Counter,
-    terminal_watcher_escalated: Counter,
-    terminal_watcher_abort_submitted: Counter,
+    /// Labeled by controller identity (`ctrlr` — a stable-for-this-process
+    /// hex address, not human-friendly but sufficient for an operator's
+    /// own alerting to group/window per device, e.g.
+    /// `increase(spdk_terminal_watcher_escalated_total{ctrlr="0x..."}[1h]) > 3`
+    /// — repeated escalations clustered on the same controller are the
+    /// signal that a specific device, not just one unlucky command, needs
+    /// attention. See the design doc's "repeated escalation" follow-up.
+    terminal_watcher_escalated: CounterVec,
+    /// Same per-controller labeling as `terminal_watcher_escalated`.
+    terminal_watcher_abort_submitted: CounterVec,
 }
 
 static SPDK_METRICS: OnceLock<Option<SpdkMetrics>> = OnceLock::new();
@@ -78,16 +86,20 @@ impl SpdkMetrics {
                 "spdk_qpair_shutdown_total",
                 "Total SPDK qpair pool shutdown drains",
             )?,
-            terminal_watcher_escalated: m::new_counter(
+            terminal_watcher_escalated: m::new_counter_vec(
                 "spdk_terminal_watcher_escalated_total",
                 "Terminal-watcher threads that proactively force-completed their qpair \
-                 after a watchdog timeout, with no qpair-level failure ever detected",
+                 after a watchdog timeout, with no qpair-level failure ever detected, \
+                 labeled by controller so repeated escalations on the same device can \
+                 be grouped/windowed by an operator's own alerting",
+                &["ctrlr"],
             )?,
-            terminal_watcher_abort_submitted: m::new_counter(
+            terminal_watcher_abort_submitted: m::new_counter_vec(
                 "spdk_terminal_watcher_abort_submitted_total",
                 "Targeted NVMe Abort commands successfully submitted by a terminal-watcher \
                  thread for one specific stuck command, before falling back to the \
-                 qpair-wide escalation",
+                 qpair-wide escalation, labeled by controller",
+                &["ctrlr"],
             )?,
         })
     }
@@ -153,10 +165,23 @@ pub(crate) fn record_qpair_shutdown() {
     with_metrics(|m| m.qpair_shutdown_total.inc());
 }
 
-pub(crate) fn record_terminal_watcher_escalated() {
-    with_metrics(|m| m.terminal_watcher_escalated.inc());
+/// `ctrlr_label` should be a stable-for-this-process identifier for the
+/// controller (e.g. `format!("{:#x}", ctrlr as usize)`), so repeated
+/// escalations on the same physical device can be grouped/windowed by an
+/// operator's own alerting (not something this function does itself).
+pub(crate) fn record_terminal_watcher_escalated(ctrlr_label: &str) {
+    with_metrics(|m| {
+        m.terminal_watcher_escalated
+            .with_label_values(&[ctrlr_label])
+            .inc()
+    });
 }
 
-pub(crate) fn record_terminal_watcher_abort_submitted() {
-    with_metrics(|m| m.terminal_watcher_abort_submitted.inc());
+/// See `record_terminal_watcher_escalated` for the label convention.
+pub(crate) fn record_terminal_watcher_abort_submitted(ctrlr_label: &str) {
+    with_metrics(|m| {
+        m.terminal_watcher_abort_submitted
+            .with_label_values(&[ctrlr_label])
+            .inc()
+    });
 }
