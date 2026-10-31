@@ -20,7 +20,7 @@ use nix::sys::eventfd::EventFd;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -897,6 +897,12 @@ pub struct SpdkEnv {
     shutdown_in_progress: AtomicBool,
     terminal_tx: crossbeam::channel::Sender<SpdkCommandTerminalEvent>,
     terminal_rx: crossbeam::channel::Receiver<SpdkCommandTerminalEvent>,
+    /// Liveness heartbeat the poller thread increments once per outer loop
+    /// iteration. Persists independently of the poller's own start/stop
+    /// lifecycle (created once here, not inside `SpdkPoller`), so it can
+    /// always be read even if `poller` is briefly `None`. See
+    /// `poller_progress()` and `HeartbeatTask`'s poller-liveness check.
+    poller_progress: Arc<AtomicU64>,
     #[cfg(test)]
     test_hooks: SpdkEnvTestHooks,
 }
@@ -943,6 +949,7 @@ impl SpdkEnv {
             shutdown_in_progress: AtomicBool::new(false),
             terminal_tx,
             terminal_rx,
+            poller_progress: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             test_hooks: SpdkEnvTestHooks::default(),
         })
@@ -1116,6 +1123,7 @@ impl SpdkEnv {
                     ctrlrs,
                 },
                 self.retired_qpairs.clone(),
+                self.poller_progress.clone(),
             );
             *self.poller.lock().unwrap() = Some(poller);
             info!("SPDK poller thread started");
@@ -1452,6 +1460,19 @@ impl SpdkEnv {
             .as_ref()
             .expect("SpdkPoller not started — was init() called?")
             .is_sleeping_arc()
+    }
+
+    /// Liveness heartbeat the poller thread increments once per outer loop
+    /// iteration. Unlike `poller_eventfd`/`poller_is_sleeping`, this never
+    /// panics even if the poller hasn't started (or has stopped) — it
+    /// always returns the same persistent counter, created once at
+    /// `SpdkEnv::new()`. A caller (`HeartbeatTask`) comparing this value
+    /// across ticks can detect a genuinely stuck/dead poller thread — the
+    /// one failure mode nothing else in this file can recover from, since
+    /// every other recovery path requires sending the poller a message and
+    /// waiting for it to process it.
+    pub fn poller_progress(&self) -> u64 {
+        self.poller_progress.load(Ordering::Relaxed)
     }
 
     // Handle tracking, which is used by SpdkBdev open/drop
