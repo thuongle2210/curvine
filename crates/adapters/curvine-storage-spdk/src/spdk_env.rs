@@ -1929,11 +1929,12 @@ impl SpdkEnv {
     /// real transport failure already takes.
     pub(crate) fn escalate_qpair_from_poller(
         &self,
+        ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) -> UnregisterResult {
         let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(poller) = poller.as_ref() {
-            poller.escalate_qpair(qpair)
+            poller.escalate_qpair(ctrlr, qpair)
         } else {
             UnregisterResult::Disconnected
         }

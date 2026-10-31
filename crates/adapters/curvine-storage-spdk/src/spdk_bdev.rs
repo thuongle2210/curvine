@@ -450,8 +450,9 @@ impl SpdkBdev {
                             block_id, watchdog_ms
                         );
                         if let Some(env) = crate::spdk_env::SpdkEnv::global() {
+                            let ctrlr = ctrlr_key as *mut crate::spdk_ffi::spdk_nvme_ctrlr;
                             let qpair = qpair_key as *mut crate::spdk_ffi::spdk_nvme_qpair;
-                            let _ = env.escalate_qpair_from_poller(qpair);
+                            let _ = env.escalate_qpair_from_poller(ctrlr, qpair);
                         }
                         // Escalation (if it ran) already force-completed
                         // this exact completion via the poller; this
