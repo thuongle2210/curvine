@@ -216,7 +216,9 @@ pub struct SpdkBdev {
     io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     retired_dma: Arc<RetiredDmaRegistry>,
-    /// Set on write/flush `ETIMEDOUT` (unconfirmed completion); sticky like `qpair_dead`.
+    /// Set when a submitted write/flush's terminal outcome was not
+    /// confirmed (timeout or synthesized completion); sticky like
+    /// `qpair_dead`.
     uncertain_writes: AtomicBool,
 }
 
@@ -375,6 +377,27 @@ impl SpdkBdev {
             "NVMe error: SCT=0x{:02x}({}), SC=0x{:02x}",
             sct, sct_name, sc
         )
+    }
+
+    /// True if `rc` is a Generic abort status (SCT=0). SPDK can complete
+    /// a write/flush with one of these on qpair loss, via the normal
+    /// (non-forced) callback; the write may still have reached disk.
+    fn is_uncertain_abort_status(rc: i32) -> bool {
+        if rc >= 0 {
+            return false;
+        }
+        const SCT_GENERIC: u32 = 0x0;
+        const ABORTED_CODES: [u32; 7] = [
+            0x05, // ABORTED_POWER_LOSS
+            0x07, // ABORTED_BY_REQUEST
+            0x08, // ABORTED_SQ_DELETION
+            0x09, // ABORTED_FAILED_FUSED
+            0x0a, // ABORTED_MISSING_FUSED
+            0x1b, // ABORTED_PREEMPT
+            0x71, // ABORTED_BY_HOST
+        ];
+        let code = (-rc) as u32;
+        code / 256 == SCT_GENERIC && ABORTED_CODES.contains(&(code % 256))
     }
 
     /// Check that the current position + len doesn't exceed device size.
@@ -586,12 +609,16 @@ impl SpdkBdev {
             }
             let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
-                if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
+                if rc == -libc::EIO || rc == -libc::ETIMEDOUT || Self::is_uncertain_abort_status(rc)
+                {
                     self.io_channel.qpair_dead.store(true, Ordering::Release);
                 }
-                if rc == -libc::ETIMEDOUT || completion.was_forced() {
-                    // Wait timed out, or the poller synthesized this
-                    // status (e.g. force_complete_qpair); not confirmed.
+                if rc == -libc::ETIMEDOUT
+                    || completion.was_forced()
+                    || Self::is_uncertain_abort_status(rc)
+                {
+                    // Timeout, synthesized status, or genuine device
+                    // abort; none confirm the write did not reach disk.
                     self.uncertain_writes.store(true, Ordering::Release);
                 }
                 return err_box!(
@@ -628,12 +655,15 @@ impl SpdkBdev {
         )?;
         let rc = completion.wait(self.io_timeout_ms * 1000);
         if rc != 0 {
-            if rc == -libc::EIO || rc == -libc::ETIMEDOUT {
+            if rc == -libc::EIO || rc == -libc::ETIMEDOUT || Self::is_uncertain_abort_status(rc) {
                 self.io_channel.qpair_dead.store(true, Ordering::Release);
             }
-            if rc == -libc::ETIMEDOUT || completion.was_forced() {
-                // Wait timed out, or the poller synthesized this
-                // status (e.g. force_complete_qpair); not confirmed.
+            if rc == -libc::ETIMEDOUT
+                || completion.was_forced()
+                || Self::is_uncertain_abort_status(rc)
+            {
+                // Timeout, synthesized status, or genuine device
+                // abort; none confirm the flush did not reach disk.
                 self.uncertain_writes.store(true, Ordering::Release);
             }
             return err_box!(
@@ -1333,27 +1363,32 @@ mod test {
         std::mem::forget(bdev);
     }
 
-    /// Control: confirmed EIO (not a timeout) must not mark uncertain.
+    /// Control: Invalid Field rejection must not mark uncertain.
+    /// -libc::EIO (-5) can't be used here: it collides with SC=0x05.
     #[test]
-    fn spdk_write_eio_does_not_mark_uncertain() {
+    fn spdk_write_invalid_field_does_not_mark_uncertain() {
         let (mut bdev, rx) = test_bdev_with_fake_channel(true);
         // No timeout: avoid racing the 1ms deadline against thread scheduling.
         bdev.io_timeout_ms = 0;
+        const INVALID_FIELD: i32 = -0x02;
 
         let responder = std::thread::spawn(move || {
             let req = rx.recv().expect("write should submit exactly once");
-            assert!(req.completion.complete(-libc::EIO));
+            assert!(req.completion.complete(INVALID_FIELD));
             rx
         });
 
         let err = bdev
             .spdk_write(0, &[0u8; 512])
-            .expect_err("write should fail with a confirmed EIO");
+            .expect_err("write should fail with a confirmed rejection");
         assert!(err.to_string().contains("NVMe write failed"), "{}", err);
-        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            !bdev.io_channel.qpair_dead.load(Ordering::Acquire),
+            "a confirmed device rejection does not imply a dead qpair"
+        );
         assert!(
             !bdev.has_uncertain_writes(),
-            "confirmed EIO is not uncertain"
+            "confirmed device rejection is not uncertain"
         );
 
         let rx = responder.join().expect("responder thread must not panic");
@@ -1400,6 +1435,8 @@ mod test {
     #[test]
     fn spdk_write_forced_eio_marks_uncertain() {
         let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        // No timeout: force_complete() must be the only path to uncertain.
+        bdev.io_timeout_ms = 0;
 
         let responder = std::thread::spawn(move || {
             let req = rx.recv().expect("write should submit exactly once");
@@ -1426,7 +1463,9 @@ mod test {
     /// Same as above but for flush: a forced completion must be uncertain.
     #[test]
     fn spdk_flush_forced_eio_marks_uncertain() {
-        let (bdev, rx) = test_bdev_with_fake_channel(true);
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        // No timeout: force_complete() must be the only path to uncertain.
+        bdev.io_timeout_ms = 0;
 
         let responder = std::thread::spawn(move || {
             let req = rx.recv().expect("flush should submit exactly once");
@@ -1450,27 +1489,31 @@ mod test {
         std::mem::forget(bdev);
     }
 
-    /// Control: confirmed EIO must not mark uncertain (flush version).
+    /// Control: Invalid Field rejection must not mark uncertain (flush).
     #[test]
-    fn spdk_flush_eio_does_not_mark_uncertain() {
+    fn spdk_flush_invalid_field_does_not_mark_uncertain() {
         let (mut bdev, rx) = test_bdev_with_fake_channel(true);
         // No timeout: avoid racing the 1ms deadline against thread scheduling.
         bdev.io_timeout_ms = 0;
+        const INVALID_FIELD: i32 = -0x02;
 
         let responder = std::thread::spawn(move || {
             let req = rx.recv().expect("flush should submit exactly once");
-            assert!(req.completion.complete(-libc::EIO));
+            assert!(req.completion.complete(INVALID_FIELD));
             rx
         });
 
         let err = bdev
             .spdk_flush()
-            .expect_err("flush should fail with a confirmed EIO");
+            .expect_err("flush should fail with a confirmed rejection");
         assert!(err.to_string().contains("NVMe flush failed"), "{}", err);
-        assert!(bdev.io_channel.qpair_dead.load(Ordering::Acquire));
+        assert!(
+            !bdev.io_channel.qpair_dead.load(Ordering::Acquire),
+            "a confirmed device rejection does not imply a dead qpair"
+        );
         assert!(
             !bdev.has_uncertain_writes(),
-            "confirmed EIO is not uncertain"
+            "confirmed device rejection is not uncertain"
         );
 
         let rx = responder.join().expect("responder thread must not panic");
@@ -1484,6 +1527,8 @@ mod test {
     #[test]
     fn spdk_write_forced_eshutdown_marks_uncertain() {
         let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        // No timeout: force_complete() must be the only path to uncertain.
+        bdev.io_timeout_ms = 0;
 
         let responder = std::thread::spawn(move || {
             let req = rx.recv().expect("write should submit exactly once");
@@ -1504,5 +1549,63 @@ mod test {
         assert!(rx.try_recv().is_err(), "only one submit expected");
 
         std::mem::forget(bdev);
+    }
+
+    /// A non-forced device abort (SC=0x08, Aborted-SQ-Deletion) must
+    /// still be uncertain: the device may have executed the write.
+    #[test]
+    fn spdk_write_aborted_sq_deletion_marks_uncertain() {
+        let (mut bdev, rx) = test_bdev_with_fake_channel(true);
+        bdev.io_timeout_ms = 0;
+        const ABORTED_SQ_DELETION: i32 = -0x08;
+
+        let responder = std::thread::spawn(move || {
+            let req = rx.recv().expect("write should submit exactly once");
+            assert!(req.completion.complete(ABORTED_SQ_DELETION));
+            rx
+        });
+
+        let err = bdev
+            .spdk_write(0, &[0u8; 512])
+            .expect_err("write should fail with a genuine abort status");
+        assert!(err.to_string().contains("NVMe write failed"), "{}", err);
+        assert!(
+            bdev.has_uncertain_writes(),
+            "a non-forced device abort status must still be uncertain"
+        );
+        assert!(
+            bdev.io_channel.qpair_dead.load(Ordering::Acquire),
+            "an abort status also implies the qpair is unusable"
+        );
+
+        let rx = responder.join().expect("responder thread must not panic");
+        assert!(rx.try_recv().is_err(), "only one submit expected");
+
+        std::mem::forget(bdev);
+    }
+
+    /// Every blocklist code must be uncertain; codes outside it must not.
+    #[test]
+    fn is_uncertain_abort_status_covers_full_blocklist() {
+        // All 7 blocklist codes (SCT=0 Generic) must be uncertain.
+        for sc in [0x05i32, 0x07, 0x08, 0x09, 0x0a, 0x1b, 0x71] {
+            let rc = -sc;
+            assert!(
+                SpdkBdev::is_uncertain_abort_status(rc),
+                "SC=0x{sc:02x} must be classified uncertain"
+            );
+        }
+
+        // Codes not in the blocklist must be accepted (not uncertain).
+        for (sct, sc) in [(0u32, 0x02u32), (0, 0x80), (0, 0x00), (2, 0x08)] {
+            let rc = -((sct * 256 + sc) as i32);
+            assert!(
+                !SpdkBdev::is_uncertain_abort_status(rc),
+                "SCT=0x{sct:x}/SC=0x{sc:02x} must not be classified uncertain"
+            );
+        }
+
+        // rc >= 0 (success / no error) must never be uncertain.
+        assert!(!SpdkBdev::is_uncertain_abort_status(0));
     }
 }
