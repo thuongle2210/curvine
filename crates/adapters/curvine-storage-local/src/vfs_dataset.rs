@@ -1790,8 +1790,7 @@ mod test {
 
         assert!(
             result.is_ok(),
-            "repeated abort_block_uncertain on an already-quarantined block \
-             must be a no-op: {result:?}"
+            "repeated abort_block_uncertain on an already-quarantined block must be a no-op"
         );
         let meta = ds.get_block(1).expect("block must still exist");
         assert_eq!(meta.state(), &BlockState::Quarantined);
