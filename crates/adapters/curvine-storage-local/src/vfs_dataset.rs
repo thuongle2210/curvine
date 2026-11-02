@@ -798,7 +798,8 @@ impl Dataset for VfsDataset {
             return Ok(());
         };
 
-        if meta.is_quarantined() {
+        // Already quarantined, or a finalized replica: never touch it.
+        if meta.is_quarantined() || meta.is_final() {
             return Ok(());
         }
 
@@ -1796,6 +1797,42 @@ mod test {
         assert_eq!(meta.state(), &BlockState::Quarantined);
         let alloc = ds.offset_alloc_for_dir(1).unwrap();
         assert_eq!(alloc.free_list_size(), 0);
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// abort_block_uncertain() must never quarantine a finalized replica.
+    #[test]
+    fn abort_block_uncertain_is_a_noop_on_finalized_block() -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_noop_on_finalized";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.finalize_block(&block)?;
+        assert_eq!(ds.get_block(1).unwrap().state(), &BlockState::Finalized);
+
+        // Fail persistence: success proves the short-circuit before put_checked().
+        store.set_force_put_failure_for_test(true);
+        let result = ds.abort_block_uncertain(&block);
+        store.set_force_put_failure_for_test(false);
+
+        assert!(
+            result.is_ok(),
+            "abort_block_uncertain on a finalized block must be a no-op"
+        );
+        let meta = ds.get_block(1).expect("finalized block must still exist");
+        assert_eq!(
+            meta.state(),
+            &BlockState::Finalized,
+            "a finalized replica must never be quarantined"
+        );
 
         drop(ds);
         drop(store);
