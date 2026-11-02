@@ -19,7 +19,7 @@ use crate::worker::storage::{
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
-use curvine_model::{ExtendedBlock, StorageInfo};
+use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -421,13 +421,19 @@ impl BlockStore {
         self.with_dataset_write("abort_replication", |state| {
             // complete/open error paths may already have rolled back to an old committed
             // generation. A second abort must not delete that finalized replica.
-            if state
-                .get_block(block_id)
-                .is_some_and(|meta| !meta.is_final())
-            {
-                state.abort_block(&ExtendedBlock::with_id(block_id))?;
+            let Some(meta) = state.get_block(block_id) else {
+                return Ok(());
+            };
+            if meta.is_final() {
+                return Ok(());
             }
-            Ok(())
+            let block = ExtendedBlock::with_id(block_id);
+            // A Writing SPDK block may be an uncertain write whose quarantine
+            // never landed (e.g. writer disconnected): quarantine, never free.
+            if meta.storage_type() == StorageType::SpdkDisk && !meta.is_quarantined() {
+                return state.abort_block_uncertain(&block);
+            }
+            state.abort_block(&block)
         })
     }
 

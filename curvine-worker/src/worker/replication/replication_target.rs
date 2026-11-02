@@ -76,7 +76,15 @@ impl ReplicationTarget {
             // Close raw-device handles BEFORE releasing their allocations or lease.
             writer.file.take();
             if !writer.is_commit {
-                if let Err(e) = attempt.store.abort_replication_write(block_id) {
+                // is_commit=false may mean an uncertain abort is still
+                // pending; retry it so the extent is quarantined, not freed.
+                let result = match writer.pending_abort.as_ref() {
+                    Some(pending) if pending.uncertain => {
+                        attempt.store.abort_block_uncertain(&pending.block)
+                    }
+                    _ => attempt.store.abort_replication_write(block_id),
+                };
+                if let Err(e) = result {
                     attempt.writer = Some(writer);
                     return Err(e.into());
                 }
@@ -281,13 +289,14 @@ impl ReplicationTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::block::BlockState;
     use crate::worker::storage::Dataset;
     use crate::worker::Worker;
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_fs_api::RpcCode;
     use curvine_io::DataSlice;
-    use curvine_model::{ExtendedBlock, ProtoUtils};
+    use curvine_model::{ExtendedBlock, FileType, ProtoUtils, StorageType};
     use prost::Message as _;
 
     fn target() -> CommonResult<ReplicationTarget> {
@@ -685,5 +694,211 @@ mod tests {
         target.reap();
         assert_eq!(count(), 1);
         Ok(())
+    }
+
+    /// An SPDK-backed target over a synthetic bdev; no real device needed.
+    fn spdk_target() -> CommonResult<(ReplicationTarget, BlockStore)> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec![format!(
+                    "[MEM:1KB]../testing/replication-spdk-{}",
+                    Utils::uuid()
+                )],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        let _worker = Worker::with_conf(conf)?;
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        Ok((
+            ReplicationTarget::new(store.clone(), "session".into()),
+            store,
+        ))
+    }
+
+    fn raw_state(store: &BlockStore, id: i64) -> CommonResult<Option<BlockState>> {
+        Ok(store.get_raw_block_opt(id)?.map(|m| *m.state()))
+    }
+
+    /// A stale uncertain SPDK block left at Writing must be quarantined by
+    /// prepare(), not freed.
+    #[test]
+    fn prepare_over_stale_uncertain_spdk_block_quarantines_instead_of_freeing() -> CommonResult<()>
+    {
+        let (target, store) = spdk_target()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        let available_before = store.read()?.available();
+
+        prepare(&target, "successor")?;
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "ambiguous SPDK Writing block must be quarantined, not freed"
+        );
+        assert_eq!(
+            store.read()?.available(),
+            available_before,
+            "quarantine must keep the extent reserved"
+        );
+        Ok(())
+    }
+
+    /// Non-SPDK Writing blocks are still freed.
+    #[test]
+    fn prepare_still_frees_non_spdk_writing_block() -> CommonResult<()> {
+        let target = target()?;
+        let store = target.store.clone();
+        store.open_block(&ExtendedBlock::with_mem(1, "4B")?)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+
+        prepare(&target, "successor")?;
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            None,
+            "non-SPDK Writing block must still be freed"
+        );
+        Ok(())
+    }
+
+    /// revoke() after a failed uncertain abort must retry it, not plain-abort.
+    /// The writer is injected: a synthetic SPDK dataset can't open a real bdev.
+    #[test]
+    fn revoke_after_failed_uncertain_abort_quarantines_instead_of_freeing() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let token = prepare(&target, "a")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+
+        // Stand in for Open: allocate the block, attach a timing-out writer.
+        {
+            let mut attempts = target.stripe(1).lock();
+            let attempt = attempts.get_mut(&1).unwrap();
+            attempt.store.open_block(&block)?;
+            attempt.writer = Some(WriteHandler {
+                store: attempt.store.clone(),
+                context: Some(crate::worker::handler::WriteContext {
+                    block: block.clone(),
+                    req_id: 7,
+                    chunk_size: 4,
+                    short_circuit: false,
+                    off: 0,
+                    block_size: 4096,
+                    dir_id: 1,
+                    dir_metrics: None,
+                }),
+                file: Some(crate::worker::storage::BlockWriteContext::new(
+                    FailingFlushUncertainBlockIO,
+                    0,
+                    4096,
+                    0,
+                )?),
+                lease: None,
+                is_commit: false,
+                io_slow_us: 0,
+                metrics: Worker::get_metrics()?,
+                client_addr: "test".into(),
+                pending_abort: None,
+            });
+        }
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        let available_before = store.read()?.available();
+
+        // Fail the writer's own abort so revoke() sees a pending uncertain abort.
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = target
+            .write(&frame_for(&token, &block, RequestStatus::Complete))
+            .unwrap_err();
+        assert!(err.to_string().contains("flush timed out"), "{err}");
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "revoke must retry the uncertain abort and quarantine, not free"
+        );
+        assert_eq!(
+            store.read()?.available(),
+            available_before,
+            "quarantine must keep the extent reserved"
+        );
+        Ok(())
+    }
+
+    /// Like `frame`, but for an explicit block (`frame` hardcodes a Mem block).
+    fn frame_for(token: &str, block: &ExtendedBlock, status: RequestStatus) -> Message {
+        let header = BlockWriteRequest {
+            block: ProtoUtils::extend_block_to_pb(block.clone()),
+            off: 0,
+            block_size: block.len,
+            short_circuit: false,
+            client_name: "test".into(),
+            chunk_size: 4,
+            pipeline_stream: Vec::new(),
+            component_info: None,
+        }
+        .encode_to_vec();
+        Builder::new()
+            .code(RpcCode::WriteReplicationBlock)
+            .req_id(7)
+            .seq_id(0)
+            .request(status)
+            .proto_header(ReplicationWriteRequest {
+                block_id: block.id,
+                token: token.into(),
+                header,
+            })
+            .data(DataSlice::Empty)
+            .build()
+    }
+
+    /// Reports uncertain writes with a timed-out flush.
+    struct FailingFlushUncertainBlockIO;
+
+    impl curvine_io::BlockIO for FailingFlushUncertainBlockIO {
+        fn read_region(&mut self, _: bool, _: i32) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "unsupported",
+            )))
+        }
+        fn write_region(&mut self, _: &DataSlice) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+        fn write_all(&mut self, _: &[u8]) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+        fn read_all(&mut self, _: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "unsupported",
+            )))
+        }
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "flush timed out",
+            )))
+        }
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+        fn pos(&self) -> i64 {
+            0
+        }
+        fn len(&self) -> i64 {
+            0
+        }
+        fn path(&self) -> &str {
+            "failing-flush-uncertain"
+        }
+        fn resize(&mut self, _: bool, _: i64, _: i64, _: i32) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "unsupported",
+            )))
+        }
     }
 }
