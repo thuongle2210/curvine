@@ -19,7 +19,7 @@ use crate::worker::storage::{
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
-use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
+use curvine_model::{ExtendedBlock, StorageInfo};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -400,9 +400,10 @@ impl BlockStore {
     }
 
     /// Abort with an uncertain (timed-out) write/flush outcome; see `Dataset::abort_block_uncertain`.
+    /// Not fenced: quarantine only reserves the extent, so it is safe from
+    /// any session, and a fence rejection would strand the block at Writing.
     pub fn abort_block_uncertain(&self, block: &ExtendedBlock) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, "abort_uncertain");
-        self.check_replication_owner(block.id)?;
         #[cfg(test)]
         if self
             .force_transient_abort_failure
@@ -427,13 +428,9 @@ impl BlockStore {
             if meta.is_final() {
                 return Ok(());
             }
-            let block = ExtendedBlock::with_id(block_id);
-            // A Writing SPDK block may be an uncertain write whose quarantine
-            // never landed (e.g. writer disconnected): quarantine, never free.
-            if meta.storage_type() == StorageType::SpdkDisk && !meta.is_quarantined() {
-                return state.abort_block_uncertain(&block);
-            }
-            state.abort_block(&block)
+            // Plain abort: an uncertain write is quarantined by its own writer
+            // (never fenced), so a Writing block here is a certain failure.
+            state.abort_block(&ExtendedBlock::with_id(block_id))
         })
     }
 

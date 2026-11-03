@@ -722,10 +722,11 @@ mod tests {
         Ok(store.get_raw_block_opt(id)?.map(|m| *m.state()))
     }
 
-    /// A stale uncertain SPDK block left at Writing must be quarantined by
-    /// prepare(), not freed.
+    /// A stale SPDK block left at Writing is a certain failure: prepare()
+    /// must free it so the successor can reopen. Quarantining it would
+    /// brick the block id (open and remove both reject Quarantined).
     #[test]
-    fn prepare_over_stale_uncertain_spdk_block_quarantines_instead_of_freeing() -> CommonResult<()>
+    fn prepare_over_stale_spdk_writing_block_frees_it_and_successor_can_reopen() -> CommonResult<()>
     {
         let (target, store) = spdk_target()?;
         let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
@@ -737,14 +738,20 @@ mod tests {
 
         assert_eq!(
             raw_state(&store, 1)?,
-            Some(BlockState::Quarantined),
-            "ambiguous SPDK Writing block must be quarantined, not freed"
+            None,
+            "a stale certain-failure SPDK block must be freed, not quarantined"
         );
-        assert_eq!(
-            store.read()?.available(),
-            available_before,
-            "quarantine must keep the extent reserved"
+        assert!(
+            store.read()?.available() > available_before,
+            "freeing must return the extent"
         );
+        // The successor reopens via its own fenced store (the base store is
+        // now fenced out by the new lease).
+        {
+            let mut attempts = target.stripe(1).lock();
+            attempts.get_mut(&1).unwrap().store.open_block(&block)?;
+        }
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
         Ok(())
     }
 
@@ -824,6 +831,71 @@ mod tests {
             store.read()?.available(),
             available_before,
             "quarantine must keep the extent reserved"
+        );
+        Ok(())
+    }
+
+    /// With its lease gone, session fencing rejects the writer's store; the
+    /// uncertain quarantine must still succeed (it is always safe).
+    #[test]
+    fn uncertain_quarantine_succeeds_even_when_fencing_rejects() -> CommonResult<()> {
+        let (_, store) = spdk_target()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+
+        // Dropping the lease makes check_replication_owner reject this store.
+        let (fenced, lease) = store.replication_write_lease(1, "stale-token")?;
+        drop(lease);
+        assert!(
+            fenced.abort_replication_write(1).is_err(),
+            "sanity: plain fenced abort must be rejected in this window"
+        );
+
+        fenced.abort_block_uncertain(&block)?;
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "uncertain quarantine must not be blocked by session fencing"
+        );
+        Ok(())
+    }
+
+    /// A routine Cancel on a certain-failure SPDK block must free it.
+    #[test]
+    fn cancel_on_certain_spdk_writing_block_frees_it() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let token = prepare(&target, "a")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        {
+            let mut attempts = target.stripe(1).lock();
+            let attempt = attempts.get_mut(&1).unwrap();
+            attempt.store.open_block(&block)?;
+            attempt.writer = Some(WriteHandler {
+                store: attempt.store.clone(),
+                context: None,
+                file: None,
+                lease: None,
+                is_commit: false,
+                io_slow_us: 0,
+                metrics: Worker::get_metrics()?,
+                client_addr: "test".into(),
+                pending_abort: None,
+            });
+        }
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        let available_before = store.read()?.available();
+
+        target.write(&frame_for(&token, &block, RequestStatus::Cancel))?;
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            None,
+            "a certain-failure SPDK block must be freed on Cancel"
+        );
+        assert!(
+            store.read()?.available() > available_before,
+            "Cancel must return the extent"
         );
         Ok(())
     }
