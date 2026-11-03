@@ -422,9 +422,10 @@ impl BlockStore {
     }
 
     /// Abort with an uncertain (timed-out) write/flush outcome; see `Dataset::abort_block_uncertain`.
+    /// Not fenced: quarantine only reserves the extent, so it is safe from
+    /// any session, and a fence rejection would strand the block at Writing.
     pub fn abort_block_uncertain(&self, block: &ExtendedBlock) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, "abort_uncertain");
-        self.check_replication_owner(block.id)?;
         #[cfg(test)]
         if self
             .force_transient_abort_failure
@@ -443,13 +444,15 @@ impl BlockStore {
         self.with_dataset_write("abort_replication", |state| {
             // complete/open error paths may already have rolled back to an old committed
             // generation. A second abort must not delete that finalized replica.
-            if state
-                .get_block(block_id)
-                .is_some_and(|meta| !meta.is_final())
-            {
-                state.abort_block(&ExtendedBlock::with_id(block_id))?;
+            let Some(meta) = state.get_block(block_id) else {
+                return Ok(());
+            };
+            if meta.is_final() {
+                return Ok(());
             }
-            Ok(())
+            // Plain abort: an uncertain write is quarantined by its own writer
+            // (never fenced), so a Writing block here is a certain failure.
+            state.abort_block(&ExtendedBlock::with_id(block_id))
         })
     }
 
