@@ -25,10 +25,11 @@ use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fault::FaultHttpControl;
 use curvine_model::{FileBlocks, FileStatus, WorkerInfo};
+use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{MasterFilesystem, SessionSummary};
 use crate::master::MasterMetrics;
 
 #[derive(Clone)]
@@ -38,6 +39,7 @@ pub struct MasterRouterHandler {
     start_time: String,
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
+    journal_store: RocksLogStorage,
 }
 
 impl MasterRouterHandler {
@@ -46,6 +48,7 @@ impl MasterRouterHandler {
         fs: MasterFilesystem,
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
+        journal_store: RocksLogStorage,
     ) -> Self {
         Self {
             fs,
@@ -53,12 +56,15 @@ impl MasterRouterHandler {
             start_time: LocalTime::now_datetime(),
             metrics,
             fault_http,
+            journal_store,
         }
     }
 }
 
-fn get_report(fs: MasterFilesystem, metrics: &MasterMetrics) -> FsResult<HashMap<String, String>> {
-    let output = metrics.text_output(fs)?;
+fn get_report(instance: &MasterRouterHandler) -> FsResult<HashMap<String, String>> {
+    let output = instance
+        .metrics
+        .text_output(instance.fs.clone(), Some(&instance.journal_store))?;
     let report = output
         .lines()
         .filter(|line| !line.starts_with("#"))
@@ -82,11 +88,13 @@ fn get_report(fs: MasterFilesystem, metrics: &MasterMetrics) -> FsResult<HashMap
 }
 
 async fn metrics(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> FsResult<String> {
-    Ok(instance.metrics.text_output(instance.fs.clone())?)
+    Ok(instance
+        .metrics
+        .text_output(instance.fs.clone(), Some(&instance.journal_store))?)
 }
 
 async fn report(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> FsResult<String> {
-    let report = get_report(instance.fs.clone(), instance.metrics)?;
+    let report = get_report(&instance)?;
     let metric = |key: &str| report.get(key).map(String::as_str).unwrap_or("N/A");
     let available = metric("available");
     let capacity = metric("capacity");
@@ -251,6 +259,15 @@ async fn remove_dcm(
     }
 }
 
+/// Client session leases with their ownership footprint (#1885). A zombie mount is
+/// identifiable here — host, mount point, whether its lease is still live — without
+/// reading the metadata database.
+async fn sessions(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+) -> FsResult<Json<Vec<SessionSummary>>> {
+    Ok(Json(instance.fs.session_summary()?))
+}
+
 async fn workers1(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
 ) -> FsResult<Json<Vec<String>>> {
@@ -275,6 +292,7 @@ impl RouterHandler for MasterRouterHandler {
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
             .route("/workers", get(workers1))
+            .route("/api/sessions", get(sessions))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)

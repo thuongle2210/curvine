@@ -47,6 +47,23 @@ impl BlockState {
     }
 }
 
+/// Refusal to remove a quarantined block; permanent until released.
+#[derive(Debug)]
+pub struct QuarantinedBlockError(pub i64);
+
+impl fmt::Display for QuarantinedBlockError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "block {} is quarantined; refusing to remove", self.0)
+    }
+}
+
+impl std::error::Error for QuarantinedBlockError {}
+
+/// True if `e` is a [`QuarantinedBlockError`]; callers can park the block instead of retrying.
+pub fn is_quarantined_error(e: &curvine_core_error::CommonError) -> bool {
+    e.downcast_ref::<QuarantinedBlockError>().is_some()
+}
+
 /// Metadata information of the worker block.
 /// The len field has 3 meanings:
 /// 1. The value of block in writing, len is block_size.
@@ -174,6 +191,20 @@ impl BlockMeta {
 
     pub fn is_quarantined(&self) -> bool {
         self.state == BlockState::Quarantined
+    }
+
+    /// Length the worker has committed for this block, or `None` while the
+    /// block is still open for writing. Until finalize publishes the block,
+    /// `len` is only the reserved block size, and the file holds just the
+    /// bytes written so far.
+    pub fn committed_len(&self) -> Option<i64> {
+        match self.state {
+            BlockState::Finalized | BlockState::Recovering => Some(self.len),
+            BlockState::Writing
+            | BlockState::Allocating
+            | BlockState::Finalizing
+            | BlockState::Quarantined => None,
+        }
     }
 
     pub fn dir_id(&self) -> u32 {

@@ -35,6 +35,7 @@
 
 use curvine_core_error::err_box;
 use curvine_io::IOResult;
+use std::io::{ErrorKind, Read};
 use std::ops::Range;
 
 /// Default chunk size (64 KiB). Matches common read sizes so a typical read
@@ -48,6 +49,34 @@ const CHECKSUM_MAGIC: [u8; 4] = *b"CVCK";
 const CHECKSUM_VERSION: u16 = 1;
 const HEADER_LEN: usize = 4 + 2 + 2 + 4 + 8;
 const CRC_LEN: usize = 4;
+/// Read buffer for [`BlockChecksum::from_reader`].
+const READ_BUF_LEN: usize = 1024 * 1024;
+
+/// Read-side checksum verification mode for a block reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChecksumVerify {
+    /// Read without verification.
+    #[default]
+    Off,
+    /// Verify when a sidecar exists; read a block without one unverified.
+    AllowMissing,
+    /// Verify, and reject a block without a sidecar.
+    RequireSidecar,
+}
+
+impl ChecksumVerify {
+    pub fn from_conf(verify: bool, allow_missing: bool) -> Self {
+        match (verify, allow_missing) {
+            (false, _) => Self::Off,
+            (true, true) => Self::AllowMissing,
+            (true, false) => Self::RequireSidecar,
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
 
 /// CRC32C of `data`.
 pub fn crc32c(data: &[u8]) -> u32 {
@@ -65,13 +94,31 @@ pub struct BlockChecksum {
 impl BlockChecksum {
     /// Compute checksums for `data` split into `chunk_size` chunks.
     ///
-    /// This walks the whole buffer in a separate pass. Use it to re-derive a
-    /// checksum from bytes already on disk or in memory (sidecar rebuild,
-    /// tests). On the write path, feed data through [`ChecksumBuilder`] as it
-    /// is written instead.
+    /// The whole block must be in memory. For block files use
+    /// [`Self::from_reader`], which streams through [`ChecksumBuilder`].
     pub fn compute(chunk_size: u32, data: &[u8]) -> IOResult<Self> {
         let mut builder = ChecksumBuilder::new(chunk_size)?;
         builder.update(data);
+        Ok(builder.finish())
+    }
+
+    /// Compute checksums by streaming `reader` to EOF in bounded reads.
+    ///
+    /// Worker finalize uses this on the staging file, so every write path
+    /// (remote, short-circuit, rewrite copy, resize) is covered by one pass
+    /// over the bytes that will actually be published.
+    pub fn from_reader<R: Read>(chunk_size: u32, mut reader: R) -> IOResult<Self> {
+        let mut builder = ChecksumBuilder::new(chunk_size)?;
+        let mut buf = vec![0u8; READ_BUF_LEN];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            builder.update(&buf[..n]);
+        }
         Ok(builder.finish())
     }
 
@@ -208,20 +255,8 @@ impl BlockChecksum {
             );
         }
 
-        if body[0..4] != CHECKSUM_MAGIC {
-            return err_box!("invalid checksum magic: {:?}", &body[0..4]);
-        }
-        let version = u16::from_le_bytes(body[4..6].try_into().unwrap());
-        if version != CHECKSUM_VERSION {
-            return err_box!("unsupported checksum version: {}", version);
-        }
-        let reserved = u16::from_le_bytes(body[6..8].try_into().unwrap());
-        if reserved != 0 {
-            return err_box!("invalid checksum reserved field: {}", reserved);
-        }
-        let chunk_size = u32::from_le_bytes(body[8..12].try_into().unwrap());
-        let data_len = u64::from_le_bytes(body[12..20].try_into().unwrap());
-        check_chunk_size(chunk_size)?;
+        let header = ChecksumHeader::parse(body)?;
+        let (chunk_size, data_len) = (header.chunk_size, header.data_len);
 
         let (crc_chunks, rest) = body[HEADER_LEN..].as_chunks::<CRC_LEN>();
         if !rest.is_empty() {
@@ -232,12 +267,57 @@ impl BlockChecksum {
     }
 }
 
+/// Fixed-size header of an encoded checksum, read before the rest so a
+/// caller can bound the sidecar size before loading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChecksumHeader {
+    pub chunk_size: u32,
+    pub data_len: u64,
+}
+
+impl ChecksumHeader {
+    /// Encoded header size in bytes.
+    pub const LEN: usize = HEADER_LEN;
+
+    /// Parse and validate the first [`Self::LEN`] bytes of `buf`.
+    pub fn parse(buf: &[u8]) -> IOResult<Self> {
+        if buf.len() < HEADER_LEN {
+            return err_box!("checksum data too short: {} bytes", buf.len());
+        }
+        if buf[0..4] != CHECKSUM_MAGIC {
+            return err_box!("invalid checksum magic: {:?}", &buf[0..4]);
+        }
+        let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        if version != CHECKSUM_VERSION {
+            return err_box!("unsupported checksum version: {}", version);
+        }
+        let reserved = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+        if reserved != 0 {
+            return err_box!("invalid checksum reserved field: {}", reserved);
+        }
+        let chunk_size = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let data_len = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+        check_chunk_size(chunk_size)?;
+        Ok(Self {
+            chunk_size,
+            data_len,
+        })
+    }
+
+    /// Size in bytes of the full encoded form this header describes, `None`
+    /// on overflow.
+    pub fn encoded_len(&self) -> Option<u64> {
+        chunk_count(self.data_len, self.chunk_size)
+            .checked_mul(CRC_LEN as u64)?
+            .checked_add((HEADER_LEN + CRC_LEN) as u64)
+    }
+}
+
 /// Incremental per-chunk CRC32C computation for data written sequentially
 /// from block offset 0. Input slices may cross chunk boundaries arbitrarily.
 ///
-/// This is the intended write-path API: calling [`Self::update`] from the
-/// write loop computes CRCs while the bytes are already being touched, with no
-/// second pass over the data as [`BlockChecksum::compute`] would need.
+/// Feed it data in any slice sizes, for example the bounded reads of
+/// [`BlockChecksum::from_reader`], without holding the whole block in memory.
 #[derive(Debug, Clone)]
 pub struct ChecksumBuilder {
     chunk_size: u32,
@@ -307,11 +387,6 @@ pub fn chunk_count(data_len: u64, chunk_size: u32) -> u64 {
     data_len.div_ceil(chunk_size as u64)
 }
 
-/// Sidecar checksum path for a block file path.
-pub fn checksum_path(block_path: &str) -> String {
-    format!("{}{}", block_path, CHECKSUM_FILE_SUFFIX)
-}
-
 fn check_chunk_size(chunk_size: u32) -> IOResult<()> {
     if chunk_size == 0 {
         return err_box!("checksum chunk size must be > 0");
@@ -366,6 +441,17 @@ mod tests {
         assert_eq!(sum.data_len(), 0);
         assert_eq!(sum.chunk_count(), 0);
         assert_eq!(sum.chunks_for_range(0, 10), 0..0);
+    }
+
+    #[test]
+    fn from_reader_matches_compute_across_read_buffer() {
+        // Cross the internal read buffer boundary with a partial last chunk.
+        let data = sample(READ_BUF_LEN * 2 + 777);
+        let expected = BlockChecksum::compute(4096, &data).unwrap();
+        let actual = BlockChecksum::from_reader(4096, data.as_slice()).unwrap();
+        assert_eq!(actual, expected);
+        let empty = BlockChecksum::from_reader(4096, &[][..]).unwrap();
+        assert_eq!(empty.chunk_count(), 0);
     }
 
     #[test]
@@ -452,6 +538,30 @@ mod tests {
     }
 
     #[test]
+    fn header_describes_the_encoded_size() {
+        for (chunk_size, len) in [
+            (4, 0),
+            (4, 10),
+            (4, 12),
+            (DEFAULT_CHECKSUM_CHUNK_SIZE, 150_017),
+        ] {
+            let buf = BlockChecksum::compute(chunk_size, &sample(len))
+                .unwrap()
+                .encode();
+            let header = ChecksumHeader::parse(&buf).unwrap();
+            assert_eq!(header.chunk_size, chunk_size);
+            assert_eq!(header.data_len, len as u64);
+            assert_eq!(header.encoded_len(), Some(buf.len() as u64));
+        }
+        let huge = ChecksumHeader {
+            chunk_size: 1,
+            data_len: u64::MAX,
+        };
+        assert_eq!(huge.encoded_len(), None);
+        assert!(ChecksumHeader::parse(&[0u8; ChecksumHeader::LEN - 1]).is_err());
+    }
+
+    #[test]
     fn decode_rejects_corrupted_input() {
         let sum = BlockChecksum::compute(4, &sample(10)).unwrap();
         let buf = sum.encode();
@@ -503,10 +613,5 @@ mod tests {
         let mut ragged = body;
         ragged.push(0);
         assert!(BlockChecksum::decode(&reseal(ragged)).is_err());
-    }
-
-    #[test]
-    fn checksum_path_appends_suffix() {
-        assert_eq!(checksum_path("/data/blk_1"), "/data/blk_1.crc");
     }
 }
