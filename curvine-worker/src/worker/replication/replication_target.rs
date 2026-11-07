@@ -297,6 +297,7 @@ mod tests {
     use curvine_fs_api::RpcCode;
     use curvine_io::DataSlice;
     use curvine_model::{ExtendedBlock, FileType, ProtoUtils, StorageType};
+    use curvine_proto::DataHeaderProto;
     use prost::Message as _;
 
     fn target() -> CommonResult<ReplicationTarget> {
@@ -858,6 +859,163 @@ mod tests {
             Some(BlockState::Quarantined),
             "uncertain quarantine must not be blocked by session fencing"
         );
+        Ok(())
+    }
+
+    /// A replication write times out after its lease is gone: write_region
+    /// fails and the sticky uncertain flag is set.
+    struct FencedUncertainWriteBlockIO;
+
+    impl curvine_io::BlockIO for FencedUncertainWriteBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "fenced-uncertain-write"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// End to end on the real route: a replication writer whose lease has
+    /// already been revoked hits a timed-out write. write() must still
+    /// quarantine through the fenced store, and the successor's prepare()
+    /// must then see Quarantined (never free it) and be refused open_block.
+    #[test]
+    fn fenced_replication_writer_quarantines_uncertain_write_and_successor_cannot_reuse(
+    ) -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+
+        // Writer A opens under its replication lease, then loses it (revoke/expiry).
+        let (fenced, lease) = store.replication_write_lease(1, "stale-token")?;
+        fenced.open_block(&block)?;
+        drop(lease);
+        let available = store.read()?.available();
+
+        let mut writer_a = WriteHandler {
+            store: fenced.clone(),
+            context: Some(crate::worker::handler::WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size: block.len,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(crate::worker::storage::BlockWriteContext::new(
+                FencedUncertainWriteBlockIO,
+                0,
+                block.len,
+                0,
+            )?),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "writer-a".into(),
+            pending_abort: None,
+        };
+        let data = Builder::new()
+            .code(RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(DataHeaderProto {
+                offset: 0,
+                flush: false,
+                is_last: false,
+            })
+            .data(DataSlice::Buffer(prost::bytes::BytesMut::from(&b"x"[..])))
+            .build();
+        writer_a.write(&data).unwrap_err();
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "a fenced writer must still be able to quarantine its uncertain write"
+        );
+        assert_eq!(
+            store.read()?.available(),
+            available,
+            "extent stays reserved"
+        );
+
+        // Successor: prepare() revokes nothing live, takes a fresh lease, and
+        // runs the plain replication abort over the quarantined block.
+        let token = prepare(&target, "successor")?;
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "the successor's plain abort must not free a quarantined extent"
+        );
+        assert_eq!(store.read()?.available(), available);
+
+        // And it cannot reopen the same extent.
+        let reopened = {
+            let mut attempts = target.stripe(1).lock();
+            attempts.get_mut(&1).unwrap().store.open_block(&block)
+        };
+        assert!(reopened.is_err(), "quarantined block must not be reopened");
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+        let _ = token;
         Ok(())
     }
 
