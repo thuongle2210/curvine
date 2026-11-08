@@ -488,16 +488,26 @@ impl BlockStore {
     /// blocks already in the committed, finalized generation and dispatch to
     /// `abort_block` or `abort_block_uncertain`. Ordinary leases are not
     /// exclusive and error paths may have rolled back to an old committed
-    /// generation, so a late abort must never delete or quarantine an acked
-    /// replica. Uses the raw meta, never the readable view. Missing blocks
-    /// (already aborted) return `Ok(())`.
+    /// generation, so a late abort must never delete an acked replica. Uses
+    /// the raw meta, never the readable view. Missing blocks (already
+    /// aborted) return `Ok(())`.
     ///
-    /// Only certain aborts are fenced. Quarantine just reserves the extent,
-    /// so it is safe from any session, and a fence rejection would strand an
-    /// uncertain block at `Writing` for the successor's plain abort to free.
+    /// One exception, an uncertain abort of an SPDK block: every writer of
+    /// that block shares one extent (`BdevLayout::prepare_write` reuses the
+    /// offset), so timed-out I/O may still land on a replica another writer
+    /// finalized. That abort is not fenced (quarantine only reserves the
+    /// extent; a rejection would strand it at `Writing` for a plain abort to
+    /// free) and does not skip `Finalized`. Everything else, including the
+    /// destructive non-SPDK fallback of `abort_block_uncertain`, stays fenced.
     fn abort_with(&self, block: &ExtendedBlock, op: &str, uncertain: bool) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, op);
-        if !uncertain {
+        // The stripe lock pins the storage type: open/finalize/remove take it too.
+        let own_spdk_extent = uncertain
+            && self
+                .read()?
+                .get_block(block.id)
+                .is_some_and(|m| m.storage_type() == StorageType::SpdkDisk);
+        if !own_spdk_extent {
             self.check_replication_owner(block.id)?;
         }
         #[cfg(test)]
@@ -508,7 +518,7 @@ impl BlockStore {
             return curvine_core_error::err_box!("injected transient abort failure for test");
         }
         self.with_dataset_write(op, |state| {
-            if state.get_block(block.id).is_some_and(|m| m.is_final()) {
+            if !own_spdk_extent && state.get_block(block.id).is_some_and(|m| m.is_final()) {
                 return Ok(());
             }
             if uncertain {

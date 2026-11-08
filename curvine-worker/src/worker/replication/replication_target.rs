@@ -16,7 +16,7 @@ use crate::worker::block::{BlockStore, BlockWriteLease};
 use crate::worker::handler::WriteHandler;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
-
+use curvine_model::ExtendedBlock;
 use curvine_proto::{
     BlockWriteRequest, PrepareReplicationRequest, PrepareReplicationResponse,
     ReconcileReplicationRequest, ReconcileReplicationResponse, ReplicationWriteRequest,
@@ -73,16 +73,25 @@ impl ReplicationTarget {
     fn revoke(&self, block_id: i64, attempt: &mut TargetAttempt) -> FsResult<()> {
         attempt.retired = true;
         if let Some(mut writer) = attempt.writer.take() {
+            // A timed-out write that failed to quarantine leaves its only evidence on
+            // the file's sticky flag: read it before the handle is dropped.
+            let uncertain = writer
+                .pending_abort
+                .as_ref()
+                .is_some_and(|pending| pending.uncertain)
+                || writer
+                    .file
+                    .as_ref()
+                    .is_some_and(|f| f.has_uncertain_writes());
             // Close raw-device handles BEFORE releasing their allocations or lease.
             writer.file.take();
             if !writer.is_commit {
-                // is_commit=false may mean an uncertain abort is still
-                // pending; retry it so the extent is quarantined, not freed.
-                let result = match writer.pending_abort.as_ref() {
-                    Some(pending) if pending.uncertain => {
-                        attempt.store.abort_block_uncertain(&pending.block)
-                    }
-                    _ => attempt.store.abort_replication_write(block_id),
+                let result = if uncertain {
+                    attempt
+                        .store
+                        .abort_block_uncertain(&ExtendedBlock::with_id(block_id))
+                } else {
+                    attempt.store.abort_replication_write(block_id)
                 };
                 if let Err(e) = result {
                     attempt.writer = Some(writer);
@@ -296,7 +305,7 @@ mod tests {
     use curvine_core_error::CommonResult;
     use curvine_fs_api::RpcCode;
     use curvine_io::DataSlice;
-    use curvine_model::{ExtendedBlock, FileType, ProtoUtils, StorageType};
+    use curvine_model::{FileType, ProtoUtils, StorageType};
     use curvine_proto::DataHeaderProto;
     use prost::Message as _;
 
@@ -836,8 +845,67 @@ mod tests {
         Ok(())
     }
 
+    /// A timed-out Running write parks no PendingAbort; revoke() must read
+    /// the file's sticky flag before dropping it and quarantine, not free.
+    #[test]
+    fn revoke_reads_sticky_uncertain_flag_before_dropping_file() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let token = prepare(&target, "a")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        {
+            let mut attempts = target.stripe(1).lock();
+            let attempt = attempts.get_mut(&1).unwrap();
+            attempt.store.open_block(&block)?;
+            attempt.writer = Some(WriteHandler {
+                store: attempt.store.clone(),
+                context: Some(crate::worker::handler::WriteContext {
+                    block: block.clone(),
+                    req_id: 7,
+                    chunk_size: 4,
+                    short_circuit: false,
+                    off: 0,
+                    block_size: 4096,
+                    dir_id: 1,
+                    dir_metrics: None,
+                }),
+                file: Some(crate::worker::storage::BlockWriteContext::new(
+                    FencedUncertainWriteBlockIO,
+                    0,
+                    4096,
+                    0,
+                )?),
+                lease: None,
+                is_commit: false,
+                io_slow_us: 0,
+                metrics: Worker::get_metrics()?,
+                client_addr: "test".into(),
+                pending_abort: None,
+            });
+        }
+        let available_before = store.read()?.available();
+
+        // write()'s own quarantine fails; revoke() must still pick the uncertain abort.
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = target
+            .write(&frame(&token, RequestStatus::Running, b"data"))
+            .unwrap_err();
+        assert!(err.to_string().contains("write timed out"), "{err}");
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "revoke must quarantine from the sticky flag, not plain-abort"
+        );
+        assert_eq!(
+            store.read()?.available(),
+            available_before,
+            "extent must stay reserved"
+        );
+        Ok(())
+    }
+
     /// With its lease gone, session fencing rejects the writer's store; the
-    /// uncertain quarantine must still succeed (it is always safe).
+    /// uncertain quarantine of its own SPDK extent must still succeed.
     #[test]
     fn uncertain_quarantine_succeeds_even_when_fencing_rejects() -> CommonResult<()> {
         let (_, store) = spdk_target()?;
@@ -858,6 +926,35 @@ mod tests {
             raw_state(&store, 1)?,
             Some(BlockState::Quarantined),
             "uncertain quarantine must not be blocked by session fencing"
+        );
+        Ok(())
+    }
+
+    /// The non-SPDK fallback of an uncertain abort deletes the block, so a
+    /// fenced-out store must be rejected: another session's pending
+    /// allocation stays intact.
+    #[test]
+    fn fenced_uncertain_abort_on_disk_block_is_rejected() -> CommonResult<()> {
+        let target = target()?;
+        let store = target.store.clone();
+        let block = ExtendedBlock::with_mem(1, "4B")?;
+
+        // A stale session whose lease is gone, then the live owner opens the block.
+        let (stale, lease) = store.replication_write_lease(1, "stale-token")?;
+        drop(lease);
+        let (owner, _owner_lease) = store.replication_write_lease(1, "owner-token")?;
+        owner.open_block(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+
+        let err = stale.abort_block_uncertain(&block).unwrap_err();
+        assert!(
+            err.to_string().contains("fenced by a replication writer"),
+            "{err}"
+        );
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Writing),
+            "the owner's pending block must not be deleted by a stale session"
         );
         Ok(())
     }
