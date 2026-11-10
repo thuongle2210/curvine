@@ -129,6 +129,17 @@ impl ReplicationTarget {
                 .remove(&(current.expires, req.block_id, current.token.clone()));
             attempts.remove(&req.block_id);
         }
+        // Quarantined extent can't be freed or reopened: refuse before Open fails.
+        if self
+            .store
+            .get_raw_block_opt(req.block_id)?
+            .is_some_and(|meta| meta.is_quarantined())
+        {
+            return err_box!(
+                "block {} is quarantined on this worker and cannot be a replication target",
+                req.block_id
+            );
+        }
         let token = Utils::uuid();
         let (store, lease) = self.store.replication_write_lease(req.block_id, &token)?;
         // A disconnected ordinary/short-circuit writer can leave a staging allocation.
@@ -1095,24 +1106,34 @@ mod tests {
             "extent stays reserved"
         );
 
-        // Successor: prepare() revokes nothing live, takes a fresh lease, and
-        // runs the plain replication abort over the quarantined block.
-        let token = prepare(&target, "successor")?;
-        assert_eq!(
-            raw_state(&store, 1)?,
-            Some(BlockState::Quarantined),
-            "the successor's plain abort must not free a quarantined extent"
+        // Successor: prepare() refused before any lease; extent stays quarantined.
+        let err = prepare(&target, "successor").unwrap_err();
+        assert!(err.to_string().contains("quarantined"), "{err}");
+        assert!(
+            target.stripe(1).lock().get(&1).is_none(),
+            "a refused prepare must leave no reservation"
         );
-        assert_eq!(store.read()?.available(), available);
-
-        // And it cannot reopen the same extent.
-        let reopened = {
-            let mut attempts = target.stripe(1).lock();
-            attempts.get_mut(&1).unwrap().store.open_block(&block)
-        };
-        assert!(reopened.is_err(), "quarantined block must not be reopened");
         assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
-        let _ = token;
+        assert_eq!(store.read()?.available(), available);
+        Ok(())
+    }
+
+    /// prepare() on a quarantined block fails fast with no lease or reservation.
+    #[test]
+    fn prepare_on_quarantined_block_is_rejected() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        store.abort_block_uncertain(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+
+        let err = prepare(&target, "a").unwrap_err();
+        assert!(
+            err.to_string().contains("quarantined on this worker"),
+            "{err}"
+        );
+        assert!(target.stripe(1).lock().get(&1).is_none());
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
         Ok(())
     }
 

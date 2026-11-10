@@ -209,6 +209,19 @@ impl MasterReplicationManager {
         err_box!("No live source worker found for locations: {:?}", locations)
     }
 
+    /// Current locations plus workers holding a quarantined replica (they refuse the open).
+    pub(crate) fn excluded_targets(
+        &self,
+        block_id: BlockId,
+        locations: &[BlockLocation],
+    ) -> Vec<WorkerId> {
+        let mut excluded: Vec<WorkerId> = locations.iter().map(|l| l.worker_id).collect();
+        excluded.extend(self.worker_manager.read().quarantined_workers(block_id));
+        excluded.sort_unstable();
+        excluded.dedup();
+        excluded
+    }
+
     fn assign(&self, exclusive_worker_ids: Vec<WorkerId>) -> CommonResult<WorkerEndpoint> {
         let worker_manager = self.worker_manager.read();
         let mut assignment = worker_manager.choose_workers(1, exclusive_worker_ids)?;
@@ -475,13 +488,7 @@ impl MasterReplicationManager {
         }
 
         let source = self.source_endpoint(&block_state.locations)?;
-        let target = self.assign(
-            block_state
-                .locations
-                .iter()
-                .map(|location| location.worker_id)
-                .collect(),
-        )?;
+        let target = self.assign(self.excluded_targets(block_id, &block_state.locations))?;
         info!(
             "block_id: {}. locations: {:?}, target: {}",
             block_id, block_state.locations, target.address

@@ -172,6 +172,8 @@ pub struct BlockReportResult {
     /// Blocks reported as removed for failing checksum verification and
     /// queued for re-replication.
     pub corrupt_blocks: Vec<i64>,
+    /// Reported quarantined: location dropped, target excluded, repair queued.
+    pub quarantined_blocks: Vec<i64>,
 }
 
 #[derive(Default)]
@@ -1993,6 +1995,7 @@ impl MasterFilesystem {
             return Ok(BlockReportResult {
                 delete_blocks: Vec::new(),
                 corrupt_blocks: Vec::new(),
+                quarantined_blocks: Vec::new(),
             });
         }
 
@@ -2039,7 +2042,9 @@ impl MasterFilesystem {
                         }
                     }
                 }
-                BlockReportStatus::Deleted => checked.push((item, None)),
+                BlockReportStatus::Deleted | BlockReportStatus::Quarantined => {
+                    checked.push((item, None))
+                }
             }
         }
         if missing_blocks > 0 || not_file_blocks > 0 {
@@ -2051,6 +2056,7 @@ impl MasterFilesystem {
 
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
         let mut corrupt_blocks = Vec::new();
+        let mut quarantined_blocks = Vec::new();
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
@@ -2067,6 +2073,8 @@ impl MasterFilesystem {
                         }
                     };
 
+                    // A live replica report supersedes any earlier quarantine.
+                    wm.release_quarantine(list.worker_id, item.id);
                     match state {
                         BlockInodeState::File => batch.push((true, item.id, loc)),
                         BlockInodeState::Missing | BlockInodeState::NotFile => {
@@ -2081,6 +2089,13 @@ impl MasterFilesystem {
                     }
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
+                    wm.release_quarantine(list.worker_id, item.id);
+                }
+                BlockReportStatus::Quarantined => {
+                    // Pinned on that worker: not a location, not a target, delete deferred.
+                    quarantined_blocks.push(item.id);
+                    batch.push((false, item.id, loc));
+                    wm.quarantine_block(list.worker_id, item.id);
                 }
             }
         }
@@ -2088,7 +2103,7 @@ impl MasterFilesystem {
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
-        let corrupt_handler = if corrupt_blocks.is_empty() {
+        let corrupt_handler = if corrupt_blocks.is_empty() && quarantined_blocks.is_empty() {
             None
         } else {
             replication_handler.clone()
@@ -2122,28 +2137,43 @@ impl MasterFilesystem {
         applied?;
 
         if !corrupt_blocks.is_empty() {
-            self.recover_corrupt_blocks(list.worker_id, &corrupt_blocks, corrupt_handler);
+            self.recover_unusable_replicas(
+                list.worker_id,
+                &corrupt_blocks,
+                "removed as corrupt",
+                corrupt_handler.clone(),
+            );
+        }
+        if !quarantined_blocks.is_empty() {
+            self.recover_unusable_replicas(
+                list.worker_id,
+                &quarantined_blocks,
+                "quarantined",
+                corrupt_handler,
+            );
         }
 
         Ok(BlockReportResult {
             delete_blocks,
             corrupt_blocks,
+            quarantined_blocks,
         })
     }
 
-    /// A worker dropped these replicas because their data failed checksum
-    /// verification. Recover like a lost replica: invalidate cache files that
-    /// became unreadable, then queue the rest for re-replication.
-    fn recover_corrupt_blocks(
+    /// Replicas became unusable (corrupt or quarantined): invalidate cache files
+    /// no replica can serve, then queue the rest for re-replication.
+    fn recover_unusable_replicas(
         &self,
         worker_id: u32,
         block_ids: &[i64],
+        reason: &str,
         replication_handler: Option<MasterReplicationHandler>,
     ) {
         warn!(
-            "worker {} removed {} corrupt block replicas: {:?}",
+            "worker {} has {} block replicas {}: {:?}",
             worker_id,
             block_ids.len(),
+            reason,
             block_ids
         );
         let replication_block_ids = self.recover_removed_locations(worker_id, block_ids);
@@ -2158,8 +2188,8 @@ impl MasterFilesystem {
             replication_handler.report_under_replicated_blocks(worker_id, replication_block_ids)
         {
             error!(
-                "Errors on reporting under-replicated {} corrupt blocks from worker {}. err: {:?}",
-                count, worker_id, e
+                "Errors on reporting under-replicated {} {} blocks from worker {}. err: {:?}",
+                count, reason, worker_id, e
             );
         }
     }
@@ -2342,6 +2372,10 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
         };
+        // Markers go with the lost worker; a rejoin re-reports them.
+        self.worker_manager
+            .write()
+            .clear_worker_quarantine(worker_id);
         let replication_block_ids = self.recover_removed_locations(worker_id, &removed_block_ids);
 
         Ok(LostWorkerLocationCleanup {
@@ -3133,6 +3167,173 @@ mod tests {
             locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
             vec![100]
         );
+    }
+
+    /// Quarantined report: location dropped, marker set, delete cleared, repair queued.
+    #[test]
+    fn quarantined_report_drops_location_marks_worker_and_queues_repair() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantined-report");
+        let block_id = replication_file(&fs, "/quarantined-report.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        // The master had already asked 200 to delete it.
+        fs.worker_manager.write().remove_block(200, block_id);
+
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let handler = Some(MasterReplicationHandler::new(manager.clone()));
+        let report = BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id: 200,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::with_quarantined(
+                block_id,
+                StorageType::SpdkDisk,
+                0,
+            )],
+        };
+
+        let result = fs.block_report(report, handler).unwrap();
+        assert_eq!(result.quarantined_blocks, vec![block_id]);
+        assert!(result.corrupt_blocks.is_empty());
+        assert!(
+            manager.has_pending_repair(block_id),
+            "repair must be queued"
+        );
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100],
+            "the quarantined worker is no longer a location"
+        );
+        let wm = fs.worker_manager.read();
+        assert_eq!(wm.quarantined_workers(block_id), vec![200]);
+        assert_eq!(wm.quarantined_blocks(), vec![(block_id, vec![200])]);
+        drop(wm);
+        let cmds = fs.worker_manager.write().block_map.handle_heartbeat(200);
+        let pending: Vec<i64> = cmds
+            .into_iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+            })
+            .collect();
+        assert!(
+            pending.is_empty(),
+            "the delete must not be re-sent while quarantined: {pending:?}"
+        );
+    }
+
+    /// A quarantined worker is excluded as a target even once it is not a location.
+    #[test]
+    fn quarantined_worker_is_excluded_from_replication_targets() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantined-target-exclusion");
+        let block_id = replication_file(&fs, "/quarantined-target-exclusion.log");
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(manager.excluded_targets(block_id, &locations), vec![100]);
+
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100],
+            "200 is not a location"
+        );
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200],
+            "200 must still be excluded as a target"
+        );
+    }
+
+    /// Deleted/live reports and worker loss clear the marker.
+    #[test]
+    fn quarantine_marker_is_released_by_later_reports_and_worker_loss() {
+        let fs = test_fs("quarantine-release");
+        let block_id = replication_file(&fs, "/quarantine-release.log");
+        let report = |worker_id, info: BlockReportInfo| BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![info],
+        };
+        let quarantined = || BlockReportInfo::with_quarantined(block_id, StorageType::SpdkDisk, 0);
+
+        fs.block_report(report(200, quarantined()), None).unwrap();
+        fs.block_report(report(300, quarantined()), None).unwrap();
+        let mut workers = fs.worker_manager.read().quarantined_workers(block_id);
+        workers.sort_unstable();
+        assert_eq!(workers, vec![200, 300]);
+
+        // 200 released and deleted its extent.
+        fs.block_report(
+            report(200, BlockReportInfo::with_deleted(block_id, 0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![300]
+        );
+
+        // 300 is lost: its locations and markers go.
+        fs.delete_locations(300).unwrap();
+        assert!(fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty());
+        assert!(fs.worker_manager.read().quarantined_blocks().is_empty());
+
+        // A live Finalized report also supersedes a marker.
+        fs.block_report(report(200, quarantined()), None).unwrap();
+        fs.block_report(
+            report(
+                200,
+                BlockReportInfo::new(block_id, BlockReportStatus::Finalized, StorageType::Disk, 0),
+            ),
+            None,
+        )
+        .unwrap();
+        assert!(fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty());
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert!(locations.iter().any(|l| l.worker_id == 200));
     }
 
     #[test]
