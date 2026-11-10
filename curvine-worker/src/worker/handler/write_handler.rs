@@ -57,7 +57,7 @@ pub(crate) enum Terminal {
 }
 
 impl Terminal {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Terminal::Removed => "removed",
             Terminal::Quarantined => "quarantined",
@@ -98,7 +98,7 @@ impl PendingAbort {
 
     /// The source message only, matching what ErrorEncoder puts on the wire;
     /// Display would append ": " plus context.
-    fn source_message(error: &FsError) -> String {
+    pub(crate) fn source_message(error: &FsError) -> String {
         match error {
             FsError::IO(e) => e.source.to_string(),
             FsError::Common(e) => e.source.to_string(),
@@ -107,7 +107,7 @@ impl PendingAbort {
     }
 
     // Only IO vs Common is distinguished; the call sites produce no other kinds.
-    fn to_error(&self) -> FsError {
+    pub(crate) fn to_error(&self) -> FsError {
         match self.kind {
             ErrorKind::IO => FsError::io(std::io::Error::other(self.error.clone())),
             _ => FsError::common(&self.error),
@@ -354,7 +354,7 @@ impl WriteHandler {
 
     /// Quarantine as soon as a write is known uncertain, so the state lives in
     /// the dataset even if the client never sends Complete/Cancel.
-    fn quarantine_if_uncertain(
+    pub(crate) fn quarantine_if_uncertain(
         store: &BlockStore,
         block: &ExtendedBlock,
         file: &BlockWriteContext,
@@ -434,7 +434,7 @@ impl WriteHandler {
     /// Raw-meta verdict after an abort/finalize attempt. `Some` is terminal
     /// (safe to latch is_commit); `None` means still Writing or unreadable,
     /// so stay retryable.
-    fn terminal_state(&self, block_id: i64) -> Option<Terminal> {
+    pub(crate) fn terminal_state(&self, block_id: i64) -> Option<Terminal> {
         match self.store.get_raw_block_opt(block_id) {
             Ok(Some(meta)) if meta.is_quarantined() => Some(Terminal::Quarantined),
             Ok(Some(meta)) if meta.is_final() => Some(Terminal::Finalized),

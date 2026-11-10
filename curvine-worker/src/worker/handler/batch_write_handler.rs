@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockStore, BlockWriteLease};
+use crate::worker::handler::write_handler::PendingAbort;
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
 use crate::worker::storage::BlockWriteContext;
 use curvine_core_error::err_box;
 use curvine_core_error::CommonResult;
-use curvine_error::FsResult;
+use curvine_error::{ErrorKind, FsError, FsResult};
 use curvine_fs_api::RpcCode;
 use curvine_io::DataSlice;
 use curvine_model::{ExtendedBlock, ProtoUtils};
@@ -40,6 +41,8 @@ pub struct BatchWriteHandler {
     /// `BlockClient::write_commit_batch()` treat an aborted batch as
     /// committed); Cancel stays idempotent and successful.
     rolled_back: bool,
+    /// Rollback aborts that did not land; replayed by the next Complete/Cancel.
+    pub(crate) pending_aborts: Vec<PendingAbort>,
     pub(crate) write_handler: WriteHandler,
 }
 
@@ -61,6 +64,7 @@ impl BatchWriteHandler {
             leases: Vec::new(),
             is_commit: false,
             rolled_back: false,
+            pending_aborts: Vec::new(),
             write_handler: WriteHandler::new(store_clone, client_addr)?,
         })
     }
@@ -76,44 +80,64 @@ impl BatchWriteHandler {
         Ok(())
     }
 
-    /// Rolls back the batch's not-yet-committed blocks after a fatal
-    /// `complete_batch` failure: blocks from `start` onward. Blocks before
-    /// `start` were already committed (their finalize succeeded) and are
-    /// left untouched — aborting them could delete a new generation another
-    /// writer opened on the same block id after their commit. Each abort is
-    /// best-effort — a failure is logged and never replaces the original
-    /// error that caused the batch to fail.
+    /// Per sibling: a timed-out write/flush on its handle, or a block the
+    /// write path already quarantined. Read while the handles are still open.
+    fn sibling_uncertainty(&self) -> Vec<bool> {
+        let Some(contexts) = self.context.as_ref() else {
+            return Vec::new();
+        };
+        let files = self.file.as_ref();
+        contexts
+            .iter()
+            .enumerate()
+            .map(|(i, context)| {
+                let flagged = files
+                    .and_then(|f| f.get(i))
+                    .and_then(|f| f.as_ref())
+                    .is_some_and(|f| f.has_uncertain_writes());
+                flagged
+                    || self
+                        .store
+                        .get_raw_block_opt(context.block.id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.is_quarantined())
+            })
+            .collect()
+    }
+
+    /// Rolls back the batch's not-yet-committed blocks (from `start`) after a
+    /// fatal failure; blocks before `start` are committed and left alone, since
+    /// another writer may own a new generation on them. Handles are dropped
+    /// first so SPDK writers drain before any extent is freed; leases stay
+    /// until the aborts are done.
     ///
-    /// A block still in the committed, finalized generation is skipped (it
-    /// is committed state, not batch staging), and a block being rewritten
-    /// is handled atomically — the check and abort run under the same block
-    /// stripe lock, so a concurrent finalize cannot slip between them and
-    /// get its committed replica deleted. Missing blocks were already
-    /// aborted and are fine too.
-    ///
-    /// The batch's write handles are dropped before any abort, matching the
-    /// other abort paths (`open_batch` error, `WriteHandler::complete`):
-    /// on SPDK the writer's Drop waits for in-flight I/O to drain, while
-    /// `abort_block` returns the extent to the allocator, so freeing
-    /// extents while writers are still alive could let a new allocation
-    /// overwrite data still being written. Leases are kept until after the
-    /// aborts so write fencing stays in place while blocks are aborted.
-    ///
-    /// State is reset (`context` / `file` / `leases` cleared, `is_commit =
-    /// true`, `rolled_back = true`) so retried Complete/Cancel requests on
-    /// this handler observe the rollback instead of misreporting the batch
-    /// as committed.
-    fn rollback_batch_from(&mut self, start: usize) {
+    /// Each sibling is aborted by its own evidence: quarantine when its write
+    /// or flush was uncertain, plain abort otherwise. An abort that does not
+    /// land is parked in `pending_aborts` with the original error and replayed
+    /// by the next Complete/Cancel; the handler is closed either way.
+    fn rollback_batch_from(
+        &mut self,
+        start: usize,
+        uncertain: &[bool],
+        reason: &'static str,
+        error: &FsError,
+    ) {
         self.file.take();
         if let Some(contexts) = self.context.take() {
-            for context in contexts.iter().skip(start) {
-                if let Err(e) = self.store.abort_batch_write(context.block.id) {
-                    log::warn!(
-                        "failed to abort batch block {} after batch failure: {}",
-                        context.block.id,
-                        e
-                    );
-                }
+            for (i, context) in contexts.iter().enumerate().skip(start) {
+                let uncertain = uncertain.get(i).copied().unwrap_or(false);
+                let pending = PendingAbort {
+                    block: context.block.clone(),
+                    uncertain,
+                    reason,
+                    kind: match error.kind() {
+                        ErrorKind::IO => ErrorKind::IO,
+                        _ => ErrorKind::Common,
+                    },
+                    error: PendingAbort::source_message(error),
+                };
+                self.abort_or_park(pending);
             }
         }
         self.leases.clear();
@@ -121,8 +145,49 @@ impl BatchWriteHandler {
         self.rolled_back = true;
     }
 
-    fn rollback_batch(&mut self) {
-        self.rollback_batch_from(0);
+    fn rollback_batch(&mut self, reason: &'static str, error: &FsError) {
+        let uncertain = self.sibling_uncertainty();
+        self.rollback_batch_from(0, &uncertain, reason, error);
+    }
+
+    /// Run one rollback abort; park it if the block is still not terminal.
+    fn abort_or_park(&mut self, pending: PendingAbort) {
+        let result = if pending.uncertain {
+            self.store.abort_block_uncertain(&pending.block)
+        } else {
+            self.store.abort_batch_write(pending.block.id)
+        };
+        if let Err(e) = result {
+            log::warn!(
+                "failed to abort batch block {} after {}: {}",
+                pending.block.id,
+                pending.reason,
+                e
+            );
+        }
+        match self.write_handler.terminal_state(pending.block.id) {
+            Some(state) => log::info!(
+                "abort of batch block {} after {} landed: {}",
+                pending.block.id,
+                pending.reason,
+                state.as_str()
+            ),
+            None => self.pending_aborts.push(pending),
+        }
+    }
+
+    /// Replay every parked abort; returns the original error (same text on
+    /// every attempt) and whether all of them landed.
+    fn replay_pending_aborts(&mut self) -> (FsError, bool) {
+        let pending = std::mem::take(&mut self.pending_aborts);
+        let error = pending
+            .first()
+            .map(|p| p.to_error())
+            .unwrap_or_else(|| FsError::common("no pending batch abort"));
+        for p in pending {
+            self.abort_or_park(p);
+        }
+        (error, self.pending_aborts.is_empty())
     }
 
     fn abort_open_contexts(store: &BlockStore, contexts: &[WriteContext]) {
@@ -282,13 +347,25 @@ impl BatchWriteHandler {
         let header: BlocksBatchCommitRequest = match msg.parse_header() {
             Ok(header) => header,
             Err(e) => {
+                let e: FsError = e.into();
                 if !self.is_commit {
-                    self.rollback_batch();
+                    self.rollback_batch("malformed commit header", &e);
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
         let mut results = Vec::new();
+
+        // A rollback left aborts that had not landed: replay them before
+        // answering. Cancel is Ok once all landed; Complete keeps the original error.
+        if !self.pending_aborts.is_empty() {
+            let (error, landed) = self.replay_pending_aborts();
+            return if landed && !commit && msg.data.is_empty() {
+                Ok(msg.success())
+            } else {
+                Err(error)
+            };
+        }
 
         if self.is_commit {
             return if !msg.data.is_empty() {
@@ -316,7 +393,7 @@ impl BatchWriteHandler {
             {
                 Ok(blocks) => blocks,
                 Err(e) => {
-                    self.rollback_batch();
+                    self.rollback_batch("commit validation failure", &e);
                     return Err(e);
                 }
             };
@@ -329,16 +406,35 @@ impl BatchWriteHandler {
             if let Some(context) = self.context.as_ref().and_then(|c| c.get(i)) {
                 WriteHandler::record_write_error(self.write_handler.metrics, context.dir_id, &e);
             }
-            self.rollback_batch();
-            return Err(e.into());
+            let e: FsError = e.into();
+            self.rollback_batch("flush failure", &e);
+            return Err(e);
         }
+        // Sticky flags from mid-stream timeouts; read before the handles go.
+        let uncertain = self.sibling_uncertainty();
+        let Some(files) = self.file.as_mut() else {
+            return err_box!("batch commit without open files");
+        };
         for file in files.iter_mut() {
             file.take();
+        }
+        if commit {
+            if let Some(i) = uncertain.iter().position(|u| *u) {
+                // Data may still be in flight on that sibling: never finalize it.
+                let e = FsError::io(std::io::Error::other(format!(
+                    "block {} write outcome uncertain, extent quarantined",
+                    commit_blocks[i].id
+                )));
+                self.rollback_batch_from(0, &uncertain, "uncertain write", &e);
+                return Err(e);
+            }
         }
 
         for (i, block) in commit_blocks.into_iter().enumerate() {
             let result = if commit {
                 self.store.finalize_block(&block).map(|_| ())
+            } else if uncertain[i] {
+                self.store.abort_block_uncertain(&block)
             } else {
                 self.store.abort_block(&block)
             };
@@ -348,8 +444,14 @@ impl BatchWriteHandler {
                 // their commit, so only the contexts from the failing index
                 // onward are reclaimed. This still covers every block that
                 // was never committed.
-                self.rollback_batch_from(i);
-                return Err(e.into());
+                let e: FsError = e.into();
+                let reason = if commit {
+                    "finalize failure"
+                } else {
+                    "cancel failure"
+                };
+                self.rollback_batch_from(i, &uncertain, reason, &e);
+                return Err(e);
             }
             results.push(true);
         }
@@ -485,6 +587,7 @@ impl BatchWriteHandler {
                         context.dir_id,
                         &e,
                     );
+                    WriteHandler::quarantine_if_uncertain(&self.store, &context.block, file);
                     return Err(e.into());
                 }
             }
@@ -521,7 +624,7 @@ mod tests {
     use curvine_io::{BlockIO, DataSlice};
     use curvine_model::{ExtendedBlock, FileType, StorageType};
     use curvine_runtime::common::Utils;
-    use curvine_storage_local::Dataset;
+    use curvine_storage_local::{BlockState, Dataset};
 
     fn store() -> CommonResult<BlockStore> {
         let conf = ClusterConf {
@@ -909,6 +1012,336 @@ mod tests {
         }
         // Repeated commit is idempotent.
         handler.complete_batch(&commit_msg(&[1, 2, 3], 7), true)?;
+        Ok(())
+    }
+
+    /// Fake handle: `flush_ok` picks the flush result, `uncertain` the sticky flag.
+    struct FakeIO {
+        flush_ok: bool,
+        uncertain: bool,
+    }
+
+    impl BlockIO for FakeIO {
+        fn read_region(&mut self, _: bool, _: i32) -> curvine_io::IOResult<DataSlice> {
+            unreachable!()
+        }
+        fn write_region(&mut self, _: &DataSlice) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+        fn write_all(&mut self, _: &[u8]) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+        fn read_all(&mut self, _: &mut [u8]) -> curvine_io::IOResult<()> {
+            unreachable!()
+        }
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            if self.flush_ok {
+                Ok(())
+            } else {
+                Err(curvine_io::IOError::new(std::io::Error::other(
+                    "flush timed out",
+                )))
+            }
+        }
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+        fn pos(&self) -> i64 {
+            0
+        }
+        fn len(&self) -> i64 {
+            0
+        }
+        fn path(&self) -> &str {
+            "fake"
+        }
+        fn resize(&mut self, _: bool, _: i64, _: i64, _: i32) -> curvine_io::IOResult<()> {
+            unreachable!()
+        }
+        fn has_uncertain_writes(&self) -> bool {
+            self.uncertain
+        }
+    }
+
+    const SPDK_LEN: i64 = 4096;
+
+    fn spdk_block(id: i64) -> ExtendedBlock {
+        ExtendedBlock::new(id, SPDK_LEN, StorageType::SpdkDisk, FileType::File)
+    }
+
+    /// Three SPDK siblings (ids 1..=3) opened on the fake SPDK dataset, with
+    /// the given handles injected; `open_writer` would need a real bdev.
+    fn spdk_batch(
+        tag: &str,
+        handles: Vec<FakeIO>,
+    ) -> CommonResult<(BlockStore, BatchWriteHandler)> {
+        let _worker = Worker::with_conf(ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec![format!("[MEM:1KB]../testing/batch-{tag}-{}", Utils::uuid())],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        })?;
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        let mut contexts = Vec::new();
+        let mut files = Vec::new();
+        for (i, io) in handles.into_iter().enumerate() {
+            let block = spdk_block(i as i64 + 1);
+            store.open_block(&block)?;
+            contexts.push(WriteContext {
+                block: block.clone(),
+                req_id: 7 + i as i64,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size: SPDK_LEN,
+                dir_id: 0,
+                dir_metrics: None,
+            });
+            files.push(Some(BlockWriteContext::new(io, 0, SPDK_LEN, 0)?));
+        }
+        handler.context = Some(contexts);
+        handler.file = Some(files);
+        handler.leases = vec![None, None, None];
+        Ok((store, handler))
+    }
+
+    fn spdk_commit_msg(cancel: bool) -> Message {
+        let blocks = (1..=3)
+            .map(|id| {
+                ProtoUtils::extend_block_to_pb(ExtendedBlock::new(
+                    id,
+                    0,
+                    StorageType::SpdkDisk,
+                    FileType::File,
+                ))
+            })
+            .collect();
+        Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(if cancel {
+                RequestStatus::Cancel
+            } else {
+                RequestStatus::Complete
+            })
+            .req_id(7)
+            .proto_header(BlocksBatchCommitRequest {
+                blocks,
+                off: 0,
+                block_size: SPDK_LEN,
+                req_id: 7,
+                seq_id: 0,
+                cancel,
+                component_info: None,
+            })
+            .build()
+    }
+
+    fn raw_state(store: &BlockStore, id: i64) -> CommonResult<Option<BlockState>> {
+        Ok(store.get_raw_block_opt(id)?.map(|m| *m.state()))
+    }
+
+    fn ok() -> FakeIO {
+        FakeIO {
+            flush_ok: true,
+            uncertain: false,
+        }
+    }
+
+    /// Complete with one uncertain sibling (flush Ok, sticky flag): refused,
+    /// that sibling quarantined, the certain siblings freed, nothing finalized.
+    #[test]
+    fn complete_with_uncertain_sibling_quarantines_it_and_frees_the_rest() -> CommonResult<()> {
+        let uncertain = FakeIO {
+            flush_ok: true,
+            uncertain: true,
+        };
+        let (store, mut handler) = spdk_batch("complete-uncertain", vec![ok(), uncertain, ok()])?;
+        let available = store.read()?.available();
+
+        let err = handler
+            .complete_batch(&spdk_commit_msg(false), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
+        assert_eq!(raw_state(&store, 1)?, None);
+        assert_eq!(raw_state(&store, 3)?, None);
+        assert_eq!(
+            store.read()?.available(),
+            available + 2 * SPDK_LEN,
+            "only the quarantined extent stays reserved"
+        );
+        assert!(handler.rolled_back && handler.is_commit);
+        assert!(handler.pending_aborts.is_empty());
+        // A later Complete on this handler is still refused; Cancel is Ok.
+        assert!(handler
+            .complete_batch(&spdk_commit_msg(false), true)
+            .is_err());
+        handler.complete_batch(&spdk_commit_msg(true), false)?;
+        Ok(())
+    }
+
+    /// Cancel aborts each sibling by its own evidence: the uncertain one is
+    /// quarantined, the others freed; the Cancel itself succeeds.
+    #[test]
+    fn cancel_with_uncertain_sibling_quarantines_it_and_frees_the_rest() -> CommonResult<()> {
+        let uncertain = FakeIO {
+            flush_ok: true,
+            uncertain: true,
+        };
+        let (store, mut handler) = spdk_batch("cancel-uncertain", vec![uncertain, ok(), ok()])?;
+
+        handler.complete_batch(&spdk_commit_msg(true), false)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+        assert_eq!(raw_state(&store, 2)?, None);
+        assert_eq!(raw_state(&store, 3)?, None);
+        assert!(handler.is_commit && !handler.rolled_back);
+        Ok(())
+    }
+
+    /// A timed-out flush inside Complete quarantines that sibling and frees
+    /// the certain ones; the flush error is returned.
+    #[test]
+    fn flush_timeout_in_complete_quarantines_only_the_uncertain_sibling() -> CommonResult<()> {
+        let timed_out = FakeIO {
+            flush_ok: false,
+            uncertain: true,
+        };
+        let (store, mut handler) =
+            spdk_batch("complete-flush-timeout", vec![ok(), ok(), timed_out])?;
+
+        let err = handler
+            .complete_batch(&spdk_commit_msg(false), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("flush timed out"), "{err}");
+        assert_eq!(raw_state(&store, 3)?, Some(BlockState::Quarantined));
+        assert_eq!(raw_state(&store, 1)?, None);
+        assert_eq!(raw_state(&store, 2)?, None);
+        assert!(handler.rolled_back);
+        Ok(())
+    }
+
+    /// A confirmed (certain) flush failure still frees every sibling.
+    #[test]
+    fn certain_flush_failure_in_complete_frees_every_sibling() -> CommonResult<()> {
+        let failed = FakeIO {
+            flush_ok: false,
+            uncertain: false,
+        };
+        let (store, mut handler) = spdk_batch("complete-flush-certain", vec![ok(), failed, ok()])?;
+        let available = store.read()?.available();
+
+        assert!(handler
+            .complete_batch(&spdk_commit_msg(false), true)
+            .is_err());
+        for id in 1..=3 {
+            assert_eq!(raw_state(&store, id)?, None, "block {id} must be freed");
+        }
+        assert_eq!(store.read()?.available(), available + 3 * SPDK_LEN);
+        Ok(())
+    }
+
+    /// The standalone batch flush quarantines an uncertain sibling on the
+    /// spot, like the per-block write path; the batch itself stays open.
+    #[test]
+    fn standalone_flush_timeout_quarantines_the_sibling_immediately() -> CommonResult<()> {
+        let timed_out = FakeIO {
+            flush_ok: false,
+            uncertain: true,
+        };
+        let (store, mut handler) = spdk_batch("flush-batch-timeout", vec![ok(), timed_out, ok()])?;
+        let flush = Builder::new()
+            .code(RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .proto_header(DataHeaderProto {
+                flush: true,
+                ..Default::default()
+            })
+            .build();
+
+        assert!(handler.flush_batch(&flush).is_err());
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        assert_eq!(raw_state(&store, 3)?, Some(BlockState::Writing));
+        assert!(!handler.rolled_back && handler.context.is_some());
+        Ok(())
+    }
+
+    /// A sibling the write path already quarantined (no sticky flag on a
+    /// replaced handle) is still detected from its raw meta: Complete refused,
+    /// the extent stays pinned, the certain siblings are freed.
+    #[test]
+    fn complete_on_already_quarantined_sibling_is_refused() -> CommonResult<()> {
+        let (store, mut handler) = spdk_batch("complete-prequarantined", vec![ok(), ok(), ok()])?;
+        store.abort_block_uncertain(&spdk_block(2))?;
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
+
+        let err = handler
+            .complete_batch(&spdk_commit_msg(false), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("quarantined"), "{err}");
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
+        assert_eq!(raw_state(&store, 1)?, None);
+        assert_eq!(raw_state(&store, 3)?, None);
+        Ok(())
+    }
+
+    /// A rollback abort that fails transiently is remembered: the retried
+    /// Complete replays it and returns the original error; once it lands,
+    /// Cancel is Ok and a later Complete is still refused.
+    #[test]
+    fn rollback_remembers_failed_abort_and_retry_replays_it() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+
+        // The first abort of the rollback (block 1) fails once.
+        store.set_force_transient_abort_failure_for_test(true);
+        let first = handler
+            .complete_batch(&commit_msg(&[1, 2, 3], 42), true)
+            .unwrap_err();
+        assert!(first.to_string().contains("Request id mismatch"), "{first}");
+        assert!(handler.rolled_back && handler.is_commit);
+        assert!(store.get_block(1).is_ok(), "block 1 abort did not land");
+        assert!(store.get_block(2).is_err() && store.get_block(3).is_err());
+        assert_eq!(handler.pending_aborts.len(), 1);
+
+        // Retry: the parked abort is replayed, the original error returned.
+        let retry = handler
+            .complete_batch(&commit_msg(&[1, 2, 3], 7), true)
+            .unwrap_err();
+        assert_eq!(retry.to_string(), first.to_string());
+        assert!(store.get_block(1).is_err(), "replayed abort must land");
+        assert!(handler.pending_aborts.is_empty());
+
+        // Closed by rollback: Cancel is Ok, Complete stays refused.
+        handler.complete_batch(&commit_msg(&[1, 2, 3], 7), false)?;
+        assert!(handler
+            .complete_batch(&commit_msg(&[1, 2, 3], 7), true)
+            .is_err());
+        Ok(())
+    }
+
+    /// Same, but the first retry is a Cancel: it replays the abort and, since
+    /// the abort lands, answers Ok.
+    #[test]
+    fn cancel_retry_replays_failed_rollback_abort_and_returns_ok() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+        store.set_force_transient_abort_failure_for_test(true);
+        assert!(handler
+            .complete_batch(&commit_msg(&[1, 2, 3], 42), true)
+            .is_err());
+        assert_eq!(handler.pending_aborts.len(), 1);
+
+        handler.complete_batch(&commit_msg(&[1, 2, 3], 7), false)?;
+        assert!(store.get_block(1).is_err());
+        assert!(handler.pending_aborts.is_empty());
         Ok(())
     }
 }
