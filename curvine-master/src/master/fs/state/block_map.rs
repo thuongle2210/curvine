@@ -89,7 +89,10 @@ impl BlockMap {
             .remove(&block_id);
     }
 
-    /// Mark the replica quarantined and drop the pending delete (worker defers it anyway).
+    /// Mark the replica quarantined and drop the pending delete: the worker
+    /// parks a delete for a quarantined block anyway, and `remove_blocks`
+    /// re-issues it when the inode goes. A future release path must not
+    /// assume the worker ever received the dropped command.
     /// Returns true if the marker is new, so a re-sent report does not re-queue repair.
     pub fn quarantine_block(&mut self, worker_id: u32, block_id: i64) -> bool {
         let inserted = self
