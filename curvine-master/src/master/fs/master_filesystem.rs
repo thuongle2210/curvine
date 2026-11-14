@@ -172,7 +172,9 @@ pub struct BlockReportResult {
     /// Blocks reported as removed for failing checksum verification and
     /// queued for re-replication.
     pub corrupt_blocks: Vec<i64>,
-    /// Reported quarantined: location dropped, target excluded, repair queued.
+    /// Newly quarantined on this worker (marker was not set before): location
+    /// dropped, target excluded, repair queued. A re-sent report of an
+    /// existing marker, or a quarantined block of a deleted file, is not listed.
     pub quarantined_blocks: Vec<i64>,
 }
 
@@ -2006,7 +2008,11 @@ impl MasterFilesystem {
         let mut not_file_blocks = 0usize;
         for item in list.blocks {
             match item.status {
-                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
+                // Quarantined goes through the inode check too: a quarantined
+                // replica of a deleted file is told to delete, not repaired.
+                BlockReportStatus::Finalized
+                | BlockReportStatus::Writing
+                | BlockReportStatus::Quarantined => {
                     let defer_writing_delete =
                         item.status == BlockReportStatus::Writing && !list.full_report;
                     let state = match self.block_inode_state(item.id) {
@@ -2042,9 +2048,7 @@ impl MasterFilesystem {
                         }
                     }
                 }
-                BlockReportStatus::Deleted | BlockReportStatus::Quarantined => {
-                    checked.push((item, None))
-                }
+                BlockReportStatus::Deleted => checked.push((item, None)),
             }
         }
         if missing_blocks > 0 || not_file_blocks > 0 {
@@ -2092,10 +2096,32 @@ impl MasterFilesystem {
                     wm.release_quarantine(list.worker_id, item.id);
                 }
                 BlockReportStatus::Quarantined => {
-                    // Pinned on that worker: not a location, not a target, delete deferred.
-                    quarantined_blocks.push(item.id);
+                    let state = match exists {
+                        Some(v) => v,
+                        None => {
+                            warn!(
+                                "block_report invariant violated: missing inode state for block {}",
+                                item.id
+                            );
+                            continue;
+                        }
+                    };
                     batch.push((false, item.id, loc));
-                    wm.quarantine_block(list.worker_id, item.id);
+                    match state {
+                        // Pinned on that worker: not a location, not a target,
+                        // delete deferred. Repair only once per marker.
+                        BlockInodeState::File => {
+                            if wm.quarantine_block(list.worker_id, item.id) {
+                                quarantined_blocks.push(item.id);
+                            }
+                        }
+                        // The file is gone: no marker, no repair; the worker
+                        // parks the delete until the extent is released.
+                        BlockInodeState::Missing | BlockInodeState::NotFile => {
+                            wm.release_quarantine(list.worker_id, item.id);
+                            wm.remove_block(list.worker_id, item.id);
+                        }
+                    }
                 }
             }
         }
@@ -2319,7 +2345,7 @@ impl MasterFilesystem {
             }
         }
 
-        if !batch.is_empty() {
+        {
             let reconciles = self.full_block_reconciles.lock();
             if !reconciles
                 .get(&worker_id)
@@ -2332,6 +2358,16 @@ impl MasterFilesystem {
                 );
                 return Ok(Vec::new());
             }
+        }
+
+        // Quarantine markers the worker no longer reports are stale too
+        // (metadata lost, extent gone). Ids still reported Quarantined were
+        // re-marked when the completing batch was applied.
+        self.worker_manager
+            .write()
+            .retain_worker_quarantine(worker_id, &reported_blocks);
+
+        if !batch.is_empty() {
             self.apply_block_report_batch(batch)?;
         }
 
@@ -3229,6 +3265,204 @@ mod tests {
         assert!(
             pending.is_empty(),
             "the delete must not be re-sent while quarantined: {pending:?}"
+        );
+
+        // The same report again (full report on re-register): marker already
+        // set, so nothing is re-queued.
+        manager.clear_pending_repair_for_test(block_id);
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                Some(MasterReplicationHandler::new(manager.clone())),
+            )
+            .unwrap();
+        assert!(
+            result.quarantined_blocks.is_empty(),
+            "an already-marked quarantine must not be reported as new"
+        );
+        assert!(
+            !manager.has_pending_repair(block_id),
+            "repair must not be re-queued for an existing marker"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+    }
+
+    /// Quarantined report for a block whose file is gone: the worker is told
+    /// to delete (it parks the command until the extent is released), no
+    /// marker is set and no repair is queued.
+    #[test]
+    fn quarantined_report_for_deleted_inode_schedules_delete_not_repair() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantined-deleted-inode");
+        let block_id = replication_file(&fs, "/quarantined-deleted-inode.log");
+        fs.delete("/quarantined-deleted-inode.log", false).unwrap();
+        assert!(matches!(
+            fs.block_inode_state(block_id).unwrap(),
+            BlockInodeState::Missing
+        ));
+
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: true,
+                    total_len: 1,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                Some(MasterReplicationHandler::new(manager.clone())),
+            )
+            .unwrap();
+
+        assert!(result.quarantined_blocks.is_empty());
+        assert!(
+            !manager.has_pending_repair(block_id),
+            "no repair for a dead file"
+        );
+        assert!(fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty());
+        let cmds = fs.worker_manager.write().block_map.handle_heartbeat(200);
+        let pending: Vec<i64> = cmds
+            .into_iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+            })
+            .collect();
+        assert_eq!(pending, vec![block_id], "the worker must be told to delete");
+    }
+
+    /// Deleting the file clears the marker and re-issues the delete to the
+    /// quarantined worker, which is no longer a location.
+    #[test]
+    fn file_delete_clears_quarantine_marker_and_tells_quarantined_worker() {
+        let fs = test_fs("quarantine-file-delete");
+        let block_id = replication_file(&fs, "/quarantine-file-delete.log");
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+        let pending = |worker_id: u32| -> Vec<i64> {
+            fs.worker_manager
+                .write()
+                .block_map
+                .handle_heartbeat(worker_id)
+                .into_iter()
+                .flat_map(|cmd| match cmd {
+                    WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+                })
+                .collect()
+        };
+        assert!(pending(200).is_empty());
+
+        fs.delete("/quarantine-file-delete.log", false).unwrap();
+
+        assert!(fs.worker_manager.read().quarantined_blocks().is_empty());
+        assert_eq!(pending(100), vec![block_id], "the location is told");
+        assert_eq!(
+            pending(200),
+            vec![block_id],
+            "the quarantined worker is told too, even though it is not a location"
+        );
+    }
+
+    /// A full report that no longer lists the block (metadata lost) prunes
+    /// that worker's marker; a stale-generation reconcile prunes nothing.
+    #[test]
+    fn full_report_reconcile_prunes_unreported_quarantine_markers() {
+        let fs = test_fs("quarantine-full-report-prune");
+        let block_id = replication_file(&fs, "/quarantine-full-report-prune.log");
+        let quarantined = |worker_id| BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::with_quarantined(
+                block_id,
+                StorageType::SpdkDisk,
+                0,
+            )],
+        };
+        fs.block_report(quarantined(200), None).unwrap();
+        fs.block_report(quarantined(300), None).unwrap();
+
+        let seed = |worker_id: u32, generation: u64| {
+            fs.full_block_reconciles.lock().insert(
+                worker_id,
+                FullBlockReconcileState {
+                    running: true,
+                    generation,
+                    pending: None,
+                },
+            );
+        };
+
+        // Stale generation: nothing pruned.
+        seed(200, 2);
+        fs.reconcile_full_block_report(200, 1, HashSet::new())
+            .unwrap();
+        let mut workers = fs.worker_manager.read().quarantined_workers(block_id);
+        workers.sort_unstable();
+        assert_eq!(workers, vec![200, 300]);
+
+        // Current generation, block not reported: 200's marker goes, 300's stays.
+        fs.reconcile_full_block_report(200, 2, HashSet::new())
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![300]
+        );
+
+        // Still reported: kept.
+        seed(300, 1);
+        fs.reconcile_full_block_report(300, 1, HashSet::from([block_id]))
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![300]
         );
     }
 

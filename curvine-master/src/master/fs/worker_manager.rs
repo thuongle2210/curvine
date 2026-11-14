@@ -26,7 +26,7 @@ use curvine_model::{
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Display, Formatter};
 
 pub struct WorkerManager {
@@ -328,7 +328,7 @@ impl WorkerManager {
         self.block_map.deleted_block(worker_id, block_id)
     }
 
-    pub fn quarantine_block(&mut self, worker_id: u32, block_id: i64) {
+    pub fn quarantine_block(&mut self, worker_id: u32, block_id: i64) -> bool {
         self.block_map.quarantine_block(worker_id, block_id)
     }
 
@@ -346,6 +346,10 @@ impl WorkerManager {
 
     pub fn clear_worker_quarantine(&mut self, worker_id: u32) {
         self.block_map.clear_worker_quarantine(worker_id)
+    }
+
+    pub fn retain_worker_quarantine(&mut self, worker_id: u32, reported: &HashSet<i64>) {
+        self.block_map.retain_worker_quarantine(worker_id, reported)
     }
 
     pub fn get_worker(&self, id: u32) -> Option<&WorkerInfo> {
