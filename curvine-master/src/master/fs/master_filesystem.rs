@@ -172,9 +172,10 @@ pub struct BlockReportResult {
     /// Blocks reported as removed for failing checksum verification and
     /// queued for re-replication.
     pub corrupt_blocks: Vec<i64>,
-    /// Newly quarantined on this worker (marker was not set before): location
-    /// dropped, target excluded, repair queued. A re-sent report of an
-    /// existing marker, or a quarantined block of a deleted file, is not listed.
+    /// Newly quarantined on this worker (marker was not set before) and the
+    /// worker was a location: location dropped, target excluded, repair
+    /// queued. Not listed: a re-sent report of an existing marker, a block of
+    /// a deleted file, or a write that timed out before it was committed.
     pub quarantined_blocks: Vec<i64>,
 }
 
@@ -184,6 +185,7 @@ pub struct LostWorkerLocationCleanup {
     pub replication_block_ids: Vec<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockInodeState {
     File,
     Missing,
@@ -2006,6 +2008,10 @@ impl MasterFilesystem {
         let mut delete_blocks = Vec::new();
         let mut missing_blocks = 0usize;
         let mut not_file_blocks = 0usize;
+        // Quarantined blocks this worker was a location of. Only those lost a
+        // readable replica; a write that timed out before commit never had one,
+        // so it is marked (target exclusion) but not repaired.
+        let mut quarantined_was_location: HashSet<i64> = HashSet::new();
         for item in list.blocks {
             match item.status {
                 // Quarantined goes through the inode check too: a quarantined
@@ -2022,6 +2028,22 @@ impl MasterFilesystem {
                             continue;
                         }
                     };
+                    if item.status == BlockReportStatus::Quarantined
+                        && state == BlockInodeState::File
+                    {
+                        let held = self
+                            .fs_dir
+                            .read()
+                            .get_block_locations(item.id)
+                            .map(|locs| locs.iter().any(|l| l.worker_id == list.worker_id));
+                        match held {
+                            Ok(true) => {
+                                quarantined_was_location.insert(item.id);
+                            }
+                            Ok(false) => {}
+                            Err(e) => warn!("block_report {item:?}: {e}"),
+                        }
+                    }
                     match state {
                         BlockInodeState::File => checked.push((item, Some(BlockInodeState::File))),
                         BlockInodeState::Missing if defer_writing_delete => {
@@ -2109,9 +2131,11 @@ impl MasterFilesystem {
                     batch.push((false, item.id, loc));
                     match state {
                         // Pinned on that worker: not a location, not a target,
-                        // delete deferred. Repair only once per marker.
+                        // delete deferred. Repair once per marker, and only if
+                        // a readable replica was actually lost.
                         BlockInodeState::File => {
-                            if wm.quarantine_block(list.worker_id, item.id) {
+                            let new_marker = wm.quarantine_block(list.worker_id, item.id);
+                            if new_marker && quarantined_was_location.contains(&item.id) {
                                 quarantined_blocks.push(item.id);
                             }
                         }
@@ -3298,6 +3322,127 @@ mod tests {
         assert_eq!(
             fs.worker_manager.read().quarantined_workers(block_id),
             vec![200]
+        );
+    }
+
+    /// A client write that timed out before commit: the worker was never a
+    /// location, so nothing readable was lost. The marker is still set (the
+    /// extent is pinned, so the worker must not be a target) but no repair is
+    /// queued and the block is not reported as newly quarantined.
+    #[test]
+    fn quarantined_report_for_uncommitted_block_marks_worker_but_does_not_queue_repair() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantined-uncommitted");
+        // replication_file adds 100 as a location; 200 never commits.
+        let block_id = replication_file(&fs, "/quarantined-uncommitted.log");
+
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                Some(MasterReplicationHandler::new(manager.clone())),
+            )
+            .unwrap();
+
+        assert!(
+            result.quarantined_blocks.is_empty(),
+            "no readable replica was lost: not newly quarantined"
+        );
+        assert!(
+            !manager.has_pending_repair(block_id),
+            "no repair for a block the worker never held"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the extent is pinned: the marker still excludes 200 as a target"
+        );
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200]
+        );
+    }
+
+    /// A cache-mode file is only invalidated while it is `Both`; opening it
+    /// for write detaches UFS first, so an uncertain abort on the block being
+    /// written can never discard the cache copy.
+    #[test]
+    fn quarantined_report_does_not_invalidate_cache_file_under_write() {
+        let fs = test_fs("quarantined-cache-under-write");
+        let path = "/quarantined-cache-under-write.log";
+        let block_id = replication_file(&fs, path);
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 0;
+        commit.locations = vec![BlockLocation::with_id(100)];
+        fs.complete_file(path, None, 0, vec![commit], "", false, None)
+            .unwrap();
+
+        // Finish as a loaded cache copy: ttl_action Delete + ufs_mtime -> Both.
+        fs.set_attr(
+            path,
+            SetAttrOptsBuilder::new()
+                .ttl_action(TtlAction::Delete)
+                .ufs_mtime(1_000)
+                .build(),
+        )
+        .unwrap();
+        assert!(fs.file_status(path).unwrap().storage_policy.both_exists());
+
+        // Reopen for write: the kernel of the claim, UFS is detached first.
+        fs.open_file(
+            path,
+            CreateFileOptsBuilder::new().build(),
+            OpenFlags::new_append(),
+        )
+        .unwrap();
+        let status = fs.file_status(path).unwrap();
+        assert!(!status.storage_policy.both_exists(), "write detaches UFS");
+
+        // Quarantine on 200 for a block 200 never committed.
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+
+        let after = fs.file_status(path).unwrap();
+        assert_eq!(
+            after.storage_policy.state, status.storage_policy.state,
+            "the cache copy must not be invalidated"
+        );
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100],
+            "the committed replica is untouched"
         );
     }
 
