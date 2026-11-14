@@ -741,6 +741,58 @@ impl MasterReplicationManager {
         self.repairs.lock().blocks.contains_key(&block_id)
     }
 
+    /// Put an attempt for `block_id` in flight to `target_worker_id`, as a
+    /// submitted replication job would be once the worker acknowledged it.
+    /// Returns the attempt id.
+    #[cfg(test)]
+    pub(crate) fn seed_inflight_attempt_for_test(
+        &self,
+        block_id: BlockId,
+        source_worker_id: WorkerId,
+        target_worker_id: WorkerId,
+    ) -> String {
+        let source = self
+            .worker_endpoint(source_worker_id)
+            .expect("source worker");
+        let target = self
+            .worker_endpoint(target_worker_id)
+            .expect("target worker");
+        let attempt_id = Utils::uuid();
+        let attempt = ReplicationAttempt::new(
+            attempt_id.clone(),
+            source.address.worker_id,
+            source.session_id,
+            target.address,
+            target.session_id,
+        );
+        let permit = self
+            .replication_semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("permit");
+        let now = self.monotonic_millis();
+        assert!(self.tracker.queue(block_id, now));
+        assert!(self
+            .tracker
+            .promote(block_id, attempt, now.saturating_add(60_000), permit));
+        assert!(matches!(
+            self.tracker
+                .acknowledge(block_id, &attempt_id, Some(&attempt_id)),
+            AckDisposition::Accepted(_)
+        ));
+        attempt_id
+    }
+
+    /// Whether `attempt_id` is parked as Uncertain.
+    #[cfg(test)]
+    pub(crate) fn is_uncertain_attempt_for_test(
+        &self,
+        block_id: BlockId,
+        attempt_id: &str,
+    ) -> bool {
+        self.tracker.is_uncertain_attempt(block_id, attempt_id)
+    }
+
     /// Forget a recorded repair demand so a test can observe a re-queue.
     /// The due-heap entry, if any, is a no-op once the block is unknown.
     #[cfg(test)]
@@ -807,6 +859,22 @@ impl MasterReplicationManager {
                 block_id, snapshot.attempt.target_worker.worker_id
             );
         }
+        // The target may have quarantined the extent after Complete; its
+        // replica is unreadable. Treat it like a session change so the attempt
+        // is reconciled and the repair retries, not finished as a success.
+        if success
+            && self
+                .worker_manager
+                .read()
+                .quarantined_workers(block_id)
+                .contains(&snapshot.attempt.target_worker.worker_id)
+        {
+            success = false;
+            warn!(
+                "Ignoring successful replication result for block {} because target worker {} holds it quarantined",
+                block_id, snapshot.attempt.target_worker.worker_id
+            );
+        }
 
         if success {
             let location = BlockLocation::new(
@@ -864,7 +932,7 @@ impl MasterReplicationManager {
         Ok(metadata_result?)
     }
 
-    pub(crate) fn commit_replication_location(
+    fn commit_replication_location(
         &self,
         block_id: BlockId,
         location: BlockLocation,
@@ -875,20 +943,6 @@ impl MasterReplicationManager {
             description: "Before a successful replication result is inserted into metadata",
             context: { "block_id" => block_id },
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
-        }
-        // The target may have quarantined the extent after Complete; its
-        // replica is unreadable, so do not publish it.
-        if self
-            .worker_manager
-            .read()
-            .quarantined_workers(block_id)
-            .contains(&location.worker_id)
-        {
-            info!(
-                "replication of block {} to worker {} finished but the worker holds it quarantined; location not added",
-                block_id, location.worker_id
-            );
-            return Ok(false);
         }
         self.fs
             .fs_dir
