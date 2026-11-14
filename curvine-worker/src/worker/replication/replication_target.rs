@@ -136,7 +136,8 @@ impl ReplicationTarget {
             .is_some_and(|meta| meta.is_quarantined())
         {
             return err_box!(
-                "block {} is quarantined on this worker and cannot be a replication target",
+                "{}: block {} is quarantined on this worker",
+                curvine_model::REPLICATION_TARGET_QUARANTINED,
                 req.block_id
             );
         }
@@ -1132,7 +1133,8 @@ mod tests {
 
         let err = prepare(&target, "a").unwrap_err();
         assert!(
-            err.to_string().contains("quarantined on this worker"),
+            err.to_string()
+                .contains(curvine_model::REPLICATION_TARGET_QUARANTINED),
             "{err}"
         );
         assert!(target.stripe(1).lock().get(&1).is_none());

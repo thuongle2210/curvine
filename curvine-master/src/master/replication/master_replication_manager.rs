@@ -19,7 +19,7 @@ use super::replication_tracker::{
 use crate::master::fs::MasterFilesystem;
 use crate::master::{Master, MasterMetrics, SyncWorkerManager};
 use curvine_config::ClusterConf;
-use curvine_core_error::{err_box, CommonResult};
+use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_fs_api::RpcCode;
 use curvine_model::{BlockLocation, ProtoUtils, WorkerAddress};
 use curvine_proto::{
@@ -572,6 +572,20 @@ impl MasterReplicationManager {
         .await;
         let prepared = match prepared {
             Ok(Ok(response)) => response,
+            Ok(Err(e)) if is_quarantined_refusal(&e) => {
+                // Definitive, not uncertain: the target refused before reserving
+                // anything. Mark it so the retried repair picks another worker.
+                self.worker_manager
+                    .write()
+                    .quarantine_block(target.address.worker_id, block_id);
+                self.cancel_known_inactive_attempt(block_id, &attempt_id);
+                return err_box!(
+                    "replication target {} holds block {} quarantined: {}",
+                    target.address.worker_id,
+                    block_id,
+                    e
+                );
+            }
             other => {
                 if other.is_err() {
                     self.metrics.replication_timeout_count.inc();
@@ -850,7 +864,7 @@ impl MasterReplicationManager {
         Ok(metadata_result?)
     }
 
-    fn commit_replication_location(
+    pub(crate) fn commit_replication_location(
         &self,
         block_id: BlockId,
         location: BlockLocation,
@@ -861,6 +875,20 @@ impl MasterReplicationManager {
             description: "Before a successful replication result is inserted into metadata",
             context: { "block_id" => block_id },
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
+        }
+        // The target may have quarantined the extent after Complete; its
+        // replica is unreadable, so do not publish it.
+        if self
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .contains(&location.worker_id)
+        {
+            info!(
+                "replication of block {} to worker {} finished but the worker holds it quarantined; location not added",
+                block_id, location.worker_id
+            );
+            return Ok(false);
         }
         self.fs
             .fs_dir
@@ -908,6 +936,13 @@ impl MasterReplicationManager {
     }
 }
 
+/// The worker's prepare refusal for a quarantined block, see
+/// `curvine_model::REPLICATION_TARGET_QUARANTINED`.
+fn is_quarantined_refusal(e: &CommonError) -> bool {
+    e.to_string()
+        .contains(curvine_model::REPLICATION_TARGET_QUARANTINED)
+}
+
 fn uncertain_reconciliation_backoff_ms(interval: Duration, retry_count: u32) -> u64 {
     let interval_ms = interval.as_millis().try_into().unwrap_or(u64::MAX);
     let shift = retry_count.min(UNCERTAIN_RECONCILIATION_MAX_BACKOFF_MULTIPLIER.ilog2());
@@ -926,6 +961,18 @@ fn target_duration(deadline: Instant) -> CommonResult<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The worker's refusal is recognised by its shared marker, wrapped or not.
+    #[test]
+    fn quarantined_refusal_is_recognised_by_shared_marker() {
+        let refusal: CommonResult<()> = curvine_core_error::err_box!(
+            "{}: block 7 is quarantined on this worker",
+            curvine_model::REPLICATION_TARGET_QUARANTINED
+        );
+        assert!(is_quarantined_refusal(&refusal.unwrap_err()));
+        let other: CommonResult<()> = curvine_core_error::err_box!("block 7 is fenced");
+        assert!(!is_quarantined_refusal(&other.unwrap_err()));
+    }
 
     #[test]
     fn repeated_loss_notifications_keep_one_due_entry() {

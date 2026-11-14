@@ -1333,7 +1333,7 @@ impl MasterFilesystem {
         path: T,
         inode_id: Option<i64>,
         client_addr: ClientAddress,
-        commit_blocks: Vec<CommitBlock>,
+        mut commit_blocks: Vec<CommitBlock>,
         exclude_workers: Vec<u32>,
         file_len: i64,
         last_block: Option<ExtendedBlock>,
@@ -1342,6 +1342,7 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
+        self.drop_quarantined_locations(&mut commit_blocks);
         self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
 
         // File allows concurrent writes, 'previous' is the previous block,
@@ -1483,18 +1484,45 @@ impl MasterFilesystem {
         self.complete_file0(path, inode_id, len, commit_blocks, client_name, options)
     }
 
+    /// A worker that reported the block `Quarantined` refuses reads, so a
+    /// commit naming it (two writers on one SPDK extent, or a report that
+    /// raced the commit) must not re-add it as a location. A later live report
+    /// from that worker releases the marker and adds the location itself.
+    /// Callers hold `fs_dir`; `worker_manager` is taken under it, the order
+    /// `allocate_block` already uses.
+    fn drop_quarantined_locations(&self, commit_blocks: &mut [CommitBlock]) {
+        let wm = self.worker_manager.read();
+        for commit in commit_blocks.iter_mut() {
+            let quarantined = wm.quarantined_workers(commit.block_id);
+            if quarantined.is_empty() {
+                continue;
+            }
+            let before = commit.locations.len();
+            commit
+                .locations
+                .retain(|loc| !quarantined.contains(&loc.worker_id));
+            if commit.locations.len() != before {
+                warn!(
+                    "commit of block {} named quarantined workers {:?}; locations not added",
+                    commit.block_id, quarantined
+                );
+            }
+        }
+    }
+
     fn complete_file0<T: AsRef<str>>(
         &self,
         path: T,
         inode_id: Option<i64>,
         len: i64,
-        commit_blocks: Vec<CommitBlock>,
+        mut commit_blocks: Vec<CommitBlock>,
         client_name: T,
         options: CompleteFileOptions,
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        self.drop_quarantined_locations(&mut commit_blocks);
         let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let committed: Vec<i64> = commit_blocks.iter().map(|v| v.block_id).collect();
         // Only the creator of a still-registered pre-allocation may release
@@ -3444,6 +3472,159 @@ mod tests {
             vec![100],
             "the committed replica is untouched"
         );
+    }
+
+    fn quarantine_on(fs: &MasterFilesystem, worker_id: u32, block_id: i64) {
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                cluster_id: "curvine".into(),
+                worker_id,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+    }
+
+    fn location_ids(fs: &MasterFilesystem, block_id: i64) -> Vec<u32> {
+        let mut ids: Vec<u32> = fs
+            .fs_dir
+            .read()
+            .get_block_locations(block_id)
+            .unwrap()
+            .iter()
+            .map(|l| l.worker_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A commit that names a worker holding the block quarantined (the #80
+    /// shared-extent overlap, or a report that raced the commit) must not
+    /// re-add that worker as a location; the marker stays.
+    #[test]
+    fn complete_file_drops_location_of_quarantined_worker() {
+        let fs = test_fs("quarantine-complete-file");
+        let path = "/quarantine-complete-file.log";
+        let block_id = replication_file(&fs, path);
+        quarantine_on(&fs, 200, block_id);
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 0;
+        commit.locations = vec![BlockLocation::with_id(100), BlockLocation::with_id(200)];
+        fs.complete_file(path, None, 0, vec![commit], "", false, None)
+            .unwrap();
+
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100],
+            "the quarantined worker must not become a location"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+    }
+
+    /// Same guard on add_block's commit of the previous block.
+    #[test]
+    fn add_block_drops_quarantined_location_from_committed_previous_block() {
+        let fs = test_fs("quarantine-add-block");
+        let path = "/quarantine-add-block.log";
+        let block_id = replication_file(&fs, path);
+        quarantine_on(&fs, 200, block_id);
+
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 0;
+        commit.locations = vec![BlockLocation::with_id(100), BlockLocation::with_id(200)];
+        // last_block = the block being committed, so a new block is allocated
+        // and the commit of the previous one is applied.
+        let last = ExtendedBlock::new(block_id, 0, StorageType::Disk, FileType::File);
+        let next = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![commit],
+                vec![],
+                0,
+                Some(last),
+            )
+            .unwrap();
+        assert_ne!(next.block.id, block_id, "a new block must be allocated");
+
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+    }
+
+    /// A replication target that quarantined the extent after Complete is not
+    /// published as a location.
+    #[test]
+    fn finish_replicated_block_ignores_quarantined_target() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantine-replication-commit");
+        let block_id = replication_file(&fs, "/quarantine-replication-commit.log");
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+
+        quarantine_on(&fs, 200, block_id);
+        assert!(
+            !manager
+                .commit_replication_location(block_id, BlockLocation::with_id(200))
+                .unwrap(),
+            "quarantined target must not be added"
+        );
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+
+        // A worker that is not quarantined still commits.
+        assert!(manager
+            .commit_replication_location(block_id, BlockLocation::with_id(300))
+            .unwrap());
+        assert_eq!(location_ids(&fs, block_id), vec![100, 300]);
+    }
+
+    /// Marking the target after a prepare refusal excludes it from the next
+    /// pick: the path `replicate_block` takes on
+    /// `REPLICATION_TARGET_QUARANTINED`, without the RPC.
+    #[test]
+    fn prepare_refusal_marks_target_quarantined_and_excludes_it() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantine-prepare-refusal");
+        let block_id = replication_file(&fs, "/quarantine-prepare-refusal.log");
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(manager.excluded_targets(block_id, &locations), vec![100]);
+
+        // A new leader has no marker; the first pick (200) refuses.
+        assert!(fs.worker_manager.write().quarantine_block(200, block_id));
+
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200],
+            "the refusing target is excluded on retry"
+        );
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
     }
 
     /// Quarantined report for a block whose file is gone: the worker is told
