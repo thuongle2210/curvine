@@ -831,6 +831,7 @@ mod tests {
                 metrics: Worker::get_metrics()?,
                 client_addr: "test".into(),
                 pending_abort: None,
+                aborted: false,
             });
         }
         assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
@@ -891,6 +892,7 @@ mod tests {
                 metrics: Worker::get_metrics()?,
                 client_addr: "test".into(),
                 pending_abort: None,
+                aborted: false,
             });
         }
         let available_before = store.read()?.available();
@@ -1080,6 +1082,7 @@ mod tests {
             metrics: Worker::get_metrics()?,
             client_addr: "writer-a".into(),
             pending_abort: None,
+            aborted: false,
         };
         let data = Builder::new()
             .code(RpcCode::WriteBlock)
@@ -1157,6 +1160,7 @@ mod tests {
                 metrics: Worker::get_metrics()?,
                 client_addr: "test".into(),
                 pending_abort: None,
+                aborted: false,
             });
         }
         assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));

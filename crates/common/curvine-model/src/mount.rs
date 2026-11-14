@@ -235,16 +235,13 @@ impl MountInfo {
         )
     }
 
+    /// Whether a cache miss should automatically submit a cache job.
+    ///
+    /// Controlled only by the `auto_cache` mount option. `ttl_ms` is the
+    /// lifetime of cached data and does not affect admission: `ttl_ms == 0`
+    /// means cached data never expires.
     pub fn auto_cache(&self) -> bool {
-        self.auto_cache && self.ttl_ms > 0
-    }
-
-    pub fn get_ttl(&self) -> Option<String> {
-        if self.auto_cache() {
-            None
-        } else {
-            Some(format!("{}s", self.ttl_ms / 1000))
-        }
+        self.auto_cache
     }
 
     pub fn get_ufs_path<P: CurvinePath>(&self, path: &P) -> CommonResult<P> {
@@ -431,10 +428,17 @@ pub struct MountOptionsBuilder {
 }
 
 impl MountOptionsBuilder {
+    /// Cache lifetime a new mount gets when the caller does not provide one.
+    ///
+    /// This is the single Rust definition of the 7d default; the CLI relies on
+    /// it for new mounts, and `--update` clears it through
+    /// [`Self::update_only_explicit`] so the stored lifetime is preserved.
+    pub const DEFAULT_TTL_MS: i64 = 7 * DurationUnit::DAY as i64;
+
     pub fn new() -> Self {
         Self {
             write_type: WriteType::CacheMode,
-            ttl_ms: Some(7 * DurationUnit::DAY as i64),
+            ttl_ms: Some(Self::DEFAULT_TTL_MS),
             ttl_action: Some(TtlAction::Delete),
             auto_cache: Some(true),
             access_mode: Some(AccessMode::ReadOnly),
@@ -527,13 +531,15 @@ impl MountOptionsBuilder {
         self
     }
 
-    /// Reset optional toggle fields to `None` so a mount `--update` preserves
-    /// existing values (`merge_with` keeps `None` fields) unless they were
-    /// explicitly provided.
+    /// Reset optional fields to `None` so a mount `--update` preserves existing
+    /// values (`merge_with` keeps `None` fields) unless they were explicitly
+    /// provided.
     pub fn update_only_explicit(mut self) -> Self {
         self.auto_cache = None;
         self.access_mode = None;
         self.write_cache = None;
+        self.ttl_ms = None;
+        self.ttl_action = None;
         self
     }
 
@@ -596,7 +602,7 @@ impl TryFrom<&str> for WriteType {
 
 #[cfg(test)]
 mod tests {
-    use crate::state::{AccessMode, MountInfo, MountOptions, WriteType};
+    use crate::state::{AccessMode, MountInfo, MountOptions, TtlAction, WriteType};
     use crate::CurvinePath;
     use curvine_fs_api::Path;
     use std::fmt;
@@ -710,6 +716,73 @@ mod tests {
                 .build(),
         );
         assert!(!merged.write_cache);
+    }
+
+    #[test]
+    fn test_update_only_explicit_preserves_existing_ttl() {
+        let info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://b".to_string(),
+            ttl_ms: 0,
+            ttl_action: TtlAction::Delete,
+            ..Default::default()
+        };
+
+        // An update that omits the TTL must keep the existing lifetime instead
+        // of resetting it to the builder default (7d).
+        let merged = info.clone().merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .build(),
+        );
+        assert_eq!(merged.ttl_ms, 0);
+        assert_eq!(merged.ttl_action, TtlAction::Delete);
+
+        // Explicitly provided values still apply.
+        let merged = info.merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .ttl_ms(3_600_000)
+                .ttl_action(TtlAction::Free)
+                .build(),
+        );
+        assert_eq!(merged.ttl_ms, 3_600_000);
+        assert_eq!(merged.ttl_action, TtlAction::Free);
+    }
+
+    #[test]
+    fn test_auto_cache_is_independent_of_ttl() {
+        for (auto_cache, ttl_ms) in [(true, 0), (true, 60_000), (false, 0), (false, 60_000)] {
+            let info = MountOptions::builder()
+                .auto_cache(auto_cache)
+                .ttl_ms(ttl_ms)
+                .build()
+                .to_info(1, "/mnt", "s3://b");
+            assert_eq!(info.ttl_ms, ttl_ms);
+            assert_eq!(
+                info.auto_cache(),
+                auto_cache,
+                "auto_cache={auto_cache}, ttl_ms={ttl_ms}"
+            );
+
+            // Changing only the TTL of an existing mount keeps its auto-cache setting.
+            let new_ttl_ms = if ttl_ms == 0 { 60_000 } else { 0 };
+            let updated = info.merge_with(
+                MountOptions::builder()
+                    .update(true)
+                    .update_only_explicit()
+                    .ttl_ms(new_ttl_ms)
+                    .build(),
+            );
+            assert_eq!(updated.ttl_ms, new_ttl_ms);
+            assert_eq!(
+                updated.auto_cache(),
+                auto_cache,
+                "auto_cache={auto_cache}, updated ttl_ms={new_ttl_ms}"
+            );
+        }
     }
 
     #[test]

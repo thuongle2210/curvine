@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::types::{PutContext, PutOperation};
-use super::ListObjectContent;
 use super::ListObjectHandler;
 use super::ListObjectOption;
 use super::ListObjectVersionsHandler;
@@ -25,10 +24,8 @@ use super::PutObjectOption;
 use crate::s3::error_code::Error;
 use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
-use crate::utils::s3_utils::{
-    file_status_to_head_object_result, file_status_to_list_object_content,
-};
-use crate::utils::temp_storage::TempStorageEnum;
+use crate::utils::s3_utils::file_status_to_head_object_result;
+use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_error::FsResult;
@@ -591,6 +588,10 @@ impl PutObjectHandler for S3Handlers {
         );
 
         async move {
+            // The staging prefix is reserved; a PUT cannot create an object
+            // that listings would have to hide.
+            reject_reserved_key(&object)?;
+
             // S3 applies `If-Match` / `If-None-Match` to the DESTINATION on
             // PutObject. Without this an `If-Match: <old>` overwrite silently
             // clobbered a concurrently-replaced object, which is the lost
@@ -625,16 +626,21 @@ impl PutObjectHandler for S3Handlers {
                 .content_length
                 .and_then(|v| usize::try_from(v).ok())
                 .filter(|v| *v > 0);
-            let md5 = PutOperation::execute(context, &mut body, metadata, expect_length).await?;
+            let md5 = PutOperation::execute(
+                context,
+                &mut body,
+                metadata,
+                crate::s3::types::BodyExpect {
+                    length: expect_length,
+                    content_md5: opt.content_md5.as_deref(),
+                },
+            )
+            .await?;
             let _ = path;
 
             // Report what HEAD/GET will report for the same object.
             Ok(format!("\"{md5}\""))
         }
-    }
-
-    fn temp_storage(&self) -> std::sync::Arc<TempStorageEnum> {
-        self.temp_storage.clone()
     }
 }
 
@@ -745,6 +751,9 @@ impl S3Handlers {
         let dst = self
             .cv_object_path(dest_bucket, dest_key)
             .map_err(|e| format!("Invalid copy destination: {e}"))?;
+        // The staging prefix is reserved; a copy cannot create an object that
+        // listings would have to hide.
+        reject_reserved_key(dest_key)?;
 
         let status = self.fs.get_status(&src).await.map_err(|_| {
             format!("NoSuchKey: copy source {source_bucket}/{source_key} does not exist")
@@ -833,6 +842,103 @@ impl S3Handlers {
 
         Ok(etag)
     }
+}
+
+/// Whether two ETag strings denote the same strong validator.
+///
+/// Quoting and a weak prefix are presentation; the digest is what must match.
+fn same_etag(left: &str, right: &str) -> bool {
+    fn value(tag: &str) -> String {
+        tag.trim()
+            .trim_start_matches("W/")
+            .trim_matches('"')
+            .to_ascii_lowercase()
+    }
+    value(left) == value(right)
+}
+
+/// S3 minimum size for a part other than the last one.
+const MIN_PART_BYTES: usize = 5 << 20;
+
+/// Key segment reserved for gateway staging artefacts.
+///
+/// Every staging object (`PutOperation`, CopyObject, multipart assembly) is a
+/// sibling named `.curvine-s3-*`, and listings filter that prefix out. Reserving
+/// it on the write paths is what makes the filter sound: no user object can
+/// carry the prefix, so hiding it can never hide user data.
+const STAGING_KEY_PREFIX: &str = ".curvine-s3-";
+
+/// Whether a listed entry is a gateway staging artefact rather than an object.
+///
+/// Sound because the namespace is reserved on every write path; ListObjects and
+/// ListObjectVersions share this predicate so neither can expose staging.
+pub(super) fn is_staging_name(name: &str) -> bool {
+    name.starts_with(STAGING_KEY_PREFIX)
+}
+
+/// Reject any key with a segment inside the reserved staging namespace.
+///
+/// Every segment is checked, not just the last: creating `a/.curvine-s3-x/b`
+/// also creates the `.curvine-s3-x` directory, and listings of `a` would then
+/// hide that entry. Rejecting it is what keeps the listing filter sound.
+fn reject_reserved_key(key: &str) -> Result<(), String> {
+    if key
+        .split('/')
+        .any(|segment| segment.starts_with(STAGING_KEY_PREFIX))
+    {
+        return Err(format!(
+            "InvalidArgument: object keys may not contain a segment starting with {STAGING_KEY_PREFIX}, which is reserved for gateway staging"
+        ));
+    }
+    Ok(())
+}
+
+/// S3 requires a Complete request to list parts in strictly ascending
+/// part-number order, without duplicates.
+///
+/// Sorting the list first used to silently accept both, so the request is
+/// validated in the order it arrived.
+fn validate_part_order(parts: &[(String, u32)]) -> Result<(), String> {
+    for window in parts.windows(2) {
+        if window[1].1 <= window[0].1 {
+            return Err(format!(
+                "InvalidPartOrder: part numbers must be strictly ascending (got {} then {})",
+                window[0].1, window[1].1
+            ));
+        }
+    }
+    if parts.is_empty() {
+        return Err("InvalidPart: no parts listed".to_string());
+    }
+    Ok(())
+}
+
+/// Check every listed part against the record staged with its bytes.
+///
+/// One record per part decides existence, ETag match and the non-final
+/// minimum size, so all three read from the same source of truth: the record
+/// published atomically with the part (`PartMeta`).
+fn validate_staged_parts(
+    parts: &[(String, u32)],
+    staged: &[(u32, PartMeta)],
+) -> Result<(), String> {
+    let count = staged.len();
+    for (index, ((etag, part_num), (_, recorded))) in parts.iter().zip(staged).enumerate() {
+        if !same_etag(&recorded.etag, etag) {
+            return Err(format!(
+                "InvalidPart: part {part_num} etag does not match the staged part"
+            ));
+        }
+        // S3 requires every part except the last to be at least 5 MiB; a
+        // single-part upload is the last part and is exempt.
+        if index + 1 < count && recorded.size < MIN_PART_BYTES {
+            return Err(format!(
+                "EntityTooSmall: part {part_num} is {} bytes, below the 5 MiB minimum for a non-final part",
+                recorded.size
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
@@ -926,21 +1032,43 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             }
         };
 
-        // Sort parts by part number
-        let mut part_list = data;
-        part_list.sort_by_key(|(_, n)| *n);
+        validate_part_order(&data)?;
+        let part_list = data;
+
+        // The staging prefix is reserved, so Complete cannot publish there.
+        reject_reserved_key(&key)?;
+
+        // An unknown, aborted or already-completed upload id is a 404, not a
+        // part error: without this check a missing part record inside a dead
+        // session would be misreported as InvalidPart (400).
+        if !self.temp_storage.upload_exists(&upload_id).await {
+            return Err(format!("NoSuchUpload: upload {upload_id} does not exist"));
+        }
 
         // Validate the upload before touching the destination. Creating the
         // final object first meant a bad upload id, or a part that is not
         // staged, still left a zero-byte object under the destination key —
         // destroying any previous object and reporting failure afterwards.
+        //
+        // The part ETAG is compared with the record the upload left next to the
+        // part, so a request naming a different digest than the one staged is
+        // rejected here, not discovered while streaming.
+        let mut staged_parts = Vec::with_capacity(part_list.len());
         for (_, part_num) in part_list.iter() {
-            if !self.temp_storage.part_exists(&upload_id, *part_num).await {
-                return Err(format!(
-                    "NoSuchUpload: part {part_num} of upload {upload_id} is not staged"
-                ));
-            }
+            let recorded = self
+                .temp_storage
+                .part_meta(&upload_id, *part_num)
+                .await
+                .ok_or_else(|| {
+                    // No record means the part was never uploaded under this
+                    // upload id, or was uploaded by an older build. This also
+                    // covers a part whose bytes were lost: the record is
+                    // published with them.
+                    format!("InvalidPart: part {part_num} of upload {upload_id} is not staged")
+                })?;
+            staged_parts.push((*part_num, recorded));
         }
+        validate_staged_parts(&part_list, &staged_parts)?;
 
         // Stage the assembled object beside the destination and publish it with
         // a rename, so the destination is only ever the previous object or the
@@ -975,22 +1103,24 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                     upload_id,
                     e
                 );
-                // Cleanup on failure
+                // Cleanup on failure. The staged parts are deliberately kept:
+                // a rejected Complete must be retryable with a corrected list,
+                // and deleting them would force the client to re-upload.
                 let _ = writer.cancel().await;
                 let _ = self.fs.delete(&staging, false).await;
-                let _ = self.temp_storage.cleanup(&upload_id).await;
-                // A missing part means the upload id or the part list does not
-                // match what was staged; S3 answers 404 NoSuchUpload.
-                return Err(format!("NoSuchUpload: {e}"));
+                // Pass the staging error through unchanged: an ETag mismatch
+                // surfaces here when a part changed between preflight and
+                // assembly and its `InvalidPart:` prefix must reach the mapping
+                // as a 400, while a genuine I/O failure stays a 500.
+                return Err(e);
             }
             part_etags.push(etag.trim_matches('"').to_ascii_lowercase());
         }
 
         if let Err(e) = writer.complete().await {
             tracing::error!("Failed to complete final file write: {}", e);
-            // Cleanup on failure
+            // Cleanup on failure. Parts stay staged so the client can retry.
             let _ = self.fs.delete(&staging, false).await;
-            let _ = self.temp_storage.cleanup(&upload_id).await;
             return Err(format!("Failed to complete final file write: {e}"));
         }
 
@@ -1017,7 +1147,6 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             .await
         {
             let _ = self.fs.delete(&staging, false).await;
-            let _ = self.temp_storage.cleanup(&upload_id).await;
             return Err(format!("Failed to record multipart etag: {e}"));
         }
 
@@ -1025,7 +1154,6 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         // that already carries its metadata.
         if let Err(e) = self.fs.rename(&staging, &final_path).await {
             let _ = self.fs.delete(&staging, false).await;
-            let _ = self.temp_storage.cleanup(&upload_id).await;
             return Err(format!("Failed to publish assembled object: {e}"));
         }
 
@@ -1074,7 +1202,8 @@ impl ListObjectHandler for S3Handlers {
         &self,
         opt: &ListObjectOption,
         bucket: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<ListObjectContent>, String>> + Send {
+    ) -> impl std::future::Future<Output = Result<super::listing::ListObjectPage, String>> + Send
+    {
         let this = self.clone();
         let opt = opt.clone();
         let bucket = bucket.to_string();
@@ -1082,81 +1211,54 @@ impl ListObjectHandler for S3Handlers {
         async move {
             let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
 
-            // S3 prefix semantics: prefix is for filtering, not path construction
-            // Only treat prefix as directory path if it ends with '/'
-            let (list_path, prefix_dir) = if let Some(prefix) = &opt.prefix {
-                if prefix.ends_with('/') {
-                    // Prefix is a directory path (e.g., "folder/")
-                    let dir_path = prefix.trim_end_matches('/');
-                    if dir_path.is_empty() {
-                        (bkt_path.clone(), String::new())
-                    } else {
-                        let full_path =
-                            Path::from_str(format!("{}/{}", bkt_path, dir_path).as_str())
-                                .map_err(|e| e.to_string())?;
-                        (full_path, dir_path.to_string())
-                    }
-                } else if prefix.contains('/') {
-                    // Prefix contains directory component (e.g., "folder/file")
-                    // List the parent directory and filter by full prefix
-                    let last_slash = prefix.rfind('/').unwrap();
-                    let dir_part = &prefix[..last_slash];
-                    if dir_part.is_empty() {
-                        (bkt_path.clone(), String::new())
-                    } else {
-                        let full_path =
-                            Path::from_str(format!("{}/{}", bkt_path, dir_part).as_str())
-                                .map_err(|e| e.to_string())?;
-                        (full_path, dir_part.to_string())
-                    }
-                } else {
-                    // Prefix is just a filename prefix (e.g., "small")
-                    // List bucket root and filter by prefix
-                    (bkt_path.clone(), String::new())
-                }
-            } else {
-                (bkt_path.clone(), String::new())
-            };
-
             // A missing bucket must be an error, not an empty listing: S3
             // answers 404, and clients rely on it to detect a wrong bucket
             // instead of concluding the bucket is empty.
-            let bucket_status = this
-                .fs
-                .get_status(&bkt_path)
-                .await
-                .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+            let bucket_status = this.fs.get_status(&bkt_path).await.map_err(|e| match e {
+                curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+                other => other.to_string(),
+            })?;
             if !bucket_status.is_dir {
                 return Err(NO_SUCH_BUCKET.to_string());
             }
 
-            let list = this
-                .fs
-                .list_status(&list_path)
-                .await
-                .map_err(|e| e.to_string())?;
+            let dirs = BucketDirs {
+                fs: &this.fs,
+                bucket: &bkt_path,
+            };
+            super::listing::list_objects(&opt, &dirs).await
+        }
+    }
+}
 
-            let mut contents = Vec::new();
+/// Bucket-relative directory reads for ListObjects. Directory names come from
+/// filesystem statuses, never from the client's prefix or continuation token.
+struct BucketDirs<'a> {
+    fs: &'a UnifiedFileSystem,
+    bucket: &'a Path,
+}
 
-            for st in list {
-                // Build the S3 key from file status
-                let key = if prefix_dir.is_empty() {
-                    st.name.clone()
-                } else {
-                    format!("{}/{}", prefix_dir, st.name)
-                };
+impl BucketDirs<'_> {
+    fn path(&self, dir: &str) -> FsResult<Path> {
+        if dir.is_empty() {
+            return Ok(self.bucket.clone());
+        }
+        Ok(Path::from_str(format!("{}/{}", self.bucket, dir))?)
+    }
+}
 
-                // Apply prefix filter
-                if let Some(pref) = &opt.prefix {
-                    if !key.starts_with(pref) {
-                        continue;
-                    }
-                }
+impl super::listing::DirSource for BucketDirs<'_> {
+    async fn list(&self, dir: &str) -> FsResult<Vec<curvine_model::FileStatus>> {
+        self.fs.list_status(&self.path(dir)?).await
+    }
 
-                contents.push(file_status_to_list_object_content(&st, key));
-            }
-
-            Ok(contents)
+    async fn stream(&self, dir: &str) -> FsResult<curvine_fs_api::ListStream> {
+        let path = self.path(dir)?;
+        let page = curvine_model::ListOptions::with_limit(32);
+        match self.fs.list_stream(&path, page).await {
+            // Backends without paged listing report it as a plain error.
+            Err(curvine_error::FsError::Common(_)) => Ok(self.fs.list_status(&path).await?.into()),
+            other => other,
         }
     }
 }
@@ -1186,6 +1288,10 @@ impl ListObjectVersionsHandler for S3Handlers {
 
             for st in list {
                 if st.is_dir {
+                    continue;
+                }
+                // Same rule as ListObjects: staging objects are internal state.
+                if is_staging_name(&st.name) {
                     continue;
                 }
 
@@ -1493,5 +1599,113 @@ mod put_destination_condition_tests {
             evaluate_precondition_headers(&cond(None, Some("*")), None, None),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod part_validation_tests {
+    use super::{
+        reject_reserved_key, same_etag, validate_part_order, validate_staged_parts, PartMeta,
+        MIN_PART_BYTES, STAGING_KEY_PREFIX,
+    };
+
+    fn parts(numbers: &[u32]) -> Vec<(String, u32)> {
+        numbers
+            .iter()
+            .map(|n| (format!("\"etag{n}\""), *n))
+            .collect()
+    }
+
+    fn staged(numbers_and_sizes: &[(u32, usize)]) -> Vec<(u32, PartMeta)> {
+        numbers_and_sizes
+            .iter()
+            .map(|(n, size)| {
+                (
+                    *n,
+                    PartMeta {
+                        etag: format!("etag{n}"),
+                        size: *size,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The production order check, not a test-local copy of it.
+    #[test]
+    fn part_order_requires_strictly_ascending_numbers() {
+        assert!(validate_part_order(&parts(&[1, 2, 3])).is_ok());
+        assert!(validate_part_order(&parts(&[3])).is_ok());
+
+        let duplicate = validate_part_order(&parts(&[1, 1])).unwrap_err();
+        assert!(duplicate.starts_with("InvalidPartOrder:"), "{duplicate}");
+
+        let descending = validate_part_order(&parts(&[2, 1])).unwrap_err();
+        assert!(descending.starts_with("InvalidPartOrder:"), "{descending}");
+
+        let empty = validate_part_order(&parts(&[])).unwrap_err();
+        assert!(empty.starts_with("InvalidPart:"), "{empty}");
+    }
+
+    /// The production size check: an undersized non-final part is refused, the
+    /// final part is exempt, and a missing part is caught here rather than
+    /// during assembly.
+    #[test]
+    fn non_final_parts_must_reach_the_minimum() {
+        let big = MIN_PART_BYTES;
+        let ok = validate_staged_parts(&parts(&[1, 2]), &staged(&[(1, big), (2, 1)]));
+        assert!(ok.is_ok(), "a small final part is allowed: {ok:?}");
+
+        let small_non_final =
+            validate_staged_parts(&parts(&[1, 2]), &staged(&[(1, big - 1), (2, 1)])).unwrap_err();
+        assert!(
+            small_non_final.starts_with("EntityTooSmall:"),
+            "{small_non_final}"
+        );
+
+        // A single part is also the final part, so it is exempt.
+        assert!(validate_staged_parts(&parts(&[1]), &staged(&[(1, 1)])).is_ok());
+    }
+
+    #[test]
+    fn staged_part_etags_must_match_the_request() {
+        let mismatch =
+            validate_staged_parts(&parts(&[1]), &staged(&[(2, MIN_PART_BYTES)])).unwrap_err();
+        assert!(mismatch.starts_with("InvalidPart:"), "{mismatch}");
+    }
+
+    #[test]
+    fn etags_compare_as_digests() {
+        assert!(same_etag("abc123", "\"abc123\""));
+        assert!(same_etag("W/\"ABC123\"", "abc123"));
+        assert!(!same_etag("abc123", "other"));
+    }
+
+    /// Reserving the prefix is what makes hiding staging objects from listings
+    /// sound: no accepted key can collide with it.
+    #[test]
+    fn the_staging_prefix_is_reserved_on_write_paths() {
+        for key in [
+            ".curvine-s3-report",
+            "folder/.curvine-s3-mp-abc",
+            format!("{STAGING_KEY_PREFIX}staging-1").as_str(),
+            // Only checking the last segment used to accept these, and the
+            // parent directory then vanished from listings.
+            ".curvine-s3-x/file",
+            "folder/.curvine-s3-x/file",
+            "a/.curvine-s3-staging-1/b/c",
+        ] {
+            let err = reject_reserved_key(key).unwrap_err();
+            assert!(err.starts_with("InvalidArgument:"), "{key}: {err}");
+        }
+        for key in [
+            "report",
+            "folder/file",
+            "folder/.hidden",
+            ".curvine-s3",
+            "folder/.curvine-s3",
+        ] {
+            assert!(reject_reserved_key(key).is_ok(), "{key} must be accepted");
+        }
     }
 }
