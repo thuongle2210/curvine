@@ -173,6 +173,41 @@ pub struct WorkerConf {
     pub enable_splice: bool,
     pub enable_send_file: bool,
 
+    /// Write block data checksums (#1921). Off by default.
+    ///
+    /// When enabled, finalizing a local file block writes a per-chunk CRC32C
+    /// sidecar next to it. Verification on read is controlled separately by
+    /// `block_checksum_verify`.
+    pub block_checksum: bool,
+
+    /// Verify block data checksums on read (#1921). Off by default.
+    ///
+    /// When enabled, worker reads of local file blocks check every chunk
+    /// against its sidecar and fail with an IO error on mismatch, so corrupted
+    /// bytes are never returned. Sendfile and short-circuit reads are not used
+    /// while this is on, because they bypass the check.
+    pub block_checksum_verify: bool,
+
+    /// With `block_checksum_verify`, whether a block without a sidecar is read
+    /// unverified (true, default) or rejected (false). Rejected blocks stay on
+    /// disk; the startup scan only counts them. Blocks written before
+    /// `block_checksum` was enabled, or while it is off, blocks finalized with
+    /// concurrent writers, and blocks whose sidecar publish failed have no
+    /// sidecar, so rejecting them only makes sense once every block has one.
+    pub block_checksum_allow_missing: bool,
+
+    /// With `block_checksum_verify`, re-verify every finalized block in the
+    /// background after the worker starts (default true). Blocks that fail
+    /// their CRC are removed and reported like a failed read, so damage left
+    /// by an unclean shutdown is found even for blocks nobody reads. Blocks
+    /// without a sidecar are never removed by the scan.
+    pub block_checksum_scan_on_start: bool,
+
+    /// Read rate limit for the startup scan, per second (default "100MB"), so
+    /// the scan does not compete with client reads after a restart. "0" does
+    /// not limit it and reads at full disk bandwidth.
+    pub block_checksum_scan_rate: String,
+
     // Pipe size
     pub pipe_buf_size: usize,
     // Number of cores of pipeline resource pool
@@ -184,6 +219,9 @@ pub struct WorkerConf {
 
     pub block_replication_concurrency_limit: usize,
     pub block_replication_chunk_size: usize,
+
+    // Enable S3 gateway alongside worker
+    pub enable_s3_gateway: bool,
 
     // SPDK over NVMe-oF/RDMA configuration.
     pub spdk_disk: SpdkConf,
@@ -204,6 +242,16 @@ impl WorkerConf {
     pub fn io_timeout_ms(&self) -> u64 {
         let dur = DurationUnit::from_str(&self.io_timeout).unwrap();
         dur.as_millis()
+    }
+
+    /// Whether the startup checksum scan runs: it needs read verification.
+    pub fn checksum_scan_enabled(&self) -> bool {
+        self.block_checksum_verify && self.block_checksum_scan_on_start
+    }
+
+    /// Startup scan rate in bytes per second; 0 means unlimited.
+    pub fn checksum_scan_bytes_per_sec(&self) -> CommonResult<u64> {
+        Ok(ByteUnit::from_str(&self.block_checksum_scan_rate)?.as_byte())
     }
 }
 
@@ -234,6 +282,11 @@ impl Default for WorkerConf {
 
             enable_splice: false,
             enable_send_file: true,
+            block_checksum: false,
+            block_checksum_verify: false,
+            block_checksum_allow_missing: true,
+            block_checksum_scan_on_start: true,
+            block_checksum_scan_rate: "100MB".to_string(),
 
             pipe_buf_size: 64 * 1024,
             pipe_pool_init_cap: 0,
@@ -241,6 +294,7 @@ impl Default for WorkerConf {
             pipe_pool_idle_time: 0,
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
+            enable_s3_gateway: false,
             spdk_disk: SpdkConf::default(),
             compatibility: CompatibilityConf::default(),
         }
@@ -268,6 +322,65 @@ mod tests {
         // 128KB write chunk at 100ms is ~1.25MB/s: clearly abnormal on any local
         // disk, while 300ms would only fire on an almost hung device.
         assert_eq!(WorkerConf::default().io_slow_us(), 100_000);
+    }
+
+    #[test]
+    fn block_checksum_defaults_to_off() {
+        assert!(!WorkerConf::default().block_checksum);
+        let conf: WorkerConf = toml::from_str(r#"data_dir = ["/data/data1"]"#).unwrap();
+        assert!(!conf.block_checksum);
+    }
+
+    #[test]
+    fn block_checksum_parses_from_toml() {
+        let conf: WorkerConf = toml::from_str("block_checksum = true").unwrap();
+        assert!(conf.block_checksum);
+        assert!(!conf.block_checksum_verify);
+    }
+
+    #[test]
+    fn block_checksum_verify_defaults_and_parses() {
+        let conf = WorkerConf::default();
+        assert!(!conf.block_checksum_verify);
+        assert!(conf.block_checksum_allow_missing);
+
+        let conf: WorkerConf =
+            toml::from_str("block_checksum_verify = true\nblock_checksum_allow_missing = false")
+                .unwrap();
+        assert!(conf.block_checksum_verify);
+        assert!(!conf.block_checksum_allow_missing);
+        assert!(!conf.block_checksum);
+    }
+
+    #[test]
+    fn block_checksum_scan_follows_verify() {
+        let conf = WorkerConf::default();
+        assert!(conf.block_checksum_scan_on_start);
+        assert!(!conf.checksum_scan_enabled());
+        assert_eq!(
+            conf.checksum_scan_bytes_per_sec().unwrap(),
+            100 * 1024 * 1024
+        );
+
+        let conf: WorkerConf = toml::from_str(r#"block_checksum_scan_rate = "0""#).unwrap();
+        assert_eq!(conf.checksum_scan_bytes_per_sec().unwrap(), 0);
+
+        let conf: WorkerConf = toml::from_str("block_checksum_verify = true").unwrap();
+        assert!(conf.checksum_scan_enabled());
+
+        let conf: WorkerConf =
+            toml::from_str("block_checksum_verify = true\nblock_checksum_scan_on_start = false")
+                .unwrap();
+        assert!(!conf.checksum_scan_enabled());
+
+        let conf: WorkerConf = toml::from_str(r#"block_checksum_scan_rate = "64MB""#).unwrap();
+        assert_eq!(
+            conf.checksum_scan_bytes_per_sec().unwrap(),
+            64 * 1024 * 1024
+        );
+
+        let conf: WorkerConf = toml::from_str(r#"block_checksum_scan_rate = "fast""#).unwrap();
+        assert!(conf.checksum_scan_bytes_per_sec().is_err());
     }
 
     #[test]

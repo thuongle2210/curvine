@@ -20,6 +20,10 @@ We maintain a list of good first issues in GitHub here. Look for issues labeled 
 - `bug` - Bug reports that need fixing
 - `enhancement` - Feature requests and improvements
 
+### Claiming an issue
+
+To work on an issue, comment `/assign` on it. A bot assigns the issue to you if it is open and nobody else is assigned. If you can no longer work on it, comment `/unassign` so others can pick it up. The comment must contain only the command.
+
 ## Reporting issues
 
 We use GitHub issues for bug reports and feature requests. When reporting an issue, please include:
@@ -90,12 +94,40 @@ cargo bench
 - Reference issue numbers when applicable
 - [Commit convention](https://github.com/CurvineIO/curvine/blob/main/COMMIT_CONVENTION.md)
 
+### Sign Your Commits
+
+Curvine uses the [Developer Certificate of Origin](DCO) (DCO). Every commit must carry a `Signed-off-by:` line whose email matches the commit author, which certifies that you wrote the change or have the right to submit it under the project license.
+
+Add the line with `git commit -s`:
+
+```bash
+git commit -s -m "fix(client): handle empty paths (#123)"
+```
+
+The `DCO` check on each pull request fails if a commit is not signed off. To sign off commits already on your branch:
+
+```bash
+git rebase --signoff origin/main
+git push --force-with-lease
+```
+
 ### Pull Request Guidelines
 - Create feature branches from `main`
 - Keep PRs focused and reasonably sized
 - Include tests for new functionality
 - Update documentation as needed
 - Ensure all CI checks pass
+
+### Dependency Policy
+
+Curvine is a Cargo workspace with smaller Go (`curvine-csi`), Java (`curvine-libsdk/java`), npm (`curvine-web/webui`), and Python components. Dependencies follow these rules:
+
+- **Adding a dependency:** prefer the standard library or a crate already in the workspace. A new dependency must be actively maintained, use a license compatible with Apache-2.0, and be explained in the PR description. Declare shared Rust crates once under `[workspace.dependencies]` in the root `Cargo.toml`.
+- **Lockfiles:** `Cargo.lock`, `go.sum`, and `package-lock.json` are committed. Changes to them are reviewed like code.
+- **Updates:** [Dependabot](.github/dependabot.yml) opens weekly, grouped update PRs for Cargo, Go modules, Maven, npm, and GitHub Actions. Maintainers review and merge them after CI passes. Major version bumps are reviewed individually.
+- **Security fixes:** dependencies with known vulnerabilities are updated as soon as a fixed version is available. Report vulnerabilities in Curvine itself as described in [SECURITY.md](SECURITY.md).
+- **GitHub Actions:** workflows request the minimum token permissions they need, and write permissions are granted per job.
+- **Pinned actions:** workflows reference every action by its full commit SHA, with the release in a trailing comment (`uses: actions/checkout@<sha> # v7.0.1`). Dependabot updates the SHA and the comment together.
 
 ## AI-Assisted Contribution Workflow
 
@@ -224,12 +256,11 @@ The Curvine contributors hold regular video calls where new and current contribu
 
 Meeting details and schedule will be announced through:
 - GitHub Discussions
-- Project mailing list
 - Community chat channels
 
 ## Code of Conduct
 
-This project follows the [Apache Software Foundation Code of Conduct](https://www.apache.org/foundation/policies/conduct.html). Please be respectful and inclusive in all interactions.
+This project follows the [CNCF Code of Conduct](CODE_OF_CONDUCT.md). Please be respectful and inclusive in all interactions.
 
 ## License
 

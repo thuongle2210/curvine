@@ -10,6 +10,9 @@ on:
       - '**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Tune build parallelism: 4 uses more CPU on standard 4-vCPU runner; set to 2 if OOM
@@ -48,7 +51,7 @@ jobs:
       options: --privileged --device /dev/fuse
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       
       - name: Setup Rust toolchain
         run: |
@@ -60,7 +63,7 @@ jobs:
           cargo --version
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: "curvine-build"
           cache-all-crates: false
@@ -126,6 +129,29 @@ jobs:
           echo "After etcd service discovery tests, disk usage:"
           df -h
 
+      # `clippy --all-targets` only compiles these tests. Without this step an
+      # auth or multipart regression in the gateway would land green and only
+      # surface in the daily coverage workflow.
+      - name: Run S3 gateway unit tests
+        run: |
+          echo "Running curvine-s3-gateway unit tests"
+          cargo test -p curvine-s3-gateway --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After S3 gateway tests, disk usage:"
+          df -h
+
+      - name: S3 UFS credential tests
+        run: |
+          # S3OperatorSettings and tests/s3_sts_wire.rs live behind `opendal-s3`, which the default
+          # build never enables, so without this step dropping the session token from the operator
+          # builder would keep every gate green. The wire test targets a loopback S3 stand-in and
+          # the pre-existing s3_fs.rs self-skips without credentials, so no cloud access is needed.
+          cargo test -p curvine-ufs-api --jobs ${{ env.CARGO_BUILD_JOBS }}
+          cargo test -p curvine-ufs-opendal --features opendal-s3 --tests --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After S3 UFS credential tests, disk usage:"
+          df -h
+
       - name: Replication lifecycle regression tests
         run: |
           # Exercise the real Master/Worker submit, dropped-report, reaper and
@@ -139,7 +165,7 @@ jobs:
 
       - name: Checkout cvtest for POSIX smoke
         if: github.event_name == 'pull_request'
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.CVTEST_REPO }}
           ref: ${{ env.CVTEST_REF }}
