@@ -127,6 +127,10 @@ pub struct MasterFilesystem {
     /// Test-only: fails the next block-report batch apply (one-shot).
     #[cfg(test)]
     force_block_report_apply_failure: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only: a reconcile pauses here after its generation check and
+    /// before its marker prune, so a racing report can be driven into the gap.
+    #[cfg(test)]
+    reconcile_prune_gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
     /// owns the staging directory across staging and draining, and the
     /// background purger skips a cycle while that lock is held, so the two can
@@ -274,6 +278,8 @@ impl MasterFilesystem {
             replication_handler: Default::default(),
             #[cfg(test)]
             force_block_report_apply_failure: Default::default(),
+            #[cfg(test)]
+            reconcile_prune_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -299,6 +305,8 @@ impl MasterFilesystem {
             replication_handler: Default::default(),
             #[cfg(test)]
             force_block_report_apply_failure: Default::default(),
+            #[cfg(test)]
+            reconcile_prune_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -2489,14 +2497,28 @@ impl MasterFilesystem {
                 );
                 return Ok(Vec::new());
             }
-        }
 
-        // Quarantine markers the worker no longer reports are stale too
-        // (metadata lost, extent gone). Ids still reported Quarantined were
-        // re-marked when the completing batch was applied.
-        self.worker_manager
-            .write()
-            .retain_worker_quarantine(worker_id, &reported_blocks);
+            // Quarantine markers the worker no longer reports are stale too
+            // (metadata lost, extent gone). Ids still reported Quarantined were
+            // re-marked when the completing batch was applied. Pruned under
+            // the generation lock: an incremental Quarantined report bumps the
+            // generation before it sets its marker, so it either makes this
+            // job stale above or marks after the prune; released in between,
+            // a report landing in the gap would have its fresh marker pruned.
+            // Lock order `full_block_reconciles` -> `worker_manager` is new
+            // here; every other `full_block_reconciles` site holds no lock.
+            #[cfg(test)]
+            {
+                // Bind first: an `if let` on the guard would hold it while parked.
+                let gate = self.reconcile_prune_gate.lock().take();
+                if let Some(gate) = gate {
+                    let _ = gate.recv_timeout(std::time::Duration::from_secs(5));
+                }
+            }
+            self.worker_manager
+                .write()
+                .retain_worker_quarantine(worker_id, &reported_blocks);
+        }
 
         if !batch.is_empty() {
             self.apply_block_report_batch(batch)?;
@@ -4114,6 +4136,62 @@ mod tests {
             vec![block_id],
             "the quarantined worker is told too, even though it is not a location"
         );
+    }
+
+    /// The reconcile's generation check and its marker prune are one critical
+    /// section. The reconcile is paused between the two; a Quarantined report
+    /// sent meanwhile must not get its fresh marker pruned. Were the prune
+    /// outside the lock, the report would run in the gap and lose the marker.
+    #[test]
+    fn quarantined_report_cannot_slip_between_reconcile_check_and_prune() {
+        let fs = Arc::new(test_fs("quarantine-reconcile-race"));
+        let block_id = replication_file(&fs, "/quarantine-reconcile-race.log");
+        fs.full_block_reconciles.lock().insert(
+            200,
+            FullBlockReconcileState {
+                running: true,
+                generation: 1,
+                pending: None,
+            },
+        );
+        let (release, gate) = std::sync::mpsc::channel();
+        *fs.reconcile_prune_gate.lock() = Some(gate);
+
+        // Reconcile for a snapshot without the block; it passes the check and
+        // parks before the prune.
+        let fs_a = fs.clone();
+        let reconcile = std::thread::spawn(move || {
+            fs_a.reconcile_full_block_report(200, 1, HashSet::new())
+                .unwrap()
+        });
+        while fs.reconcile_prune_gate.lock().is_some() {
+            std::thread::yield_now();
+        }
+
+        // The report arrives in the gap.
+        let fs_b = fs.clone();
+        let report = std::thread::spawn(move || quarantine_on(&fs_b, 200, block_id));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let marked_early = !fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty();
+
+        release.send(()).unwrap();
+        reconcile.join().unwrap();
+        report.join().unwrap();
+
+        assert!(
+            !marked_early,
+            "the report must wait for the reconcile's generation lock"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the marker is set after the prune and survives"
+        );
+        assert!(!fs.is_full_block_reconcile_current(200, 1));
     }
 
     /// A full report that no longer lists the block (metadata lost) prunes
