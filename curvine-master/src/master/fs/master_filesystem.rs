@@ -4330,6 +4330,7 @@ mod tests {
     use super::*;
     use curvine_core_error::ErrorExt;
     use curvine_error::ErrorKind;
+    use curvine_proto::ReportBlockReplicationRequest;
     use curvine_raft::raft::{FollowerReadinessMonitor, RoleState};
     use curvine_runtime::common::Utils;
     use curvine_runtime::sync::StateCtl;
@@ -6527,9 +6528,18 @@ mod tests {
     fn replication_manager_for(
         fs: &MasterFilesystem,
     ) -> Arc<crate::master::replication::master_replication_manager::MasterReplicationManager> {
+        replication_manager_with_concurrency(fs, 1000)
+    }
+
+    /// `concurrency == 0` keeps queued blocks queued: the loop never gets a permit.
+    fn replication_manager_with_concurrency(
+        fs: &MasterFilesystem,
+        concurrency: usize,
+    ) -> Arc<crate::master::replication::master_replication_manager::MasterReplicationManager> {
         use crate::master::replication::master_replication_manager::MasterReplicationManager;
         let mut conf = ClusterConf::format();
         conf.master.block_replication_enabled = true;
+        conf.master.block_replication_concurrency_limit = concurrency;
         let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
         MasterReplicationManager::new(fs, &conf, &rt, &fs.worker_manager).unwrap()
     }
@@ -6572,6 +6582,11 @@ mod tests {
             fs.worker_manager.read().quarantined_workers(block_id),
             vec![200],
             "the extent is pinned: the marker still excludes 200 as a target"
+        );
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200]
         );
     }
 
@@ -6737,6 +6752,248 @@ mod tests {
             "the marker is set after the prune and survives"
         );
         assert!(!fs.is_full_block_reconcile_current(200, 1));
+    }
+
+    /// A quarantined worker is excluded as a target even once it is not a location.
+    #[test]
+    fn quarantined_worker_is_excluded_from_replication_targets() {
+        let fs = test_fs("quarantined-target-exclusion");
+        let block_id = replication_file(&fs, "/quarantined-target-exclusion.log");
+        let manager = replication_manager_for(&fs);
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(manager.excluded_targets(block_id, &locations), vec![100]);
+
+        quarantine_on(&fs, 200, block_id);
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100],
+            "200 is not a location"
+        );
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200],
+            "200 must still be excluded as a target"
+        );
+    }
+
+    /// Every spare worker quarantined: no target is assignable until a marker
+    /// is released (live report) or its worker is lost.
+    #[test]
+    fn exclusion_follows_marker_release_and_worker_loss() {
+        let fs = test_fs("quarantined-all-spares");
+        let block_id = replication_file(&fs, "/quarantined-all-spares.log");
+        let manager = replication_manager_for(&fs);
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+
+        quarantine_on(&fs, 200, block_id);
+        quarantine_on(&fs, 300, block_id);
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200, 300]
+        );
+        assert!(
+            !manager.can_assign_for_test(vec![100, 200, 300]),
+            "no candidate left"
+        );
+
+        // 300 reports the block live again: its marker goes.
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                batch_index: None,
+                cluster_id: "curvine".into(),
+                worker_id: 300,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(location_ids(&fs, block_id), vec![100, 300]);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "300's marker released by its live report"
+        );
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200, 300],
+            "300 excluded as a location now, 200 still as a marker"
+        );
+
+        // 200 is lost: its marker goes with it; only locations remain excluded.
+        fs.worker_manager.write().clear_worker_quarantine(200);
+        assert!(fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty());
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 300]
+        );
+    }
+
+    /// A prepare refusal marks the target, drops the attempt and re-queues at
+    /// once; the next pick excludes the refusing worker.
+    #[test]
+    fn prepare_refusal_marks_target_quarantined_and_excludes_it() {
+        let fs = test_fs("quarantine-prepare-refusal");
+        let block_id = replication_file(&fs, "/quarantine-prepare-refusal.log");
+        let manager = replication_manager_with_concurrency(&fs, 0);
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(manager.excluded_targets(block_id, &locations), vec![100]);
+
+        // A new leader has no marker; the first pick (200) refuses Prepare.
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+        manager.on_prepare_refused(block_id, &attempt_id, 200);
+
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+        assert!(
+            !manager.is_uncertain_attempt_for_test(block_id, &attempt_id),
+            "refused before reserving: cancelled, not parked"
+        );
+        assert!(
+            manager.is_queued_for_test(block_id),
+            "re-queued now, not after the repair backoff"
+        );
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200],
+            "the refusing target is excluded on the re-pick"
+        );
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+    }
+
+    /// Target quarantined after Complete: not published, parked Uncertain, repair retries.
+    #[test]
+    fn finish_replicated_block_ignores_quarantined_target() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantine-replication-commit");
+        let block_id = replication_file(&fs, "/quarantine-replication-commit.log");
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+
+        // Quarantined after Complete, before the report lands.
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+        quarantine_on(&fs, 200, block_id);
+        manager
+            .finish_replicated_block(ReportBlockReplicationRequest {
+                block_id,
+                attempt_id: Some(attempt_id.clone()),
+                storage_type: StorageType::SpdkDisk.into(),
+                success: true,
+                message: None,
+            })
+            .unwrap();
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100],
+            "quarantined target must not be published"
+        );
+        assert!(
+            manager.is_uncertain_attempt_for_test(block_id, &attempt_id),
+            "the attempt must be reconciled, not finished as a success"
+        );
+
+        // A non-quarantined worker still commits (second file: the first attempt is parked).
+        let other = replication_file(&fs, "/quarantine-replication-commit-2.log");
+        let attempt_id = manager.seed_inflight_attempt_for_test(other, 100, 300);
+        manager
+            .finish_replicated_block(ReportBlockReplicationRequest {
+                block_id: other,
+                attempt_id: Some(attempt_id.clone()),
+                storage_type: StorageType::Disk.into(),
+                success: true,
+                message: None,
+            })
+            .unwrap();
+        assert_eq!(location_ids(&fs, other), vec![100, 300]);
+        assert!(!manager.is_uncertain_attempt_for_test(other, &attempt_id));
+    }
+
+    /// A parked attempt whose live target confirms the replica is final: the
+    /// stale marker is released and the replica published, not re-parked.
+    #[test]
+    fn reconcile_confirming_final_replica_releases_stale_marker() {
+        let fs = test_fs("quarantine-stale-marker-reconcile");
+        let block_id = replication_file(&fs, "/quarantine-stale-marker-reconcile.log");
+        let manager = replication_manager_for(&fs);
+
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+        quarantine_on(&fs, 200, block_id);
+        manager
+            .finish_replicated_block(ReportBlockReplicationRequest {
+                block_id,
+                attempt_id: Some(attempt_id.clone()),
+                storage_type: StorageType::SpdkDisk.into(),
+                success: true,
+                message: None,
+            })
+            .unwrap();
+        assert!(manager.is_uncertain_attempt_for_test(block_id, &attempt_id));
+
+        // What reconcile_attempt does on `Some(storage_type)` from the target.
+        manager
+            .confirm_final_replica(block_id, &attempt_id, 200, StorageType::SpdkDisk.into())
+            .unwrap();
+        assert!(
+            fs.worker_manager
+                .read()
+                .quarantined_workers(block_id)
+                .is_empty(),
+            "the live target's answer outranks the marker"
+        );
+        assert_eq!(location_ids(&fs, block_id), vec![100, 200]);
+        assert!(!manager.is_uncertain_attempt_for_test(block_id, &attempt_id));
+    }
+
+    /// The target's answer is about the replica, not the attempt: a stale
+    /// attempt id still releases the marker, and nothing is published.
+    #[test]
+    fn confirm_final_replica_releases_marker_even_for_a_stale_attempt() {
+        let fs = test_fs("quarantine-stale-attempt-confirm");
+        let block_id = replication_file(&fs, "/quarantine-stale-attempt-confirm.log");
+        let manager = replication_manager_for(&fs);
+        quarantine_on(&fs, 200, block_id);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+
+        manager
+            .confirm_final_replica(
+                block_id,
+                "no-such-attempt",
+                200,
+                StorageType::SpdkDisk.into(),
+            )
+            .unwrap();
+        assert!(fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty());
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100],
+            "an unknown attempt publishes nothing; the full report adds the location"
+        );
     }
 
     #[test]
