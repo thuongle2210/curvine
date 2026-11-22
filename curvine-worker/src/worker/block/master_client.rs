@@ -347,11 +347,11 @@ impl MasterClient {
         request.blocks.extend(blocks.iter().map(|block| {
             let status = match block.state {
                 BlockState::Finalized => BlockReportStatusProto::Finalized,
+                BlockState::Quarantined => BlockReportStatusProto::Quarantined,
                 BlockState::Writing
                 | BlockState::Recovering
                 | BlockState::Allocating
-                | BlockState::Finalizing
-                | BlockState::Quarantined => BlockReportStatusProto::Writing,
+                | BlockState::Finalizing => BlockReportStatusProto::Writing,
             };
             BlockReportInfoProto {
                 id: block.id,
