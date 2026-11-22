@@ -453,6 +453,8 @@ pub struct S3GatewayConf {
     pub cache_refresh_interval_secs: u64,
     pub get_chunk_size_mb: f32,
     pub web_port: u16,
+    pub signed_chunk_spool_dir: String,
+    pub signed_chunk_spool_max_bytes: u64,
 }
 
 impl Default for S3GatewayConf {
@@ -470,6 +472,8 @@ impl Default for S3GatewayConf {
             cache_refresh_interval_secs: 30,
             get_chunk_size_mb: 1.0,
             web_port: 9003,
+            signed_chunk_spool_dir: "/tmp/curvine-signed-spool".to_string(),
+            signed_chunk_spool_max_bytes: 10 << 30,
         }
     }
 }
@@ -477,7 +481,7 @@ impl Default for S3GatewayConf {
 #[cfg(test)]
 mod tests {
     use super::ClusterConf;
-    use crate::RaftPeer;
+    use crate::{RaftPeer, TransferMode};
     use curvine_runtime::common::Utils;
 
     struct EnvVarsGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -812,7 +816,8 @@ mod tests {
                 conn_limit = 0
 
                 [transfer]
-                enabled = true
+                mode = "standalone"
+                endpoints = ["transfer-01.example:9010"]
             "#,
         )
         .unwrap();
@@ -820,6 +825,7 @@ mod tests {
         let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
 
+        assert_eq!(conf.transfer.mode, Some(TransferMode::Standalone));
         assert!(!conf.client.master_addrs.is_empty());
     }
 
@@ -922,7 +928,7 @@ mod tests {
             &path,
             r#"
                 [transfer]
-                enabled = true
+                mode = "embedded"
 
                 [log]
                 file_name = "curvine.log"
@@ -933,6 +939,7 @@ mod tests {
         let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
 
+        assert_eq!(conf.transfer.mode, Some(TransferMode::Embedded));
         assert_eq!(conf.transfer.log.file_name, "transfer.log");
         assert_eq!(conf.log.file_name, "curvine.log");
     }

@@ -15,14 +15,14 @@
 use crate::common::UfsFactory;
 use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, TransferMetrics};
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_config::ClientConf;
+use curvine_config::{ClientConf, LoadTransferDefaults};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    FileStatus, LoadJobInfo, MountInfo, TransferCommand, TransferJobRecord, TransferKind,
+    FileStatus, MountInfo, TransferCommand, TransferJobInfo, TransferJobRecord, TransferKind,
     TransferTaskRecord, TransferTaskState,
 };
 use curvine_runtime::common::LocalTime;
@@ -35,7 +35,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const CV_LIST_PAGE_SIZE: usize = 1_000;
 
 pub struct PlannedTransfer {
-    pub job_info: LoadJobInfo,
+    pub job_info: TransferJobInfo,
     pub tasks: Vec<TransferTaskRecord>,
     pub total_size: i64,
     pub skipped_files: usize,
@@ -51,6 +51,7 @@ pub struct TransferPlanner {
     client_conf: ClientConf,
     max_tasks_per_transfer: usize,
     ufs_limiter: Arc<UfsEndpointLimiter>,
+    transfer_defaults: LoadTransferDefaults,
 }
 
 impl TransferPlanner {
@@ -61,6 +62,7 @@ impl TransferPlanner {
         client_conf: ClientConf,
         max_tasks_per_transfer: usize,
         ufs_max_concurrency_per_endpoint: usize,
+        transfer_defaults: LoadTransferDefaults,
     ) -> Self {
         Self {
             master_fs,
@@ -69,6 +71,7 @@ impl TransferPlanner {
             client_conf,
             max_tasks_per_transfer,
             ufs_limiter: Arc::new(UfsEndpointLimiter::new(ufs_max_concurrency_per_endpoint)),
+            transfer_defaults,
         }
     }
 
@@ -80,11 +83,15 @@ impl TransferPlanner {
     async fn plan_once(
         &self,
         job: &TransferJobRecord,
-        mount: MountInfo,
+        mut mount: MountInfo,
     ) -> FsResult<PlannedTransfer> {
+        // Transfer-service jobs are planned here, not by the master load planner,
+        // so the `[job]` transfer tuning has to be injected before the mount is
+        // handed to the UFS reader and to every task info.
+        self.transfer_defaults.apply(&mut mount.properties);
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
-        let job_info = self.load_job_info(job, &mount);
+        let job_info = self.transfer_job_info(job, &mount);
         let source_status = self.get_status(&source, &mount).await?;
         let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
         let target_status = if incremental_load {
@@ -209,8 +216,16 @@ impl TransferPlanner {
         }
     }
 
-    pub(crate) fn load_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> LoadJobInfo {
-        load_job_info(job, mount, &self.client_conf)
+    pub(crate) fn transfer_job_info(
+        &self,
+        job: &TransferJobRecord,
+        mount: &MountInfo,
+    ) -> TransferJobInfo {
+        // Scheduler-built tasks come through here with a mount snapshot, which
+        // may not have been through plan_once().
+        let mut mount = mount.clone();
+        self.transfer_defaults.apply(&mut mount.properties);
+        transfer_job_info(job, &mount, &self.client_conf)
     }
 
     async fn get_status(&self, path: &Path, mount: &MountInfo) -> FsResult<FileStatus> {
@@ -343,17 +358,17 @@ fn validate_transfer_target(
     Ok(())
 }
 
-pub(crate) fn load_job_info(
+pub(crate) fn transfer_job_info(
     job: &TransferJobRecord,
     mount: &MountInfo,
     client_conf: &ClientConf,
-) -> LoadJobInfo {
+) -> TransferJobInfo {
     let command = transfer_command(job).ok();
     let overwrite = command
         .as_ref()
         .map(|command| command.overwrite())
         .unwrap_or(true);
-    LoadJobInfo {
+    TransferJobInfo {
         job_id: job.job_id.clone(),
         source_path: job.source_path.clone(),
         target_path: job.target_path.clone(),

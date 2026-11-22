@@ -16,10 +16,14 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
-use crate::master::{JobStore, Master};
+use crate::master::Master;
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
-use curvine_model::{JobTaskProgress, JobTaskState, JobTaskType, MetricValue, WorkerInfo};
+use curvine_metrics::{
+    Counter, CounterVec, Gauge, GaugeVec, HistogramVec, MetricFamilyType, Metrics, Metrics as m,
+};
+use curvine_model::{
+    MetricType, MetricValue, ReadCacheReservationEvents, ReadCacheSkipReason, WorkerInfo,
+};
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::version::ReleaseVersion;
@@ -34,38 +38,6 @@ const CLIENT_VERSION_NONE: &str = "none";
 /// Release version label of a client whose reported version cannot be parsed.
 /// Parsing keeps the label set bounded by real builds, not by client input.
 const CLIENT_VERSION_UNKNOWN: &str = "unknown";
-
-/// Job kinds and the states the master job manager moves a job through.
-/// `load_jobs` exports every combination, with 0 when no job is in it, so a
-/// dashboard series does not disappear while the store is empty.
-const LOAD_JOB_KINDS: [JobTaskType; 2] = [JobTaskType::Load, JobTaskType::Export];
-const LOAD_JOB_STATES: [JobTaskState; 6] = [
-    JobTaskState::Pending,
-    JobTaskState::Loading,
-    JobTaskState::Completed,
-    JobTaskState::Failed,
-    JobTaskState::Canceled,
-    JobTaskState::PartialSuccess,
-];
-
-fn job_kind_label(kind: JobTaskType) -> &'static str {
-    match kind {
-        JobTaskType::Load => "load",
-        JobTaskType::Export => "export",
-    }
-}
-
-fn job_state_label(state: JobTaskState) -> &'static str {
-    match state {
-        JobTaskState::UNKNOWN => "unknown",
-        JobTaskState::Pending => "pending",
-        JobTaskState::Loading => "loading",
-        JobTaskState::Completed => "completed",
-        JobTaskState::Failed => "failed",
-        JobTaskState::Canceled => "canceled",
-        JobTaskState::PartialSuccess => "partial_success",
-    }
-}
 
 struct ClientCompat {
     release_version: String,
@@ -144,9 +116,62 @@ impl ClientCompatTracker {
     }
 }
 
+pub(crate) struct ReadCacheReservationMetrics {
+    pub(crate) issued: Counter,
+    pub(crate) confirmed: Counter,
+    pub(crate) released_bytes: Counter,
+    pub(crate) expired: Counter,
+    skipped: [Counter; ReadCacheSkipReason::ALL.len()],
+}
+
+impl ReadCacheReservationMetrics {
+    fn new(prefix: &str) -> CommonResult<Self> {
+        let counter = |suffix: &str, help: &str| {
+            m::new_counter(format!("{prefix}_{suffix}"), help.to_string())
+        };
+        let skipped = m::new_counter_vec(
+            format!("{prefix}_skipped_total"),
+            "Read-cache optimization skips by bounded reason; counts attempts, not unique files"
+                .to_string(),
+            &["reason"],
+        )?;
+        Ok(Self {
+            issued: counter("batches_issued_total", "New read-cache confirmation batches; excludes token redelivery")?,
+            confirmed: counter("batches_confirmed_total", "Read-cache batches acknowledged by a fresh snapshot; may release zero bytes")?,
+            released_bytes: counter("released_bytes_total", "Replica reservation bytes actually released by read-cache confirmation")?,
+            expired: counter("batches_expired_total", "Read-cache confirmation batches discarded at their ACK deadline; no capacity is released")?,
+            skipped: ReadCacheSkipReason::ALL.map(|reason| skipped.with_label_values(&[reason.label()])),
+        })
+    }
+
+    pub(crate) fn record(&self, events: ReadCacheReservationEvents) {
+        for (counter, count) in [
+            (&self.issued, events.issued),
+            (&self.confirmed, events.confirmed),
+            (&self.released_bytes, events.released_bytes),
+            (&self.expired, events.expired),
+        ] {
+            if count > 0 {
+                counter.inc_by(count);
+            }
+        }
+        for reason in ReadCacheSkipReason::ALL {
+            self.skip(reason, events.skipped[reason as usize]);
+        }
+    }
+
+    pub(crate) fn skip(&self, reason: ReadCacheSkipReason, count: i64) {
+        if count > 0 {
+            self.skipped[reason as usize].inc_by(count);
+        }
+    }
+}
+
 pub struct MasterMetrics {
     pub(crate) rpc_request_total_count: Counter,
     pub(crate) rpc_request_total_time: Counter,
+    pub(crate) follower_read_accepted_total: CounterVec,
+    pub(crate) follower_read_refused_total: CounterVec,
     pub(crate) active_connections: Gauge,
 
     pub(crate) capacity: Gauge,
@@ -157,6 +182,7 @@ pub struct MasterMetrics {
     pub(crate) allocatable_capacity: Gauge,
     pub(crate) allocatable_available: Gauge,
     pub(crate) scheduled_bytes: GaugeVec,
+    pub(crate) read_cache_reservation: ReadCacheReservationMetrics,
 
     pub(crate) worker_num: GaugeVec,
 
@@ -167,6 +193,8 @@ pub struct MasterMetrics {
     pub(crate) journal_term: Gauge,
     pub(crate) journal_applied: Gauge,
     pub(crate) journal_ufs_applied: Gauge,
+
+    pub(crate) journal_ufs: GaugeVec,
 
     // Metadata DB keys as produced by `DBEngine::get_rocksdb_metrics`; journal
     // DB keys carry an extra `journal_` prefix.
@@ -259,25 +287,6 @@ pub struct MasterMetrics {
     pub(crate) reaped_locks_total: Counter,
     pub(crate) reaped_writers_total: Counter,
     pub(crate) reaped_stale_hints_total: Counter,
-
-    // Load and export jobs of the master job manager (#224), labelled by kind
-    // (load, export) and state. fs_mode exports are submitted from journal
-    // apply, so no client ever sees their job id; these metrics are how an
-    // operator notices that they fail. `load_jobs` is rebuilt from the job
-    // store on every scrape, and finished runs stay in it until
-    // `job.terminal_retention` expires. The counters see every run that enters
-    // the job store; a direct submit that needs no work (target already cached,
-    // nothing to copy) returns at submit time and is not counted.
-    pub(crate) load_jobs: GaugeVec,
-    pub(crate) load_job_finished_total: CounterVec,
-    // From job creation (including the wait for a load slot) to the terminal state.
-    pub(crate) load_job_duration_ms: HistogramVec,
-    // Worker task reports. A report for a run that has already finished is
-    // ignored by the job store and is not counted.
-    pub(crate) load_task_finished_total: CounterVec,
-    // Bytes copied by load and export tasks, summed from the growth of each
-    // task's reported `loaded_size`. Use rate() for throughput.
-    pub(crate) load_task_loaded_bytes_total: CounterVec,
 }
 
 impl MasterMetrics {
@@ -307,6 +316,16 @@ impl MasterMetrics {
                 "rpc_request_time",
                 "Rpc request time duration(ms)",
             )?,
+            follower_read_accepted_total: m::new_counter_vec(
+                "master_follower_read_accepted_total",
+                "Follower read RPCs served after freshness and location readiness checks",
+                &["rpc_code"],
+            )?,
+            follower_read_refused_total: m::new_counter_vec(
+                "master_follower_read_refused_total",
+                "Follower RPCs refused by the allowlist or freshness/readiness checks",
+                &["rpc_code", "reason"],
+            )?,
             active_connections: m::new_gauge(
                 "master_active_connections",
                 "Number of active RPC connections to master",
@@ -330,6 +349,7 @@ impl MasterMetrics {
                 "In-flight allocations not yet reflected in heartbeat available space, labelled by live worker connect address",
                 &["worker_addr"],
             )?,
+            read_cache_reservation: ReadCacheReservationMetrics::new("master_read_cache_reservation")?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
@@ -350,6 +370,11 @@ impl MasterMetrics {
             journal_ufs_applied: m::new_gauge(
                 "journal_ufs_applied",
                 "Last UFS-applied index of the journal state machine",
+            )?,
+            journal_ufs: m::new_gauge_vec(
+                "journal_ufs",
+                "UFS replay progress by kind: pending backlog, stalled flag, failed attempts",
+                &["kind"],
             )?,
 
             rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,
@@ -517,46 +542,6 @@ impl MasterMetrics {
                 "master_reaped_stale_hints_total",
                 "Ownership hints dropped because the inode or ownership was already gone",
             )?,
-
-            load_jobs: m::new_gauge_vec(
-                "load_jobs",
-                "Load and export jobs held by the master job manager, labelled by kind and state",
-                &["kind", "state"],
-            )?,
-            load_job_finished_total: m::new_counter_vec(
-                "load_job_finished_total",
-                "Load and export job runs that reached a terminal state, labelled by kind and state",
-                &["kind", "state"],
-            )?,
-            load_job_duration_ms: m::new_histogram_vec_with_buckets(
-                "load_job_duration_ms",
-                "Time (ms) from creating a load or export job run to its terminal state, labelled by kind and state",
-                &["kind", "state"],
-                &[
-                    100.0,
-                    1_000.0,
-                    10_000.0,
-                    60_000.0,
-                    300_000.0,
-                    900_000.0,
-                    1_800_000.0,
-                    3_600_000.0,
-                    10_800_000.0,
-                    21_600_000.0,
-                    43_200_000.0,
-                    86_400_000.0,
-                ],
-            )?,
-            load_task_finished_total: m::new_counter_vec(
-                "load_task_finished_total",
-                "Load and export tasks reported in a terminal state by workers, labelled by kind and state",
-                &["kind", "state"],
-            )?,
-            load_task_loaded_bytes_total: m::new_counter_vec(
-                "load_task_loaded_bytes_total",
-                "Bytes copied by load and export tasks as reported by workers, labelled by kind",
-                &["kind"],
-            )?,
         };
 
         Ok(wm)
@@ -624,77 +609,6 @@ impl MasterMetrics {
         self.checkpoint_last_duration_ms.set(total_ms as i64);
     }
 
-    /// Records a job run that reached a terminal state `duration_ms` after it
-    /// was created.
-    pub(crate) fn record_load_job_finished(
-        &self,
-        kind: JobTaskType,
-        state: JobTaskState,
-        duration_ms: u64,
-    ) {
-        let labels = [job_kind_label(kind), job_state_label(state)];
-        self.load_job_finished_total
-            .with_label_values(&labels)
-            .inc();
-        self.load_job_duration_ms
-            .with_label_values(&labels)
-            .observe(duration_ms as f64);
-    }
-
-    /// Records a worker report that moved a task from `previous` to `current`:
-    /// the bytes copied since the previous report and, on the first terminal
-    /// report, the task's final state.
-    pub(crate) fn record_load_task_report(
-        &self,
-        kind: JobTaskType,
-        previous: &JobTaskProgress,
-        current: &JobTaskProgress,
-    ) {
-        let kind = job_kind_label(kind);
-        // A retried task restarts from 0; the bytes it copies again are new
-        // work, so only growth is counted and a drop is not subtracted.
-        let copied = current.loaded_size.saturating_sub(previous.loaded_size);
-        if copied > 0 {
-            self.load_task_loaded_bytes_total
-                .with_label_values(&[kind])
-                .inc_by(copied);
-        }
-
-        if !previous.state.is_finish() && current.state.is_finish() {
-            self.load_task_finished_total
-                .with_label_values(&[kind, job_state_label(current.state)])
-                .inc();
-        }
-    }
-
-    /// Rebuilds `load_jobs` from the job store. The master renders it before
-    /// `text_output`, which has no access to the job manager.
-    pub(crate) fn refresh_load_jobs(&self, jobs: &JobStore) {
-        Self::refresh_load_job_counts(&self.load_jobs, jobs);
-    }
-
-    fn refresh_load_job_counts(metric: &GaugeVec, jobs: &JobStore) {
-        let mut counts = HashMap::new();
-        for kind in LOAD_JOB_KINDS {
-            for state in LOAD_JOB_STATES {
-                counts.insert((job_kind_label(kind), job_state_label(state)), 0);
-            }
-        }
-        for entry in jobs.iter() {
-            let job = entry.value();
-            let state: JobTaskState = job.state.state();
-            *counts
-                .entry((job_kind_label(job.kind), job_state_label(state)))
-                .or_insert(0) += 1;
-        }
-
-        // Count first, so the window in which the gauge is empty stays short.
-        metric.reset();
-        for ((kind, state), count) in counts {
-            metric.with_label_values(&[kind, state]).set(count);
-        }
-    }
-
     /// Renders all metrics. `journal_store` adds the journal DB RocksDB metrics;
     /// `None` skips them, e.g. for a filesystem built without a journal system.
     pub fn text_output(
@@ -750,19 +664,47 @@ impl MasterMetrics {
         Metrics::text_output()
     }
 
-    pub fn get_or_register(&self, value: &MetricValue) -> CommonResult<CounterVec> {
+    /// Label that keeps each client's gauge snapshots apart. Gauges are levels,
+    /// not sums, so the cluster total is `sum by (name)` over the instances.
+    /// A client's series are removed once its session expires and the reaper
+    /// forgets it, so a dead client stops contributing its last reported level.
+    pub const INSTANCE_LABEL: &'static str = "instance";
+
+    pub fn get_or_register(&self, value: &MetricValue) -> CommonResult<Metrics> {
         if let Some(v) = Metrics::get(&value.name) {
-            return v.try_into_counter_vec();
+            return Ok(v);
         }
 
-        let label_values: Vec<&str> = value.tags.keys().map(|v| v.as_str()).collect();
-        let metric = m::new_counter_vec(&value.name, &value.name, &label_values)?;
+        // Label positions are fixed at registration, so both sides must use
+        // the same order; HashMap iteration order is randomized.
+        let mut label_values: Vec<&str> = value.tags.keys().map(|v| v.as_str()).collect();
+        label_values.sort_unstable();
+        let metric = match value.metric_type {
+            MetricType::Counter => {
+                Metrics::CounterVec(m::new_counter_vec(&value.name, &value.name, &label_values)?)
+            }
+            MetricType::Gauge => {
+                Metrics::GaugeVec(m::new_gauge_vec(&value.name, &value.name, &label_values)?)
+            }
+            MetricType::Histogram => {
+                warn!("Unsupported metric type: {}", value.name);
+                return curvine_core_error::err_box!("Unsupported metric type");
+            }
+        };
         Ok(metric)
     }
 
-    pub fn metrics_report(&self, metrics: Vec<MetricValue>) -> CommonResult<()> {
-        for value in metrics {
-            let counter = match self.get_or_register(&value) {
+    pub fn metrics_report(&self, instance: &str, metrics: Vec<MetricValue>) -> CommonResult<()> {
+        for mut value in metrics {
+            if value.metric_type == MetricType::Gauge {
+                // A gauge is a point-in-time level of one client, so snapshots
+                // from different clients must not overwrite each other.
+                value
+                    .tags
+                    .insert(Self::INSTANCE_LABEL.to_string(), instance.to_string());
+            }
+
+            let metric = match self.get_or_register(&value) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("Metric not found: {}: {}", value.name, e);
@@ -770,13 +712,67 @@ impl MasterMetrics {
                 }
             };
 
-            let label_values: Vec<&str> = value.tags.values().map(|v| v.as_str()).collect();
-            counter
-                .with_label_values(&label_values)
-                .inc_by(value.value as i64)
+            let mut tags: Vec<(&String, &String)> = value.tags.iter().collect();
+            tags.sort_by(|a, b| a.0.cmp(b.0));
+            let label_values: Vec<&str> = tags.iter().map(|(_, v)| v.as_str()).collect();
+            let res = match value.metric_type {
+                MetricType::Counter => metric.try_into_counter_vec().map(|counter| {
+                    counter
+                        .with_label_values(&label_values)
+                        .inc_by(value.value as i64)
+                }),
+                MetricType::Gauge => metric.try_into_gauge_vec().map(|gauge| {
+                    gauge
+                        .with_label_values(&label_values)
+                        .set(value.value as i64)
+                }),
+                MetricType::Histogram => {
+                    warn!("Unsupported metric type: {}", value.name);
+                    continue;
+                }
+            };
+            if let Err(e) = res {
+                warn!("Metric not found: {}: {}", value.name, e);
+            }
         }
 
         Ok(())
+    }
+
+    /// Drop every gauge series reported by `instance`.
+    ///
+    /// Client names are per-process, so a client that exits or crashes would
+    /// otherwise keep contributing its last level to `sum by (name)` for the
+    /// lifetime of the master, and every restart would leave a label value
+    /// behind. The session reaper calls this once the client's lease has
+    /// expired: the client can no longer refresh its series.
+    pub fn evict_instance(&self, instance: &str) {
+        let names: Vec<String> = Metrics::registry()
+            .gather()
+            .iter()
+            .filter(|family| family.get_field_type() == MetricFamilyType::GAUGE)
+            .filter(|family| {
+                family.get_metric().iter().any(|metric| {
+                    let labels = metric.get_label();
+                    labels.len() == 1
+                        && labels[0].get_name() == Self::INSTANCE_LABEL
+                        && labels[0].get_value() == instance
+                })
+            })
+            .map(|family| family.get_name().to_string())
+            .collect();
+
+        for name in names {
+            let Some(metric) = Metrics::get(&name) else {
+                continue;
+            };
+            let Ok(gauge) = metric.try_into_gauge_vec() else {
+                continue;
+            };
+            if let Err(e) = gauge.remove_label_values(&[instance]) {
+                warn!("drop gauge series {} of {}: {}", name, instance, e);
+            }
+        }
     }
 }
 
@@ -789,10 +785,161 @@ impl Debug for MasterMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::master::JobContext;
-    use curvine_config::{ClientConf, JournalConf};
-    use curvine_model::{LoadJobCommand, MountInfo, WorkerAddress};
+    use curvine_config::JournalConf;
+    use curvine_model::WorkerAddress;
     use curvine_runtime::common::Utils;
+
+    #[test]
+    fn read_cache_metrics_export_fixed_labels_and_exact_event_totals() {
+        let metrics = ReadCacheReservationMetrics::new("test_read_cache_reservation").unwrap();
+        let mut events = ReadCacheReservationEvents {
+            issued: 2,
+            confirmed: 1,
+            released_bytes: 4 << 20,
+            expired: 1,
+            ..Default::default()
+        };
+        events.skip(ReadCacheSkipReason::LeaseRevoked);
+        metrics.record(events);
+        metrics.record(Default::default());
+        assert_eq!(metrics.issued.get(), 2);
+        assert_eq!(metrics.confirmed.get(), 1);
+        assert_eq!(metrics.released_bytes.get(), 4 << 20);
+        assert_eq!(metrics.expired.get(), 1);
+        let output = Metrics::text_output().unwrap();
+        for reason in ReadCacheSkipReason::ALL {
+            let value = i64::from(matches!(reason, ReadCacheSkipReason::LeaseRevoked));
+            assert_eq!(metrics.skipped[reason as usize].get(), value);
+            assert!(
+                output.contains(&format!(
+                    "test_read_cache_reservation_skipped_total{{reason=\"{}\"}} {}",
+                    reason.label(),
+                    value
+                )),
+                "{output}"
+            );
+        }
+        assert!(output.contains("test_read_cache_reservation_released_bytes_total 4194304"));
+    }
+
+    fn gauge_value(name: &str, instance: &str) -> i64 {
+        Metrics::get(name)
+            .expect("metric registered")
+            .try_into_gauge_vec()
+            .expect("gauge metric")
+            .with_label_values(&[instance])
+            .get()
+    }
+
+    /// Whether the registry currently holds a series of `name` for `instance`.
+    fn has_instance_series(name: &str, instance: &str) -> bool {
+        Metrics::registry()
+            .gather()
+            .iter()
+            .filter(|family| family.get_name() == name)
+            .flat_map(|family| family.get_metric())
+            .any(|metric| {
+                metric.get_label().iter().any(|label| {
+                    label.get_name() == MasterMetrics::INSTANCE_LABEL
+                        && label.get_value() == instance
+                })
+            })
+    }
+
+    #[test]
+    fn gauge_reports_are_stored_as_per_client_snapshots() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let name = "test_client_write_queued_bytes";
+        let report = |value: f64| MetricValue {
+            metric_type: MetricType::Gauge,
+            name: name.to_string(),
+            value,
+            tags: HashMap::new(),
+        };
+
+        metrics
+            .metrics_report("client-a", vec![report(10.0)])
+            .unwrap();
+        metrics
+            .metrics_report("client-b", vec![report(7.0)])
+            .unwrap();
+        assert_eq!(gauge_value(name, "client-a"), 10);
+        assert_eq!(gauge_value(name, "client-b"), 7);
+
+        // A decrease must overwrite the stored level, not be dropped: after the
+        // queue drains, the master has to see zero instead of the old peak.
+        metrics
+            .metrics_report("client-a", vec![report(0.0)])
+            .unwrap();
+        assert_eq!(gauge_value(name, "client-a"), 0);
+        assert_eq!(gauge_value(name, "client-b"), 7);
+    }
+
+    #[test]
+    fn evicting_an_instance_drops_only_its_gauge_series() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let name = "test_client_evicted_queued_bytes";
+        let report = |value: f64| MetricValue {
+            metric_type: MetricType::Gauge,
+            name: name.to_string(),
+            value,
+            tags: HashMap::new(),
+        };
+
+        // Instance values unique to this test: metric tests share the global
+        // registry and run in parallel.
+        metrics
+            .metrics_report("evict-a", vec![report(10.0)])
+            .unwrap();
+        metrics
+            .metrics_report("evict-b", vec![report(7.0)])
+            .unwrap();
+
+        metrics.evict_instance("evict-a");
+
+        // `with_label_values` would recreate a removed series, so absence has
+        // to be checked on a registry snapshot.
+        assert!(
+            !has_instance_series(name, "evict-a"),
+            "the expired client's series must be removed"
+        );
+        assert!(has_instance_series(name, "evict-b"));
+        assert_eq!(gauge_value(name, "evict-b"), 7);
+    }
+
+    fn counter_value(name: &str, labels: &[&str]) -> i64 {
+        Metrics::get(name)
+            .expect("metric registered")
+            .try_into_counter_vec()
+            .expect("counter metric")
+            .with_label_values(labels)
+            .get()
+    }
+
+    #[test]
+    fn counter_reports_keep_label_values_aligned_with_names() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let name = "test_client_reports_multilabel";
+        let report = || MetricValue {
+            metric_type: MetricType::Counter,
+            name: name.to_string(),
+            value: 1.0,
+            tags: HashMap::from([
+                ("first".to_string(), "x".to_string()),
+                ("second".to_string(), "y".to_string()),
+            ]),
+        };
+
+        // Both reports must land on the same child. Randomized tag ordering
+        // would bind the values to the wrong names and split the series.
+        metrics.metrics_report("client-a", vec![report()]).unwrap();
+        metrics.metrics_report("client-a", vec![report()]).unwrap();
+        assert_eq!(counter_value(name, &["x", "y"]), 2);
+        assert_eq!(counter_value(name, &["y", "x"]), 0);
+    }
 
     fn count(
         counts: &HashMap<(String, &'static str), i64>,
@@ -974,94 +1121,6 @@ mod tests {
         let output = Metrics::text_output().unwrap();
         assert!(
             !output.contains(&format!("{metric_name}{{worker_addr=\"{lost}\"}}")),
-            "{output}"
-        );
-    }
-
-    fn job(job_id: &str, source_path: &str, kind: JobTaskType, state: JobTaskState) -> JobContext {
-        let mut job = JobContext::with_conf(
-            &LoadJobCommand::builder(source_path).build(),
-            job_id.to_string(),
-            source_path.to_string(),
-            "/target".to_string(),
-            &MountInfo::default(),
-            &ClientConf::default(),
-            1,
-            kind,
-        );
-        job.state.advance_state(state, true);
-        job
-    }
-
-    #[test]
-    fn load_jobs_are_counted_by_kind_and_state() {
-        let metric_name = "test_load_jobs_are_counted_by_kind_and_state";
-        let metric = m::new_gauge_vec(metric_name, metric_name, &["kind", "state"]).unwrap();
-        let series = |kind: &str, state: &str, value: i64| {
-            format!("{metric_name}{{kind=\"{kind}\",state=\"{state}\"}} {value}")
-        };
-
-        let jobs = JobStore::new();
-        for (job_id, source_path, kind, state) in [
-            (
-                "load-1",
-                "s3://bucket/a",
-                JobTaskType::Load,
-                JobTaskState::Loading,
-            ),
-            (
-                "load-2",
-                "s3://bucket/b",
-                JobTaskType::Load,
-                JobTaskState::Loading,
-            ),
-            (
-                "load-3",
-                "s3://bucket/c",
-                JobTaskType::Load,
-                JobTaskState::Failed,
-            ),
-            (
-                "export-1",
-                "/fs/a",
-                JobTaskType::Export,
-                JobTaskState::Pending,
-            ),
-            (
-                "export-2",
-                "/fs/b",
-                JobTaskType::Export,
-                JobTaskState::PartialSuccess,
-            ),
-        ] {
-            jobs.insert(job_id.to_string(), job(job_id, source_path, kind, state));
-        }
-
-        MasterMetrics::refresh_load_job_counts(&metric, &jobs);
-        let output = Metrics::text_output().unwrap();
-        for expected in [
-            series("load", "loading", 2),
-            series("load", "failed", 1),
-            series("load", "pending", 0),
-            series("load", "completed", 0),
-            series("load", "canceled", 0),
-            series("load", "partial_success", 0),
-            series("export", "pending", 1),
-            series("export", "partial_success", 1),
-            series("export", "loading", 0),
-        ] {
-            assert!(output.contains(&expected), "missing {expected}: {output}");
-        }
-
-        // Every job left the store: all known states report 0.
-        jobs.clear();
-        MasterMetrics::refresh_load_job_counts(&metric, &jobs);
-        let output = Metrics::text_output().unwrap();
-        assert!(output.contains(&series("load", "loading", 0)), "{output}");
-        assert!(output.contains(&series("load", "failed", 0)), "{output}");
-        assert!(output.contains(&series("export", "pending", 0)), "{output}");
-        assert!(
-            output.contains(&series("export", "partial_success", 0)),
             "{output}"
         );
     }
