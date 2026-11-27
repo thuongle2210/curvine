@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockStore, BlockWriteLease};
-use crate::worker::handler::write_handler::{terminal_state, PendingAbort};
+use crate::worker::handler::write_handler::{terminal_state, PendingAbort, Terminal};
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
 use crate::worker::storage::BlockWriteContext;
@@ -484,16 +484,41 @@ impl BatchWriteHandler {
             file.take();
         }
 
+        // Commit is all-or-nothing: before the first finalize, refuse the
+        // whole batch if any sibling is unpublishable, either flagged
+        // uncertain by its own handle or already `Quarantined` in the raw
+        // meta (an eager quarantine from the write path, or another handler
+        // on the shared SPDK extent). Finalizing the siblings before it and
+        // failing on it would hand the client a half-committed batch.
+        if commit {
+            let unpublishable: Vec<i64> = commit_blocks
+                .iter()
+                .enumerate()
+                .filter(|(i, block)| {
+                    uncertain.get(*i).copied().unwrap_or(false)
+                        || matches!(
+                            terminal_state(&self.store, block.id),
+                            Some(Terminal::Quarantined)
+                        )
+                })
+                .map(|(_, block)| block.id)
+                .collect();
+            if !unpublishable.is_empty() {
+                let error = FsError::io(std::io::Error::other(format!(
+                    "batch blocks {:?} write outcome uncertain, extent quarantined",
+                    unpublishable
+                )));
+                // Rollback by evidence: a flagged sibling is quarantined, an
+                // already quarantined one is left pinned (the uncertain abort
+                // is a no-op on it), certain siblings are freed.
+                self.rollback_batch_with_evidence(0, &uncertain, &error);
+                return Err(error);
+            }
+        }
+
         for (i, block) in commit_blocks.into_iter().enumerate() {
             let sibling_uncertain = uncertain.get(i).copied().unwrap_or(false);
-            let result: CommonResult<()> = if commit && sibling_uncertain {
-                // Data may still be in flight: never publish this extent. The
-                // rollback below quarantines it by the same flag.
-                err_box!(
-                    "block {} write outcome uncertain, extent quarantined",
-                    block.id
-                )
-            } else if commit {
+            let result: CommonResult<()> = if commit {
                 let checksum_hint = checksum_hints.get(i).cloned().flatten();
                 self.store
                     .finalize_block_with_checksum(&block, checksum_hint)
@@ -1500,6 +1525,83 @@ mod tests {
             Some(BlockState::Quarantined),
             "replay must quarantine, not free"
         );
+        Ok(())
+    }
+
+    // ---- Complete refuses a batch with a quarantined sibling ----
+
+    /// Sibling 2 was quarantined during the write (eager quarantine, raw meta
+    /// `Quarantined`, no sticky flag left on a fresh handle); flush is fine.
+    /// Complete must refuse before finalizing anything: sibling 1, which the
+    /// finalize loop would otherwise have published first, is freed instead.
+    #[test]
+    fn complete_with_quarantined_sibling_is_refused_and_finalizes_nothing() -> CommonResult<()> {
+        let (store, mut handler) = spdk_batch("batch-refuse-quarantined", vec![ok(), ok(), ok()])?;
+        store.abort_block_uncertain(&spdk_block(2, SPDK_BLOCK))?;
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
+
+        let err = handler
+            .complete_batch(&spdk_commit_msg(7), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("quarantined"), "{err}");
+        assert!(err.to_string().contains("[2]"), "names the sibling: {err}");
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            None,
+            "nothing finalized, certain sibling freed"
+        );
+        assert_eq!(
+            raw_state(&store, 2)?,
+            Some(BlockState::Quarantined),
+            "stays pinned"
+        );
+        assert_eq!(raw_state(&store, 3)?, None);
+        assert!(handler.rolled_back);
+        assert!(handler.is_commit);
+        assert!(handler.pending_aborts.is_empty());
+
+        // The refusal is terminal for this batch: retried Complete is refused,
+        // Cancel is Ok.
+        assert!(handler.complete_batch(&spdk_commit_msg(7), true).is_err());
+        handler.complete_batch(&spdk_commit_msg(7), false)?;
+        Ok(())
+    }
+
+    /// Mixed batch: sibling 1 quarantined in the raw meta, sibling 2 carries
+    /// the sticky flag, sibling 3 was finalized by another writer. The
+    /// refusal keeps both unpublishable siblings pinned, leaves the foreign
+    /// committed copy alone, and names both offenders.
+    #[test]
+    fn refusal_keeps_pinned_sibling_frees_certain_siblings_leaves_foreign_finalized_copy(
+    ) -> CommonResult<()> {
+        let (store, mut handler) = spdk_batch(
+            "batch-refuse-mixed",
+            vec![
+                ok(),
+                FakeIO {
+                    flush_ok: true,
+                    uncertain: true,
+                },
+                ok(),
+            ],
+        )?;
+        store.abort_block_uncertain(&spdk_block(1, SPDK_BLOCK))?;
+        store.finalize_block(&spdk_block(3, 0))?;
+        assert!(store.get_block(3)?.is_final());
+
+        let err = handler
+            .complete_batch(&spdk_commit_msg(7), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("[1, 2]"), "{err}");
+
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
+        assert!(
+            store.get_block(3)?.is_final(),
+            "foreign committed copy untouched"
+        );
+        assert!(handler.rolled_back);
         Ok(())
     }
 }
