@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockStore, BlockWriteLease};
+use crate::worker::handler::write_handler::{terminal_state, PendingAbort};
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
 use crate::worker::storage::BlockWriteContext;
 use curvine_core_error::err_box;
 use curvine_core_error::CommonResult;
-use curvine_error::FsResult;
+use curvine_error::{ErrorKind, FsError, FsResult};
 use curvine_fs_api::RpcCode;
 use curvine_io::DataSlice;
 use curvine_model::{ExtendedBlock, ProtoUtils};
@@ -40,6 +41,19 @@ pub struct BatchWriteHandler {
     /// `BlockClient::write_commit_batch()` treat an aborted batch as
     /// committed); Cancel stays idempotent and successful.
     rolled_back: bool,
+    /// Rollback aborts that failed non-terminally (the block is still
+    /// `Writing`), replayed on the next Complete/Cancel instead of being
+    /// forgotten. Cancel answers `Ok` only once every entry landed; Complete
+    /// re-returns `rollback_error`. Like the per-block handler, the list does
+    /// not survive a connection drop: a block left `Writing` is then the
+    /// orphan sweep's.
+    pending_aborts: Vec<PendingAbort>,
+    /// The failure that triggered the rollback, re-returned by a retried
+    /// Complete while aborts are still parked so the client keeps seeing the
+    /// same cause. Only `IO` keeps its kind; every other kind is answered as
+    /// `Common` with the same message. Boxed: set on the failure path only,
+    /// and `BlockHandler` carries this struct by value.
+    rollback_error: Option<Box<(ErrorKind, String)>>,
     pub(crate) write_handler: WriteHandler,
 }
 
@@ -61,6 +75,8 @@ impl BatchWriteHandler {
             leases: Vec::new(),
             is_commit: false,
             rolled_back: false,
+            pending_aborts: Vec::new(),
+            rollback_error: None,
             write_handler: WriteHandler::new(store_clone, client_addr)?,
         })
     }
@@ -112,9 +128,9 @@ impl BatchWriteHandler {
     /// true`, `rolled_back = true`) so retried Complete/Cancel requests on
     /// this handler observe the rollback instead of misreporting the batch
     /// as committed.
-    fn rollback_batch_from(&mut self, start: usize) {
+    fn rollback_batch_from(&mut self, start: usize, cause: &FsError) {
         let uncertain = self.uncertain_evidence();
-        self.rollback_batch_with_evidence(start, &uncertain);
+        self.rollback_batch_with_evidence(start, &uncertain, cause);
     }
 
     /// Per-sibling sticky uncertain flags, in batch order. A sibling whose
@@ -132,19 +148,18 @@ impl BatchWriteHandler {
     }
 
     /// [`Self::rollback_batch_from`] with the uncertain flags already read.
-    fn rollback_batch_with_evidence(&mut self, start: usize, uncertain: &[bool]) {
+    /// `cause` is the failure that triggered the rollback; it is what a
+    /// retried Complete gets back while any abort is still parked.
+    fn rollback_batch_with_evidence(&mut self, start: usize, uncertain: &[bool], cause: &FsError) {
         self.file.take();
+        self.rollback_error = Some(Box::new((
+            cause.kind(),
+            PendingAbort::source_message(cause),
+        )));
         if let Some(contexts) = self.context.take() {
             for (i, context) in contexts.iter().enumerate().skip(start) {
                 let uncertain = uncertain.get(i).copied().unwrap_or(false);
-                if let Err(e) = self.store.abort_batch_write(context.block.id, uncertain) {
-                    log::warn!(
-                        "failed to abort batch block {} (uncertain={}) after batch failure: {}",
-                        context.block.id,
-                        uncertain,
-                        e
-                    );
-                }
+                self.abort_or_park(&context.block, uncertain, "batch rollback");
             }
         }
         self.leases.clear();
@@ -152,8 +167,76 @@ impl BatchWriteHandler {
         self.rolled_back = true;
     }
 
-    fn rollback_batch(&mut self) {
-        self.rollback_batch_from(0);
+    /// Abort one sibling (quarantine if `uncertain`); if the abort fails and
+    /// the block is not terminal, park it for replay on the next
+    /// Complete/Cancel. A failure on an already terminal block is only logged.
+    fn abort_or_park(&mut self, block: &ExtendedBlock, uncertain: bool, reason: &'static str) {
+        let Err(e) = self.store.abort_batch_write(block.id, uncertain) else {
+            return;
+        };
+        let error: FsError = e.into();
+        if terminal_state(&self.store, block.id).is_some() {
+            log::warn!(
+                "abort of batch block {} (uncertain={}) after {} failed but the block is terminal: {}",
+                block.id,
+                uncertain,
+                reason,
+                error
+            );
+            return;
+        }
+        log::warn!(
+            "abort of batch block {} (uncertain={}) after {} failed, parked for retry: {}",
+            block.id,
+            uncertain,
+            reason,
+            error
+        );
+        self.pending_aborts
+            .push(PendingAbort::new(block, uncertain, reason, &error));
+    }
+
+    /// Replay every parked abort; entries whose block is now terminal are
+    /// dropped. Returns whether any is still parked.
+    fn replay_pending_aborts(&mut self) -> bool {
+        let pending = std::mem::take(&mut self.pending_aborts);
+        for p in pending {
+            let result = self.store.abort_batch_write(p.block.id, p.uncertain);
+            match terminal_state(&self.store, p.block.id) {
+                Some(state) => log::info!(
+                    "replayed abort of batch block {} after {} landed: {}",
+                    p.block.id,
+                    p.reason,
+                    state.as_str()
+                ),
+                None => {
+                    if let Err(e) = result {
+                        log::warn!(
+                            "replayed abort of batch block {} after {} failed again: {}",
+                            p.block.id,
+                            p.reason,
+                            e
+                        );
+                    }
+                    self.pending_aborts.push(p);
+                }
+            }
+        }
+        !self.pending_aborts.is_empty()
+    }
+
+    fn rollback_error(&self) -> FsError {
+        match self.rollback_error.as_deref() {
+            Some((ErrorKind::IO, msg)) => FsError::io(std::io::Error::other(msg.clone())),
+            Some((_, msg)) => FsError::common(msg),
+            None => FsError::common(
+                "batch write was rolled back after a previous failure; retry the batch write",
+            ),
+        }
+    }
+
+    fn rollback_batch(&mut self, cause: &FsError) {
+        self.rollback_batch_from(0, cause);
     }
 
     fn abort_open_contexts(store: &BlockStore, contexts: &[WriteContext]) {
@@ -313,18 +396,32 @@ impl BatchWriteHandler {
         let header: BlocksBatchCommitRequest = match msg.parse_header() {
             Ok(header) => header,
             Err(e) => {
+                let error: FsError = e.into();
                 if !self.is_commit {
-                    self.rollback_batch();
+                    self.rollback_batch(&error);
                 }
-                return Err(e.into());
+                return Err(error);
             }
         };
         let mut results = Vec::new();
 
         if self.is_commit {
-            return if !msg.data.is_empty() {
-                err_box!("The block has been committed and data cannot be written anymore.")
-            } else if self.rolled_back && commit {
+            if !msg.data.is_empty() {
+                return err_box!(
+                    "The block has been committed and data cannot be written anymore."
+                );
+            }
+            // Aborts the rollback could not land are retried first: a Cancel
+            // is only "done" once every sibling is terminal, and a Complete
+            // gets the rollback's cause, as the client saw it the first time,
+            // whether the replay landed now or is still pending.
+            if !self.pending_aborts.is_empty() {
+                let still_pending = self.replay_pending_aborts();
+                if still_pending || commit {
+                    return Err(self.rollback_error());
+                }
+            }
+            return if self.rolled_back && commit {
                 // The batch was aborted by a previous failed Complete. Blocks
                 // are gone, so reporting success would let the client treat an
                 // aborted batch as committed. Cancel stays idempotent.
@@ -347,7 +444,7 @@ impl BatchWriteHandler {
             {
                 Ok(blocks) => blocks,
                 Err(e) => {
-                    self.rollback_batch();
+                    self.rollback_batch(&e);
                     return Err(e);
                 }
             };
@@ -366,8 +463,9 @@ impl BatchWriteHandler {
             }
         }
         if let Some(e) = flush_error {
-            self.rollback_batch();
-            return Err(e.into());
+            let error: FsError = e.into();
+            self.rollback_batch(&error);
+            return Err(error);
         }
         // Sticky flags from mid-stream timeouts, read while the handles are
         // alive and after the flush so a flush timeout counts too: a flagged
@@ -412,8 +510,9 @@ impl BatchWriteHandler {
                 // onward are reclaimed. This still covers every block that
                 // was never committed. The handles are gone, so the flags
                 // read above decide which siblings are quarantined.
-                self.rollback_batch_with_evidence(i, &uncertain);
-                return Err(e.into());
+                let error: FsError = e.into();
+                self.rollback_batch_with_evidence(i, &uncertain, &error);
+                return Err(error);
             }
             results.push(true);
         }
@@ -1288,6 +1387,119 @@ mod tests {
         );
         assert!(store.get_block(1).is_err());
         assert!(store.get_block(3).is_err());
+        Ok(())
+    }
+
+    // ---- parked aborts: a rollback abort that fails is replayed ----
+
+    /// The first rollback abort fails transiently: the block is parked, the
+    /// siblings are freed. The retried Complete replays it, frees the block
+    /// and returns the rollback's cause; a further Complete gets the usual
+    /// "rolled back" refusal.
+    #[test]
+    fn rollback_parks_a_transiently_failing_abort_and_complete_replays_it() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = handler
+            .complete_batch(&commit_msg(&[1, 2, 3], 42), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("Request id mismatch"), "{err}");
+        assert!(handler.rolled_back);
+        assert_eq!(handler.pending_aborts.len(), 1);
+        assert_eq!(handler.pending_aborts[0].block.id, 1);
+        assert!(store.get_block(1).is_ok(), "parked block is still Writing");
+        assert!(store.get_block(2).is_err());
+        assert!(store.get_block(3).is_err());
+
+        // Retried Complete: the parked abort lands, the original cause comes back.
+        let err = handler
+            .complete_batch(&commit_msg(&[1, 2, 3], 7), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("Request id mismatch"), "{err}");
+        assert!(handler.pending_aborts.is_empty());
+        assert!(
+            store.get_block(1).is_err(),
+            "replayed abort freed the block"
+        );
+
+        // Nothing left to replay: the plain rolled-back refusal.
+        let err = handler
+            .complete_batch(&commit_msg(&[1, 2, 3], 7), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("rolled back"), "{err}");
+        Ok(())
+    }
+
+    /// Cancel after a parked abort: `Err` while the replay still fails, `Ok`
+    /// once it lands.
+    #[test]
+    fn cancel_after_parked_aborts_land_is_ok() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+
+        store.set_force_transient_abort_failure_for_test(true);
+        assert!(handler
+            .complete_batch(&commit_msg(&[1, 2, 3], 42), true)
+            .is_err());
+        assert_eq!(handler.pending_aborts.len(), 1);
+
+        // The replay fails again: Cancel is not done yet.
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = handler
+            .complete_batch(&commit_msg(&[1, 2, 3], 7), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("Request id mismatch"), "{err}");
+        assert_eq!(handler.pending_aborts.len(), 1);
+        assert!(store.get_block(1).is_ok());
+
+        // The replay lands: Cancel is done.
+        handler.complete_batch(&commit_msg(&[1, 2, 3], 7), false)?;
+        assert!(handler.pending_aborts.is_empty());
+        assert!(store.get_block(1).is_err());
+        // And stays idempotent.
+        handler.complete_batch(&commit_msg(&[1, 2, 3], 7), false)?;
+        Ok(())
+    }
+
+    /// A parked abort keeps its evidence: an uncertain sibling whose
+    /// quarantine failed transiently is quarantined by the replay, never freed.
+    #[test]
+    fn parked_uncertain_abort_is_replayed_as_quarantine() -> CommonResult<()> {
+        let (store, mut handler) = spdk_batch(
+            "batch-parked-uncertain",
+            vec![
+                FakeIO {
+                    flush_ok: true,
+                    uncertain: true,
+                },
+                ok(),
+                ok(),
+            ],
+        )?;
+
+        // Rollback via req_id mismatch; the first abort (sibling 1, uncertain) fails.
+        store.set_force_transient_abort_failure_for_test(true);
+        assert!(handler.complete_batch(&spdk_commit_msg(42), true).is_err());
+        assert_eq!(handler.pending_aborts.len(), 1);
+        assert!(handler.pending_aborts[0].uncertain);
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        assert_eq!(raw_state(&store, 2)?, None);
+        assert_eq!(raw_state(&store, 3)?, None);
+
+        let err = handler
+            .complete_batch(&spdk_commit_msg(7), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("Request id mismatch"), "{err}");
+        assert!(handler.pending_aborts.is_empty());
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "replay must quarantine, not free"
+        );
         Ok(())
     }
 }
