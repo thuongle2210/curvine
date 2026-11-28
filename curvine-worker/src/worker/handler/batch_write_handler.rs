@@ -100,17 +100,14 @@ impl BatchWriteHandler {
     /// best-effort — a failure is logged and never replaces the original
     /// error that caused the batch to fail.
     ///
-    /// Each sibling is aborted by its own evidence: one whose write handle
-    /// carries the sticky uncertain flag (a timed-out write or flush) takes
-    /// the quarantine route and keeps its SPDK extent pinned; every other
-    /// sibling is freed. The flags are read here, while the handles are
-    /// still alive; callers that already dropped the handles pass the flags
-    /// they read through [`Self::rollback_batch_with_evidence`].
+    /// Each sibling is aborted by its own evidence: a sticky uncertain flag
+    /// (timed-out write or flush) quarantines it, otherwise it is freed. The
+    /// flags are read while the handles are still alive; callers that already
+    /// dropped them use [`Self::rollback_batch_with_evidence`].
     ///
     /// A block still in the committed, finalized generation is skipped (it
     /// is committed state, not batch staging) unless it is an uncertain SPDK
-    /// sibling: all writers share the extent, so it is quarantined even then
-    /// (see [`BlockStore::abort_with`]). A block being rewritten
+    /// sibling, whose shared extent is quarantined even then. A block being rewritten
     /// is handled atomically — the check and abort run under the same block
     /// stripe lock, so a concurrent finalize cannot slip between them and
     /// get its committed replica deleted. Missing blocks were already
@@ -133,8 +130,7 @@ impl BatchWriteHandler {
         self.rollback_batch_with_evidence(start, &uncertain, cause);
     }
 
-    /// Per-sibling sticky uncertain flags, in batch order. A sibling whose
-    /// handle is gone (short-circuit, or already taken) reads as certain.
+    /// Per-sibling sticky uncertain flags; a missing handle reads as certain.
     fn uncertain_evidence(&self) -> Vec<bool> {
         self.file
             .as_ref()
@@ -454,9 +450,7 @@ impl BatchWriteHandler {
             let Some(file) = file.as_mut() else { continue };
             if let Err(e) = file.flush() {
                 WriteHandler::record_write_error(self.write_handler.metrics, context.dir_id, &e);
-                // Pin the extent now, while this handle is still alive: the
-                // rollback below reads the same flag, but the quarantine must
-                // not depend on it (or on the client) getting that far.
+                // Pin now, while the handle is alive; do not rely on the rollback.
                 WriteHandler::quarantine_if_uncertain(&self.store, &context.block, file);
                 flush_error = Some(e);
                 break;
@@ -467,9 +461,8 @@ impl BatchWriteHandler {
             self.rollback_batch(&error);
             return Err(error);
         }
-        // Sticky flags from mid-stream timeouts, read while the handles are
-        // alive and after the flush so a flush timeout counts too: a flagged
-        // sibling is quarantined, never freed or finalized.
+        // Read after the flush (so a flush timeout counts) and before the
+        // handles are dropped.
         let uncertain = self.uncertain_evidence();
         let Some(files) = self.file.as_mut() else {
             return err_box!("batch commit without open files");
@@ -533,8 +526,7 @@ impl BatchWriteHandler {
                 // abort a new generation another writer opened on them since
                 // their commit, so only the contexts from the failing index
                 // onward are reclaimed. This still covers every block that
-                // was never committed. The handles are gone, so the flags
-                // read above decide which siblings are quarantined.
+                // was never committed. Handles are gone; use the flags read above.
                 let error: FsError = e.into();
                 self.rollback_batch_with_evidence(i, &uncertain, &error);
                 return Err(error);
@@ -673,10 +665,8 @@ impl BatchWriteHandler {
                         context.dir_id,
                         &e,
                     );
-                    // The batch stays open for Complete/Cancel, but a timed-out
-                    // flush must pin the extent now, not when the client comes
-                    // back: the rollback then finds the block already
-                    // quarantined and leaves it alone.
+                    // Batch stays open, but pin the extent now rather than
+                    // when (if) the client comes back.
                     WriteHandler::quarantine_if_uncertain(&self.store, &context.block, file);
                     return Err(e.into());
                 }
@@ -1107,8 +1097,7 @@ mod tests {
 
     // ---- SPDK siblings: rollback by evidence, eager quarantine ----
 
-    /// Writer fake with a configurable flush outcome and sticky uncertain flag,
-    /// standing in for an SPDK writer whose write or flush timed out.
+    /// Writer fake: configurable flush outcome and sticky uncertain flag.
     struct FakeIO {
         flush_ok: bool,
         uncertain: bool,
@@ -1186,9 +1175,8 @@ mod tests {
 
     const SPDK_BLOCK: i64 = 4096;
 
-    /// A 3-block batch (ids 1..=3) over an SPDK test dataset, built directly
-    /// (the real `open_batch` needs a bdev writer). `ios[i]` is sibling i's
-    /// writer fake.
+    /// 3-block batch (ids 1..=3) over an SPDK test dataset, built directly
+    /// (`open_batch` needs a real bdev writer). `ios[i]` is sibling i's fake.
     fn spdk_batch(
         dir_tag: &str,
         ios: Vec<FakeIO>,
@@ -1277,8 +1265,7 @@ mod tests {
         }
     }
 
-    /// A standalone flush whose sibling timed out must pin that sibling's
-    /// extent at once; the batch stays open and the other siblings untouched.
+    /// Standalone flush timeout pins that sibling at once; batch stays open.
     #[test]
     fn batch_flush_timeout_quarantines_the_sibling() -> CommonResult<()> {
         let (store, mut handler) = spdk_batch(
@@ -1312,8 +1299,7 @@ mod tests {
         Ok(())
     }
 
-    /// A flush timeout inside Complete: the uncertain sibling is quarantined,
-    /// the certain siblings are freed, nothing is finalized.
+    /// Flush timeout inside Complete: uncertain sibling quarantined, others freed.
     #[test]
     fn complete_flush_timeout_quarantines_uncertain_and_frees_certain_siblings() -> CommonResult<()>
     {
@@ -1344,8 +1330,7 @@ mod tests {
         Ok(())
     }
 
-    /// An earlier timed-out write left the sticky flag on sibling 3; its flush
-    /// is fine. Cancel must still quarantine that sibling and free the others.
+    /// Sticky flag on sibling 3, flush OK: Cancel quarantines it, frees the others.
     #[test]
     fn cancel_quarantines_uncertain_sibling_after_successful_flush() -> CommonResult<()> {
         let (store, mut handler) = spdk_batch(
@@ -1370,9 +1355,7 @@ mod tests {
         Ok(())
     }
 
-    /// Same flag on Complete: the uncertain sibling is never finalized. With
-    /// the flag on sibling 1 nothing before it is finalized either; the
-    /// certain siblings are freed by the rollback.
+    /// Same flag on Complete: never finalized; flag on sibling 1 so nothing is.
     #[test]
     fn complete_quarantines_uncertain_sibling_after_successful_flush() -> CommonResult<()> {
         let (store, mut handler) = spdk_batch(
@@ -1400,9 +1383,7 @@ mod tests {
         Ok(())
     }
 
-    /// A certain sibling that another writer finalized behind the handler's
-    /// back is committed state, not staging: the rollback leaves it alone
-    /// while freeing the siblings that are still this batch's.
+    /// A sibling another writer finalized is committed state: rollback skips it.
     #[test]
     fn rollback_leaves_a_sibling_finalized_by_another_writer() -> CommonResult<()> {
         let store = store()?;
