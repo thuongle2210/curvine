@@ -380,8 +380,9 @@ impl WriteHandler {
     }
 
     /// Quarantine as soon as a write is known uncertain, so the state lives in
-    /// the dataset even if the client never sends Complete/Cancel.
-    fn quarantine_if_uncertain(
+    /// the dataset even if the client never sends Complete/Cancel. Shared
+    /// with the batch handler, which calls it per sibling.
+    pub(crate) fn quarantine_if_uncertain(
         store: &BlockStore,
         block: &ExtendedBlock,
         file: &BlockWriteContext,
