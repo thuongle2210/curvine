@@ -568,9 +568,15 @@ impl BlockStore {
     }
 
     /// Aborts a batch-opened block unless it is already finalized; see
-    /// [`BlockStore::abort_with`] for the check-and-abort contract.
-    pub(crate) fn abort_batch_write(&self, block_id: i64) -> CommonResult<()> {
-        self.abort_with(&ExtendedBlock::with_id(block_id), "abort_batch", false)
+    /// [`BlockStore::abort_with`] for the check-and-abort contract. With
+    /// `uncertain`, an SPDK extent is quarantined instead of freed.
+    pub(crate) fn abort_batch_write(&self, block_id: i64, uncertain: bool) -> CommonResult<()> {
+        let op = if uncertain {
+            "abort_batch_uncertain"
+        } else {
+            "abort_batch"
+        };
+        self.abort_with(&ExtendedBlock::with_id(block_id), op, uncertain)
     }
 
     pub fn get_block(&self, id: i64) -> CommonResult<BlockMeta> {
