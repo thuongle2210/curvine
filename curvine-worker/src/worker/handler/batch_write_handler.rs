@@ -55,6 +55,10 @@ pub struct BatchWriteHandler {
     /// and `BlockHandler` carries this struct by value.
     rollback_error: Option<Box<(ErrorKind, String)>>,
     pub(crate) write_handler: WriteHandler,
+    /// Test-only: runs between the pre-finalize scan and the finalize loop,
+    /// where another handler can still quarantine a sibling.
+    #[cfg(test)]
+    after_scan_for_test: Option<Box<Box<dyn FnMut() + Send>>>,
 }
 
 impl Drop for BatchWriteHandler {
@@ -78,6 +82,8 @@ impl BatchWriteHandler {
             pending_aborts: Vec::new(),
             rollback_error: None,
             write_handler: WriteHandler::new(store_clone, client_addr)?,
+            #[cfg(test)]
+            after_scan_for_test: None,
         })
     }
 
@@ -514,6 +520,10 @@ impl BatchWriteHandler {
                 self.rollback_batch_with_evidence(0, &uncertain, &error);
                 return Err(error);
             }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.after_scan_for_test.as_mut() {
+            hook();
         }
 
         for (i, block) in commit_blocks.into_iter().enumerate() {
@@ -1676,6 +1686,45 @@ mod tests {
         assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
         assert_eq!(raw_state(&store, 1)?, None);
         assert_eq!(raw_state(&store, 3)?, None);
+        assert!(handler.rolled_back);
+        Ok(())
+    }
+
+    /// A sibling quarantined by another handler after the pre-finalize scan
+    /// and before its own finalize: the finalize refuses it under the stripe
+    /// lock with the quarantine wording, it stays pinned, the sibling after
+    /// it is freed. Sibling 1, finalized before the race, stays final (the
+    /// documented half-commit; this guards only that nothing quarantined is
+    /// published and that the error says why).
+    #[test]
+    fn concurrent_quarantine_between_scan_and_finalize_is_refused() -> CommonResult<()> {
+        let (store, mut handler) = spdk_batch("batch-scan-finalize-race", vec![ok(), ok(), ok()])?;
+        let racer = store.clone();
+        handler.after_scan_for_test = Some(Box::new(Box::new(move || {
+            racer
+                .abort_block_uncertain(&spdk_block(2, SPDK_BLOCK))
+                .expect("racing quarantine");
+        })));
+
+        let err = handler
+            .complete_batch(&spdk_commit_msg(7), true)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("quarantined"),
+            "finalize must name the quarantine, got: {err}"
+        );
+
+        assert_eq!(
+            raw_state(&store, 2)?,
+            Some(BlockState::Quarantined),
+            "stays pinned"
+        );
+        assert_eq!(raw_state(&store, 3)?, None, "sibling after it freed");
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Finalized),
+            "documented half-commit"
+        );
         assert!(handler.rolled_back);
         Ok(())
     }

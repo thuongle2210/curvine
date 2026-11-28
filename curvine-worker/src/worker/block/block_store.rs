@@ -403,6 +403,20 @@ impl BlockStore {
     ) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "finalize");
         self.check_replication_owner(block.id)?;
+        // A quarantined extent is never published. The dataset would refuse
+        // the state change too, but with a generic state error and only
+        // after the finalize prepared; refusing here, under the stripe lock
+        // that every quarantine also takes, closes the window between any
+        // caller-side scan and this finalize and names the cause.
+        if self
+            .get_raw_block_opt(block.id)?
+            .is_some_and(|m| m.is_quarantined())
+        {
+            return curvine_core_error::err_box!(
+                "block {} write outcome uncertain, extent quarantined; refusing to finalize",
+                block.id
+            );
+        }
         // A hint covers only this session's writes. If another writer shared
         // the staging file, it may have rewritten those bytes before exiting,
         // so fall back to re-reading the file.
@@ -2188,6 +2202,46 @@ mod tests {
         // read before the stop is seen, but no healthy block can finish.
         assert_eq!(stats.verified, 0, "{stats:?}");
         assert!(stats.mismatched + stats.skipped >= 1, "{stats:?}");
+        Ok(())
+    }
+
+    /// Finalize of a quarantined block is refused under the stripe lock with
+    /// the quarantine wording; the meta and the extent are untouched.
+    #[test]
+    fn finalize_of_quarantined_block_is_refused() -> CommonResult<()> {
+        let dataset = BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        let block = ExtendedBlock::new(
+            9,
+            4096,
+            curvine_model::StorageType::SpdkDisk,
+            curvine_model::FileType::File,
+        );
+        store.open_block(&block)?;
+        store.abort_block_uncertain(&block)?;
+        let available = store.read()?.available();
+
+        let err = store
+            .finalize_block_with_checksum(
+                &ExtendedBlock::new(
+                    9,
+                    0,
+                    curvine_model::StorageType::SpdkDisk,
+                    curvine_model::FileType::File,
+                ),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("write outcome uncertain, extent quarantined"),
+            "must be the quarantine wording, not the dataset's state error: {err}"
+        );
+        assert_eq!(
+            store.get_raw_block_opt(9)?.map(|m| *m.state()),
+            Some(BlockState::Quarantined)
+        );
+        assert_eq!(store.read()?.available(), available);
         Ok(())
     }
 }
