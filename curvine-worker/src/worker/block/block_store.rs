@@ -15,7 +15,7 @@
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
     BlockChecksum, BlockDataset, BlockLayout, BlockReadContext, BlockTruncated, BlockWriteContext,
-    ChecksumVerify, Dataset,
+    ChecksumVerify, Dataset, QuarantinedBlockError,
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
@@ -552,6 +552,17 @@ impl BlockStore {
     /// replica another writer finalized; quarantine only reserves the extent.
     fn abort_with(&self, block: &ExtendedBlock, op: &str, uncertain: bool) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, op);
+        self.abort_with_locked(block, op, uncertain)
+    }
+
+    /// [`Self::abort_with`] for a caller that already holds the block's
+    /// stripe lock.
+    fn abort_with_locked(
+        &self,
+        block: &ExtendedBlock,
+        op: &str,
+        uncertain: bool,
+    ) -> CommonResult<()> {
         // The stripe lock pins the storage type: open/finalize/remove take it too.
         let own_spdk_extent = uncertain
             && self
@@ -819,9 +830,43 @@ impl BlockStore {
         Ok(state.num_blocks())
     }
 
+    /// A delete must never free an extent whose write is known uncertain.
+    /// For a remembered block (`uncertain_unquarantined`) try the quarantine
+    /// first, under the stripe lock the caller already holds; whether or not
+    /// it lands, answer as for a quarantined block so the master defers the
+    /// delete and retries later, when the meta will read `Quarantined`.
+    /// Non-members pass. The dataset itself refuses to remove a meta that
+    /// already reads `Quarantined`; this covers the gap before it does.
+    fn refuse_delete_of_remembered_uncertain(&self, id: i64) -> CommonResult<()> {
+        if !self.uncertain_unquarantined.contains(&id) {
+            return Ok(());
+        }
+        let abort = self.abort_with_locked(&ExtendedBlock::with_id(id), "remove_quarantine", true);
+        match abort {
+            Ok(()) if self.is_quarantined_raw(id) => {
+                self.uncertain_unquarantined.remove(&id);
+                log::info!(
+                    "delete of block {} quarantined it instead: write outcome uncertain",
+                    id
+                );
+            }
+            Ok(()) => log::warn!(
+                "delete of block {} deferred: write outcome uncertain, quarantine did not land",
+                id
+            ),
+            Err(e) => log::warn!(
+                "delete of block {} deferred: write outcome uncertain, quarantine failed: {}",
+                id,
+                e
+            ),
+        }
+        Err(Box::new(QuarantinedBlockError(id)))
+    }
+
     pub fn remove_block(&self, id: i64) -> CommonResult<()> {
         let _block_lock = self.block_lock(id, "remove");
         self.check_replication_owner(id)?;
+        self.refuse_delete_of_remembered_uncertain(id)?;
         let block = ExtendedBlock::with_id(id);
         self.with_dataset_write("remove", |state| state.remove_block(&block))
     }
@@ -830,6 +875,12 @@ impl BlockStore {
     pub fn async_remove_block(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
         let _block_lock = self.block_lock(id, "remove");
         if let Err(error) = self.check_replication_owner(id) {
+            self.write()?.decrement_blocks_to_delete();
+            return Err(error);
+        }
+        if let Err(error) = self.refuse_delete_of_remembered_uncertain(id) {
+            // Heartbeat incremented this before scheduling; consume it as the
+            // remove path below would have.
             self.write()?.decrement_blocks_to_delete();
             return Err(error);
         }
@@ -1081,6 +1132,7 @@ mod tests {
     use crate::worker::storage::{Dataset, FileLayout};
     use curvine_config::WorkerConf;
     use curvine_io::DataSlice;
+    use curvine_model::FileType;
     use curvine_runtime::common::FileUtils;
     use std::io::Write;
     use std::sync::{Arc, Barrier};
@@ -2285,6 +2337,101 @@ mod tests {
         // read before the stop is seen, but no healthy block can finish.
         assert_eq!(stats.verified, 0, "{stats:?}");
         assert!(stats.mismatched + stats.skipped >= 1, "{stats:?}");
+        Ok(())
+    }
+
+    // ---- delete of a remembered-uncertain block ----
+
+    fn spdk_store_with_remembered_block(id: i64) -> CommonResult<(BlockStore, ExtendedBlock)> {
+        let dataset = BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        let block = ExtendedBlock::new(id, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        // The eager quarantine failed; only the store remembers.
+        store.note_uncertain_unquarantined(id);
+        assert_eq!(store.uncertain_unquarantined_for_test(), vec![id]);
+        assert_eq!(
+            store.get_raw_block_opt(id)?.map(|m| *m.state()),
+            Some(BlockState::Writing)
+        );
+        Ok((store, block))
+    }
+
+    /// The master deletes a remembered block while the quarantine can land
+    /// now: the delete quarantines it and is deferred; the extent stays
+    /// reserved and the delete counter is consumed.
+    #[test]
+    fn delete_of_remembered_uncertain_block_quarantines_instead_of_freeing() -> CommonResult<()> {
+        let (store, block) = spdk_store_with_remembered_block(1)?;
+        let available_before = store.read()?.available();
+        store.read()?.increment_blocks_to_delete();
+
+        let err = store.async_remove_block(block.id).unwrap_err();
+        assert!(
+            crate::worker::storage::is_quarantined_error(&err),
+            "delete must be deferred as for a quarantined block: {err}"
+        );
+        assert_eq!(
+            store.get_raw_block_opt(block.id)?.map(|m| *m.state()),
+            Some(BlockState::Quarantined)
+        );
+        assert_eq!(
+            store.read()?.available(),
+            available_before,
+            "extent still reserved"
+        );
+        assert!(store.uncertain_unquarantined_for_test().is_empty());
+        assert_eq!(store.read()?.num_blocks_to_delete(), 0);
+
+        // A later delete (master retry) sees a quarantined block: same answer.
+        store.read()?.increment_blocks_to_delete();
+        let err = store.async_remove_block(block.id).unwrap_err();
+        assert!(crate::worker::storage::is_quarantined_error(&err));
+        assert_eq!(store.read()?.num_blocks_to_delete(), 0);
+        Ok(())
+    }
+
+    /// The quarantine still fails at delete time: the delete is deferred all
+    /// the same, the block stays `Writing` and remembered, nothing is freed.
+    #[test]
+    fn delete_of_remembered_uncertain_block_is_deferred_while_abort_fails() -> CommonResult<()> {
+        let (store, block) = spdk_store_with_remembered_block(2)?;
+        let available_before = store.read()?.available();
+        store.read()?.increment_blocks_to_delete();
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = store.async_remove_block(block.id).unwrap_err();
+        assert!(crate::worker::storage::is_quarantined_error(&err), "{err}");
+        assert_eq!(
+            store.get_raw_block_opt(block.id)?.map(|m| *m.state()),
+            Some(BlockState::Writing)
+        );
+        assert_eq!(store.uncertain_unquarantined_for_test(), vec![block.id]);
+        assert_eq!(store.read()?.available(), available_before);
+        assert_eq!(store.read()?.num_blocks_to_delete(), 0);
+
+        // Synchronous remove takes the same guard.
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = store.remove_block(block.id).unwrap_err();
+        assert!(crate::worker::storage::is_quarantined_error(&err), "{err}");
+        assert!(store.get_raw_block_opt(block.id)?.is_some());
+        Ok(())
+    }
+
+    /// A `Writing` block the store does not remember is deleted as before.
+    #[test]
+    fn delete_of_non_member_writing_block_is_unchanged() -> CommonResult<()> {
+        let dataset = BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        let block = ExtendedBlock::new(3, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        let available_before = store.read()?.available();
+        store.read()?.increment_blocks_to_delete();
+
+        assert!(store.async_remove_block(block.id)?.is_some());
+        assert!(store.get_raw_block_opt(block.id)?.is_none());
+        assert!(store.read()?.available() > available_before, "extent freed");
+        assert_eq!(store.read()?.num_blocks_to_delete(), 0);
         Ok(())
     }
 }
