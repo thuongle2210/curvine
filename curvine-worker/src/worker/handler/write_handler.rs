@@ -50,7 +50,7 @@ fn map_storage_open_error(e: curvine_core_error::CommonError) -> FsError {
 
 /// How a block left the Writing state, as seen by the raw meta.
 #[derive(Clone, Copy, Debug)]
-enum Terminal {
+pub(crate) enum Terminal {
     Removed,
     Quarantined,
     /// A committed generation survives (rollback or another writer's
@@ -59,7 +59,7 @@ enum Terminal {
 }
 
 impl Terminal {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Terminal::Removed => "removed",
             Terminal::Quarantined => "quarantined",
@@ -86,7 +86,12 @@ pub(crate) struct PendingAbort {
 }
 
 impl PendingAbort {
-    fn new(block: &ExtendedBlock, uncertain: bool, reason: &'static str, error: &FsError) -> Self {
+    pub(crate) fn new(
+        block: &ExtendedBlock,
+        uncertain: bool,
+        reason: &'static str,
+        error: &FsError,
+    ) -> Self {
         debug_assert!(
             matches!(error.kind(), ErrorKind::IO | ErrorKind::Common),
             "to_error() only round-trips IO and Common"
@@ -102,7 +107,7 @@ impl PendingAbort {
 
     /// The source message only, matching what ErrorEncoder puts on the wire;
     /// Display would append ": " plus context.
-    fn source_message(error: &FsError) -> String {
+    pub(crate) fn source_message(error: &FsError) -> String {
         match error {
             FsError::IO(e) => e.source.to_string(),
             FsError::Common(e) => e.source.to_string(),
@@ -111,11 +116,24 @@ impl PendingAbort {
     }
 
     // Only IO vs Common is distinguished; the call sites produce no other kinds.
-    fn to_error(&self) -> FsError {
+    pub(crate) fn to_error(&self) -> FsError {
         match self.kind {
             ErrorKind::IO => FsError::io(std::io::Error::other(self.error.clone())),
             _ => FsError::common(&self.error),
         }
+    }
+}
+
+/// Raw-meta verdict after an abort/finalize attempt. `Some` is terminal
+/// (safe to latch is_commit); `None` means still Writing or unreadable, so
+/// stay retryable. Shared by the per-block and batch handlers.
+pub(crate) fn terminal_state(store: &BlockStore, block_id: i64) -> Option<Terminal> {
+    match store.get_raw_block_opt(block_id) {
+        Ok(Some(meta)) if meta.is_quarantined() => Some(Terminal::Quarantined),
+        Ok(Some(meta)) if meta.is_final() => Some(Terminal::Finalized),
+        Ok(Some(_)) => None,
+        Ok(None) => Some(Terminal::Removed),
+        Err(_) => None,
     }
 }
 
@@ -497,13 +515,7 @@ impl WriteHandler {
     /// (safe to latch is_commit); `None` means still Writing or unreadable,
     /// so stay retryable.
     fn terminal_state(&self, block_id: i64) -> Option<Terminal> {
-        match self.store.get_raw_block_opt(block_id) {
-            Ok(Some(meta)) if meta.is_quarantined() => Some(Terminal::Quarantined),
-            Ok(Some(meta)) if meta.is_final() => Some(Terminal::Finalized),
-            Ok(Some(_)) => None,
-            Ok(None) => Some(Terminal::Removed),
-            Err(_) => None,
-        }
+        terminal_state(&self.store, block_id)
     }
 
     /// Close the handler with this writer's data aborted.
