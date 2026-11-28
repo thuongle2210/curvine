@@ -1112,6 +1112,8 @@ mod tests {
     struct FakeIO {
         flush_ok: bool,
         uncertain: bool,
+        /// `write_region` fails with "write timed out" when false.
+        write_ok: bool,
     }
 
     impl BlockIO for FakeIO {
@@ -1124,7 +1126,13 @@ mod tests {
         }
 
         fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
-            Ok(())
+            if self.write_ok {
+                Ok(())
+            } else {
+                Err(curvine_io::IOError::new(std::io::Error::other(
+                    "write timed out",
+                )))
+            }
         }
 
         fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
@@ -1265,6 +1273,7 @@ mod tests {
         FakeIO {
             flush_ok: true,
             uncertain: false,
+            write_ok: true,
         }
     }
 
@@ -1279,6 +1288,7 @@ mod tests {
                 FakeIO {
                     flush_ok: false,
                     uncertain: true,
+                    write_ok: true,
                 },
                 ok(),
             ],
@@ -1314,6 +1324,7 @@ mod tests {
                 FakeIO {
                     flush_ok: false,
                     uncertain: true,
+                    write_ok: true,
                 },
                 ok(),
             ],
@@ -1345,6 +1356,7 @@ mod tests {
                 FakeIO {
                     flush_ok: true,
                     uncertain: true,
+                    write_ok: true,
                 },
             ],
         )?;
@@ -1369,6 +1381,7 @@ mod tests {
                 FakeIO {
                     flush_ok: true,
                     uncertain: true,
+                    write_ok: true,
                 },
                 ok(),
                 ok(),
@@ -1500,6 +1513,7 @@ mod tests {
                 FakeIO {
                     flush_ok: true,
                     uncertain: true,
+                    write_ok: true,
                 },
                 ok(),
                 ok(),
@@ -1582,6 +1596,7 @@ mod tests {
                 FakeIO {
                     flush_ok: true,
                     uncertain: true,
+                    write_ok: true,
                 },
                 ok(),
             ],
@@ -1601,6 +1616,66 @@ mod tests {
             store.get_block(3)?.is_final(),
             "foreign committed copy untouched"
         );
+        assert!(handler.rolled_back);
+        Ok(())
+    }
+
+    /// Sibling 2's mid-stream write times out: the per-block write path
+    /// quarantines it at once and the batch stays open with every handle in
+    /// place. Complete is then refused for that sibling, Cancel leaves it
+    /// pinned. Guards `write_batch`'s hand-rebuilt error branch, which must
+    /// hand the failing sibling's handle (and its sticky flag) back.
+    #[test]
+    fn batch_write_timeout_quarantines_the_sibling_and_complete_is_refused() -> CommonResult<()> {
+        let (store, mut handler) = spdk_batch(
+            "batch-write-timeout",
+            vec![
+                ok(),
+                FakeIO {
+                    flush_ok: true,
+                    uncertain: true,
+                    write_ok: false,
+                },
+                ok(),
+            ],
+        )?;
+        let available_before = store.read()?.available();
+
+        let files = (1..=3)
+            .map(|i| curvine_proto::FileWriteData {
+                path: format!("f{i}"),
+                content: vec![b'x'],
+            })
+            .collect();
+        let msg = Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .proto_header(FilesBatchWriteRequest {
+                files,
+                req_id: 7,
+                seq_id: 0,
+                component_info: None,
+            })
+            .build();
+        let err = handler.write_batch(&msg).unwrap_err();
+        assert!(err.to_string().contains("write timed out"), "{err}");
+
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        assert_eq!(raw_state(&store, 3)?, Some(BlockState::Writing));
+        assert_eq!(store.read()?.available(), available_before);
+        assert_eq!(handler.file.as_ref().map(Vec::len), Some(3), "handles kept");
+        assert_eq!(handler.context.as_ref().map(Vec::len), Some(3));
+        assert!(!handler.is_commit, "batch stays open");
+
+        let err = handler
+            .complete_batch(&spdk_commit_msg(7), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("[2]"), "{err}");
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
+        assert_eq!(raw_state(&store, 1)?, None);
+        assert_eq!(raw_state(&store, 3)?, None);
         assert!(handler.rolled_back);
         Ok(())
     }
