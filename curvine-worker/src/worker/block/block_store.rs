@@ -51,20 +51,31 @@ pub(crate) struct BlockWriteLease {
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
     block_id: i64,
     replication: bool,
+    /// Ordinary leases only: the store, so a connection drop can retry a
+    /// quarantine the write path could not land (`uncertain_unquarantined`).
+    /// The store never holds leases, so this is not a cycle.
+    store: Option<BlockStore>,
 }
 
 impl Drop for BlockWriteLease {
     fn drop(&mut self) {
-        let mut uses = self.uses[self.block_id as u64 as usize % self.uses.len()].lock();
-        if let Some(entry) = uses.get_mut(&self.block_id) {
-            if self.replication {
-                entry.replication = None;
-            } else {
-                entry.ordinary_writers -= 1;
+        {
+            let mut uses = self.uses[self.block_id as u64 as usize % self.uses.len()].lock();
+            if let Some(entry) = uses.get_mut(&self.block_id) {
+                if self.replication {
+                    entry.replication = None;
+                } else {
+                    entry.ordinary_writers -= 1;
+                }
+                if entry.replication.is_none() && entry.ordinary_writers == 0 {
+                    uses.remove(&self.block_id);
+                }
             }
-            if entry.replication.is_none() && entry.ordinary_writers == 0 {
-                uses.remove(&self.block_id);
-            }
+        }
+        // The handler is going away with its sticky uncertain flag; if the
+        // eager quarantine failed, this is the last chance on this connection.
+        if let Some(store) = self.store.take() {
+            store.retry_uncertain_unquarantined_for(self.block_id);
         }
     }
 }
@@ -118,6 +129,12 @@ pub struct BlockStore {
     /// `open_block` refuses them: a replacement finalized before the report
     /// lands would otherwise lose its location to that stale report.
     fenced_blocks: Arc<DashSet<i64>>,
+    /// Blocks whose write is known uncertain but whose quarantine attempt
+    /// failed, so the raw meta still reads `Writing`. The only record of the
+    /// uncertainty that outlives the write handler; retried on lease drop
+    /// and every heartbeat until the meta reads `Quarantined`, and consulted
+    /// so nothing frees such an extent in the meantime.
+    uncertain_unquarantined: Arc<DashSet<i64>>,
     /// Test-only: forces the next finalize prepare to fail (one-shot).
     #[cfg(test)]
     force_transient_finalize_failure: Arc<std::sync::atomic::AtomicBool>,
@@ -140,6 +157,7 @@ impl BlockStore {
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             corrupt_blocks: Arc::new(DashMap::new()),
             fenced_blocks: Arc::new(DashSet::new()),
+            uncertain_unquarantined: Arc::new(DashSet::new()),
             #[cfg(test)]
             force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -164,6 +182,7 @@ impl BlockStore {
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             corrupt_blocks: Arc::new(DashMap::new()),
             fenced_blocks: Arc::new(DashSet::new()),
+            uncertain_unquarantined: Arc::new(DashSet::new()),
             force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_transient_abort_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -207,6 +226,7 @@ impl BlockStore {
             uses: self.uses.clone(),
             block_id,
             replication: false,
+            store: Some(self.clone()),
         }))
     }
 
@@ -230,6 +250,7 @@ impl BlockStore {
                 uses: self.uses.clone(),
                 block_id,
                 replication: true,
+                store: None,
             },
         ))
     }
@@ -547,7 +568,7 @@ impl BlockStore {
         {
             return curvine_core_error::err_box!("injected transient abort failure for test");
         }
-        self.with_dataset_write(op, |state| {
+        let result = self.with_dataset_write(op, |state| {
             if !own_spdk_extent && state.get_block(block.id).is_some_and(|m| m.is_final()) {
                 return Ok(());
             }
@@ -556,7 +577,83 @@ impl BlockStore {
             } else {
                 state.abort_block(block)
             }
-        })
+        });
+        // Membership is only meaningful while the meta is not yet
+        // Quarantined; a persist error can still leave the in-memory state
+        // quarantined, so decide by the meta, not by `result`.
+        if uncertain && self.is_quarantined_raw(block.id) {
+            self.uncertain_unquarantined.remove(&block.id);
+        }
+        result
+    }
+
+    fn is_quarantined_raw(&self, block_id: i64) -> bool {
+        self.get_raw_block_opt(block_id)
+            .ok()
+            .flatten()
+            .is_some_and(|m| m.is_quarantined())
+    }
+
+    /// Record that `block_id`'s write is uncertain but its quarantine did
+    /// not land (the raw meta is not `Quarantined`). Called by the write
+    /// handlers when the eager `abort_block_uncertain` fails; replayed by
+    /// [`Self::retry_uncertain_unquarantined`] until it lands. Non-SPDK
+    /// blocks never get here: their writers report no uncertain writes.
+    pub(crate) fn note_uncertain_unquarantined(&self, block_id: i64) {
+        if self.is_quarantined_raw(block_id) {
+            return;
+        }
+        if self.uncertain_unquarantined.insert(block_id) {
+            log::warn!(
+                "block {} write is uncertain and not yet quarantined; will retry",
+                block_id
+            );
+        }
+    }
+
+    /// Retry the quarantine of one remembered block; a landed quarantine
+    /// (or a block that no longer exists) leaves the set.
+    pub(crate) fn retry_uncertain_unquarantined_for(&self, block_id: i64) {
+        if !self.uncertain_unquarantined.contains(&block_id) {
+            return;
+        }
+        match self.abort_block_uncertain(&ExtendedBlock::with_id(block_id)) {
+            Ok(()) => {
+                // A missing block is terminal too (already freed before the
+                // uncertainty was known; nothing left to pin).
+                if self.get_raw_block_opt(block_id).ok().flatten().is_none() {
+                    self.uncertain_unquarantined.remove(&block_id);
+                }
+                if !self.uncertain_unquarantined.contains(&block_id) {
+                    log::info!("deferred quarantine of block {} landed", block_id);
+                }
+            }
+            Err(e) => log::warn!(
+                "deferred quarantine of block {} failed again, kept for retry: {}",
+                block_id,
+                e
+            ),
+        }
+    }
+
+    /// Retry every remembered block; called from the heartbeat tick.
+    pub fn retry_uncertain_unquarantined(&self) {
+        let ids: Vec<i64> = self
+            .uncertain_unquarantined
+            .iter()
+            .map(|e| *e.key())
+            .collect();
+        for id in ids {
+            self.retry_uncertain_unquarantined_for(id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uncertain_unquarantined_for_test(&self) -> Vec<i64> {
+        self.uncertain_unquarantined
+            .iter()
+            .map(|e| *e.key())
+            .collect()
     }
 
     pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {

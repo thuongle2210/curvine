@@ -413,6 +413,9 @@ impl WriteHandler {
                 "failed to quarantine block {} after uncertain write: {}",
                 block.id, e
             );
+            // The sticky flag dies with this handler; the store keeps the
+            // uncertainty and retries on lease drop and heartbeat.
+            store.note_uncertain_unquarantined(block.id);
         }
     }
 
@@ -542,6 +545,9 @@ impl WriteHandler {
                 self.client_addr,
                 abort_err
             );
+            if pending.uncertain {
+                self.store.note_uncertain_unquarantined(pending.block.id);
+            }
         }
         let error = pending.to_error();
         match self.terminal_state(pending.block.id) {
@@ -3573,6 +3579,150 @@ mod tests {
             .map_err(FsError::from)?
             .is_final());
 
+        Ok(())
+    }
+
+    // ---- uncertain write whose eager quarantine failed is remembered by the store ----
+
+    fn raw_state(store: &BlockStore, id: i64) -> Option<curvine_storage_local::BlockState> {
+        store
+            .get_raw_block_opt(id)
+            .ok()
+            .flatten()
+            .map(|m| *m.state())
+    }
+
+    /// A timed-out write whose eager quarantine fails leaves the block in the
+    /// store's remembered set, raw meta still `Writing`.
+    #[test]
+    fn failed_eager_quarantine_is_remembered_by_the_store() -> FsResult<()> {
+        let block = ExtendedBlock::new(60, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-remember-uncertain",
+            &block,
+            UncertainWriteBlockIO,
+        )?;
+        store.set_force_transient_abort_failure_for_test(true);
+
+        let err = handler.write(&spdk_data_frame()).unwrap_err();
+        assert!(err.to_string().contains("write timed out"), "{err}");
+
+        assert_eq!(
+            raw_state(&store, block.id),
+            Some(curvine_storage_local::BlockState::Writing),
+            "quarantine attempt failed, meta untouched"
+        );
+        assert_eq!(store.uncertain_unquarantined_for_test(), vec![block.id]);
+        Ok(())
+    }
+
+    /// When the eager quarantine lands, nothing is remembered.
+    #[test]
+    fn successful_eager_quarantine_leaves_the_set_empty() -> FsResult<()> {
+        let block = ExtendedBlock::new(61, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) =
+            spdk_handler("write-handler-remember-none", &block, UncertainWriteBlockIO)?;
+        let _ = handler.write(&spdk_data_frame()).unwrap_err();
+        assert_eq!(
+            raw_state(&store, block.id),
+            Some(curvine_storage_local::BlockState::Quarantined)
+        );
+        assert!(store.uncertain_unquarantined_for_test().is_empty());
+        Ok(())
+    }
+
+    /// Connection drop: the handler (and its lease) go away without
+    /// Complete/Cancel. The lease's Drop retries the quarantine; the extent
+    /// stays reserved.
+    #[test]
+    fn lease_drop_retries_the_quarantine() -> FsResult<()> {
+        let block = ExtendedBlock::new(62, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-lease-drop-retry",
+            &block,
+            UncertainWriteBlockIO,
+        )?;
+        handler.lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        let available_before = store.read().map_err(FsError::from)?.available();
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let _ = handler.write(&spdk_data_frame()).unwrap_err();
+        assert_eq!(store.uncertain_unquarantined_for_test(), vec![block.id]);
+
+        drop(handler); // simulated connection drop
+
+        assert_eq!(
+            raw_state(&store, block.id),
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "lease drop must retry the quarantine"
+        );
+        assert!(store.uncertain_unquarantined_for_test().is_empty());
+        assert_eq!(
+            store.read().map_err(FsError::from)?.available(),
+            available_before,
+            "extent stays reserved"
+        );
+        Ok(())
+    }
+
+    /// The retry on lease drop fails too; the heartbeat retry drains the set
+    /// once the abort succeeds.
+    #[test]
+    fn heartbeat_retries_remembered_uncertain_blocks() -> FsResult<()> {
+        let block = ExtendedBlock::new(63, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) = spdk_handler(
+            "write-handler-heartbeat-retry",
+            &block,
+            UncertainWriteBlockIO,
+        )?;
+        handler.lease = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+
+        store.set_force_transient_abort_failure_for_test(true);
+        let _ = handler.write(&spdk_data_frame()).unwrap_err();
+        // The lease-drop retry fails as well.
+        store.set_force_transient_abort_failure_for_test(true);
+        drop(handler);
+        assert_eq!(
+            raw_state(&store, block.id),
+            Some(curvine_storage_local::BlockState::Writing)
+        );
+        assert_eq!(store.uncertain_unquarantined_for_test(), vec![block.id]);
+
+        // Heartbeat tick: still failing -> kept.
+        store.set_force_transient_abort_failure_for_test(true);
+        store.retry_uncertain_unquarantined();
+        assert_eq!(store.uncertain_unquarantined_for_test(), vec![block.id]);
+
+        // Next tick lands.
+        store.retry_uncertain_unquarantined();
+        assert_eq!(
+            raw_state(&store, block.id),
+            Some(curvine_storage_local::BlockState::Quarantined)
+        );
+        assert!(store.uncertain_unquarantined_for_test().is_empty());
+        Ok(())
+    }
+
+    /// A remembered block that was removed before the retry (nothing left to
+    /// pin) is dropped from the set rather than retried forever.
+    #[test]
+    fn retry_forgets_a_block_that_no_longer_exists() -> FsResult<()> {
+        let block = ExtendedBlock::new(64, 4096, StorageType::SpdkDisk, FileType::File);
+        let (store, mut handler) =
+            spdk_handler("write-handler-retry-missing", &block, UncertainWriteBlockIO)?;
+        store.set_force_transient_abort_failure_for_test(true);
+        let _ = handler.write(&spdk_data_frame()).unwrap_err();
+        handler.file.take();
+        assert_eq!(store.uncertain_unquarantined_for_test(), vec![block.id]);
+
+        // Freed behind the store's back (U2 closes this path for deletes).
+        store.abort_block(&block).map_err(FsError::from)?;
+        store.retry_uncertain_unquarantined();
+        assert!(store.uncertain_unquarantined_for_test().is_empty());
         Ok(())
     }
 }

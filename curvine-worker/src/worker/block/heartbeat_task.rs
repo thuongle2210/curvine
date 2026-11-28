@@ -263,6 +263,10 @@ impl LoopTask for HeartbeatTask {
     type Error = FsError;
 
     fn run(&self) -> FsResult<()> {
+        // A quarantine the write path could not land is retried here first:
+        // it must be in place before any delete command below could free
+        // the extent, and before the block report describes the block.
+        self.store.retry_uncertain_unquarantined();
         // Perform heartbeat sending.
         let mut proof = self.capacity_proof.lock().unwrap();
         if let Err(error) = proof.recover(|| {

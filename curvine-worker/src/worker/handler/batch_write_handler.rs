@@ -192,6 +192,10 @@ impl BatchWriteHandler {
             reason,
             error
         );
+        if uncertain {
+            // The parked entry dies with the connection; the store's record does not.
+            self.store.note_uncertain_unquarantined(block.id);
+        }
         self.pending_aborts
             .push(PendingAbort::new(block, uncertain, reason, &error));
     }
@@ -1677,6 +1681,64 @@ mod tests {
         assert_eq!(raw_state(&store, 1)?, None);
         assert_eq!(raw_state(&store, 3)?, None);
         assert!(handler.rolled_back);
+        Ok(())
+    }
+
+    /// A batch sibling whose flush timed out and whose eager quarantine
+    /// failed is remembered by the store (raw meta still `Writing`); a later
+    /// retry pins it.
+    #[test]
+    fn batch_failed_eager_quarantine_is_remembered() -> CommonResult<()> {
+        let (store, mut handler) = spdk_batch(
+            "batch-remember-uncertain",
+            vec![
+                ok(),
+                FakeIO {
+                    flush_ok: false,
+                    uncertain: true,
+                    write_ok: true,
+                },
+                ok(),
+            ],
+        )?;
+        store.set_force_transient_abort_failure_for_test(true);
+
+        let err = handler.flush_batch(&flush_msg(7)).unwrap_err();
+        assert!(err.to_string().contains("flush timed out"), "{err}");
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Writing));
+        assert_eq!(store.uncertain_unquarantined_for_test(), vec![2]);
+
+        store.retry_uncertain_unquarantined();
+        assert_eq!(raw_state(&store, 2)?, Some(BlockState::Quarantined));
+        assert!(store.uncertain_unquarantined_for_test().is_empty());
+        Ok(())
+    }
+
+    /// A parked uncertain rollback abort (T2) is also remembered by the
+    /// store, so a connection drop mid-park cannot lose it.
+    #[test]
+    fn parked_uncertain_abort_is_remembered_by_the_store() -> CommonResult<()> {
+        let (store, mut handler) = spdk_batch(
+            "batch-parked-remembered",
+            vec![
+                FakeIO {
+                    flush_ok: true,
+                    uncertain: true,
+                    write_ok: true,
+                },
+                ok(),
+                ok(),
+            ],
+        )?;
+        store.set_force_transient_abort_failure_for_test(true);
+        assert!(handler.complete_batch(&spdk_commit_msg(42), true).is_err());
+        assert_eq!(handler.pending_aborts.len(), 1);
+        assert_eq!(store.uncertain_unquarantined_for_test(), vec![1]);
+
+        drop(handler); // connection drop with the abort still parked
+        store.retry_uncertain_unquarantined();
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+        assert!(store.uncertain_unquarantined_for_test().is_empty());
         Ok(())
     }
 }
