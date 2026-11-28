@@ -1,8 +1,9 @@
 //! RocksDB-backed SPDK block metadata.
 use crate::meta_store::BlockMetaStore;
 use crate::BlockMeta;
-/// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) | quarantined(1B) = 30B.
-/// Legacy 29B records (no quarantined byte) decode with quarantined=false.
+/// Key: block_id (8B). Value: dir_id(4B) | offset(8B) | size(8B) | len(8B) | finalized(1B) | quarantined(1B) | uncertain(1B) = 31B.
+/// Legacy 29B records (no quarantined byte) decode with quarantined=false;
+/// 30B records (no uncertain byte) decode with uncertain=false.
 /// O(1) per block
 use byteorder::{BigEndian, ByteOrder};
 use curvine_core_error::{err_box, CommonResult};
@@ -11,11 +12,13 @@ use log::{info, warn};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 const CF_SPDK_BLOCKS: &str = "spdk_blocks";
-const VALUE_SIZE: usize = 30;
+const VALUE_SIZE: usize = 31;
 /// Pre-quarantine record size (no quarantined byte); must stay decodable.
 const LEGACY_VALUE_SIZE: usize = 29;
-/// Byte offset of the quarantined flag (30B format).
+/// Byte offset of the quarantined flag (30B and 31B formats).
 const QUARANTINED_BYTE: usize = 29;
+/// Byte offset of the uncertain flag (31B format).
+const UNCERTAIN_BYTE: usize = 30;
 pub struct SpdkMetaStore {
     db: DBEngine,
     /// Test-only: forces the next put() to fail.
@@ -32,6 +35,9 @@ pub struct SpdkBlockRecord {
     pub finalized: bool,
     /// Extent must stay reserved on restart when true.
     pub quarantined: bool,
+    /// Write known uncertain, quarantine not yet landed: reload pins the
+    /// extent as if quarantined (unless `finalized`).
+    pub uncertain: bool,
 }
 impl SpdkMetaStore {
     pub fn open(dir: &str, format: bool) -> CommonResult<Self> {
@@ -58,13 +64,15 @@ impl SpdkMetaStore {
         len: i64,
         finalized: bool,
         quarantined: bool,
+        uncertain: bool,
     ) -> CommonResult<()> {
         #[cfg(test)]
         if self.force_put_failure.load(Ordering::Acquire) {
             return err_box!("SpdkMetaStore: injected put failure for block {}", block_id);
         }
         let key = Self::encode_key(block_id);
-        let value = Self::encode_value(dir_id, offset, size, len, finalized, quarantined);
+        let value =
+            Self::encode_value(dir_id, offset, size, len, finalized, quarantined, uncertain);
         self.db.put_cf(CF_SPDK_BLOCKS, key, value)
     }
     pub fn delete(&self, block_id: i64) -> CommonResult<()> {
@@ -123,6 +131,7 @@ impl SpdkMetaStore {
         len: i64,
         finalized: bool,
         quarantined: bool,
+        uncertain: bool,
     ) -> [u8; VALUE_SIZE] {
         let mut buf = [0u8; VALUE_SIZE];
         BigEndian::write_u32(&mut buf[0..4], dir_id);
@@ -131,6 +140,7 @@ impl SpdkMetaStore {
         BigEndian::write_i64(&mut buf[20..28], len);
         buf[28] = if finalized { 1 } else { 0 };
         buf[QUARANTINED_BYTE] = if quarantined { 1 } else { 0 };
+        buf[UNCERTAIN_BYTE] = if uncertain { 1 } else { 0 };
         buf
     }
     #[inline]
@@ -143,8 +153,9 @@ impl SpdkMetaStore {
                 LEGACY_VALUE_SIZE
             );
         }
-        // Missing in legacy 29B records -> defaults to not quarantined.
+        // Missing in legacy 29B / 30B records -> defaults to false.
         let quarantined = bytes.get(QUARANTINED_BYTE).is_some_and(|b| *b != 0);
+        let uncertain = bytes.get(UNCERTAIN_BYTE).is_some_and(|b| *b != 0);
         Ok(SpdkBlockRecord {
             block_id,
             dir_id: BigEndian::read_u32(&bytes[0..4]),
@@ -153,11 +164,12 @@ impl SpdkMetaStore {
             len: BigEndian::read_i64(&bytes[20..28]),
             finalized: bytes[28] != 0,
             quarantined,
+            uncertain,
         })
     }
 
     /// Test-only: write a raw legacy 29B record (bypasses encode_value,
-    /// which always emits 30B), for backward-compat decode tests.
+    /// which always emits 31B), for backward-compat decode tests.
     #[cfg(test)]
     pub(crate) fn put_legacy_for_test(
         &self,
@@ -189,6 +201,7 @@ impl BlockMetaStore for SpdkMetaStore {
             meta.len(),
             meta.is_final(),
             meta.is_quarantined(),
+            meta.uncertain,
         )
     }
 
@@ -207,8 +220,10 @@ mod test {
     #[test]
     fn put_get_delete() {
         let store = SpdkMetaStore::open(&test_dir("pgd"), true).unwrap();
-        store.put(1, 1, 0, 4096, 4096, true, false).unwrap();
-        store.put(2, 1, 4096, 8192, 6000, false, false).unwrap();
+        store.put(1, 1, 0, 4096, 4096, true, false, false).unwrap();
+        store
+            .put(2, 1, 4096, 8192, 6000, false, false, false)
+            .unwrap();
         let r = store.get(1).unwrap().unwrap();
         assert_eq!(r.offset, 0);
         assert!(r.finalized);
@@ -219,10 +234,34 @@ mod test {
     #[test]
     fn put_persists_quarantined() {
         let store = SpdkMetaStore::open(&test_dir("quarantined"), true).unwrap();
-        store.put(1, 1, 0, 4096, 4096, false, true).unwrap();
+        store.put(1, 1, 0, 4096, 4096, false, true, false).unwrap();
         let r = store.get(1).unwrap().unwrap();
         assert!(!r.finalized);
         assert!(r.quarantined);
+    }
+    #[test]
+    fn put_persists_uncertain_and_30_byte_record_defaults_it_false() {
+        let store = SpdkMetaStore::open(&test_dir("uncertain"), true).unwrap();
+        store.put(1, 1, 0, 4096, 4096, false, false, true).unwrap();
+        let r = store.get(1).unwrap().unwrap();
+        assert!(r.uncertain);
+        assert!(!r.quarantined);
+        assert!(!r.finalized);
+        // scan_all carries it too
+        assert!(store.scan_all().unwrap()[0].uncertain);
+
+        // A 30B record (pre-uncertain format) decodes with uncertain=false.
+        let key = SpdkMetaStore::encode_key(2);
+        let mut v30 = [0u8; 30];
+        BigEndian::write_u32(&mut v30[0..4], 1);
+        BigEndian::write_i64(&mut v30[4..12], 4096);
+        BigEndian::write_i64(&mut v30[12..20], 4096);
+        BigEndian::write_i64(&mut v30[20..28], 4096);
+        v30[29] = 1;
+        store.db.put_cf(CF_SPDK_BLOCKS, key, v30).unwrap();
+        let r = store.get(2).unwrap().unwrap();
+        assert!(r.quarantined);
+        assert!(!r.uncertain);
     }
     /// Regression: a legacy 29B record must still decode and show up in
     /// scan_all(), defaulting quarantined=false.
@@ -255,7 +294,16 @@ mod test {
         let store = SpdkMetaStore::open(&test_dir("scan"), true).unwrap();
         for i in 0..100 {
             store
-                .put(i, (i % 3) as u32, i * 4096, 4096, 4096, i % 2 == 0, false)
+                .put(
+                    i,
+                    (i % 3) as u32,
+                    i * 4096,
+                    4096,
+                    4096,
+                    i % 2 == 0,
+                    false,
+                    false,
+                )
                 .unwrap();
         }
         assert_eq!(store.scan_all().unwrap().len(), 100);
@@ -263,8 +311,10 @@ mod test {
     #[test]
     fn dir_id_preserved() {
         let store = SpdkMetaStore::open(&test_dir("dir"), true).unwrap();
-        store.put(1, 10, 0, 4096, 4096, true, false).unwrap();
-        store.put(2, 20, 4096, 4096, 4096, false, false).unwrap();
+        store.put(1, 10, 0, 4096, 4096, true, false, false).unwrap();
+        store
+            .put(2, 20, 4096, 4096, 4096, false, false, false)
+            .unwrap();
         let records = store.scan_all().unwrap();
         assert_eq!(records.iter().filter(|r| r.dir_id == 10).count(), 1);
         assert_eq!(records.iter().filter(|r| r.dir_id == 20).count(), 1);
@@ -272,8 +322,8 @@ mod test {
     #[test]
     fn update_key() {
         let store = SpdkMetaStore::open(&test_dir("upd"), true).unwrap();
-        store.put(1, 1, 0, 4096, 4096, false, false).unwrap();
-        store.put(1, 1, 0, 4096, 2048, true, false).unwrap();
+        store.put(1, 1, 0, 4096, 4096, false, false, false).unwrap();
+        store.put(1, 1, 0, 4096, 2048, true, false, false).unwrap();
         assert_eq!(store.get(1).unwrap().unwrap().len, 2048);
     }
     #[test]
@@ -281,7 +331,7 @@ mod test {
         let dir = test_dir("reopen");
         {
             let s = SpdkMetaStore::open(&dir, true).unwrap();
-            s.put(1, 5, 0, 4096, 4096, true, false).unwrap();
+            s.put(1, 5, 0, 4096, 4096, true, false, false).unwrap();
         }
         let s = SpdkMetaStore::open(&dir, false).unwrap();
         assert_eq!(s.scan_all().unwrap().len(), 1);

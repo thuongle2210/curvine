@@ -79,6 +79,11 @@ pub struct BlockMeta {
     pub actual_len: i64,
     /// SPDK bdev byte offset
     pub bdev_offset: i64,
+    /// The write is known uncertain but the quarantine has not landed yet
+    /// (`state` is still `Writing`). Persisted on SPDK records so a restart
+    /// pins the extent instead of discarding it; cleared once the state is
+    /// `Quarantined` or the block is finalized by a later generation.
+    pub uncertain: bool,
 }
 
 impl BlockMeta {
@@ -91,6 +96,7 @@ impl BlockMeta {
             storage_type: dir.storage_type(),
             actual_len: block_size,
             bdev_offset: 0,
+            uncertain: false,
         }
     }
 
@@ -122,6 +128,7 @@ impl BlockMeta {
                     storage_type: dir.storage_type(),
                     actual_len,
                     bdev_offset: 0,
+                    uncertain: false,
                 };
 
                 Ok(meta)
@@ -143,6 +150,7 @@ impl BlockMeta {
             storage_type: meta.storage_type,
             actual_len,
             bdev_offset: 0,
+            uncertain: false,
         };
 
         Ok(meta)
@@ -158,6 +166,9 @@ impl BlockMeta {
             storage_type: meta.storage_type,
             actual_len: meta.actual_len,
             bdev_offset: meta.bdev_offset,
+            // Finalized by this writer: the uncertainty (if any) belongs to
+            // a state that no longer exists.
+            uncertain: false,
         }
     }
 
@@ -259,6 +270,7 @@ mod test {
             storage_type: StorageType::SpdkDisk,
             actual_len: block_size,
             bdev_offset: 0,
+            uncertain: false,
         }
     }
 
@@ -287,6 +299,7 @@ mod test {
             storage_type: StorageType::Ssd,
             actual_len: 100,
             bdev_offset: 0,
+            uncertain: false,
         };
         let final_meta = BlockMeta::with_final(&meta, &path)?;
         assert_eq!(final_meta.state, BlockState::Finalized);

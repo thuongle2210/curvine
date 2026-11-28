@@ -70,6 +70,15 @@ pub trait Dataset {
         self.abort_block(block)
     }
 
+    /// Record that `block_id`'s write is uncertain while its quarantine has
+    /// not landed, so a restart pins the extent instead of discarding it.
+    /// Only meaningful for storage whose uncertain abort quarantines (SPDK);
+    /// the default does nothing. `Err` means "not durable yet": the
+    /// in-memory flag is set regardless.
+    fn mark_uncertain(&mut self, _block_id: i64) -> CommonResult<()> {
+        Ok(())
+    }
+
     // Delete a block.
     fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()>;
 

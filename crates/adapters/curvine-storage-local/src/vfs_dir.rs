@@ -529,6 +529,7 @@ mod test {
             storage_type: StorageType::SpdkDisk,
             actual_len: 4096,
             bdev_offset: 0,
+            uncertain: false,
         };
         let layout = BdevLayout::new(None);
         let r = layout.finalize(&dir, &meta, 2048, false)?;

@@ -1869,6 +1869,7 @@ mod tests {
             storage_type: curvine_model::StorageType::Disk,
             actual_len: 4096,
             bdev_offset: 0,
+            uncertain: false,
         }]);
         let request = snapshot.batch_request(0);
         assert_eq!(request.blocks.len(), 1);

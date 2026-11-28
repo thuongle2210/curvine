@@ -126,7 +126,11 @@ impl BlockLayout for BdevLayout {
             }
 
             alloc_entries.push((record.block_id, record.offset, record.size));
-            let state = if record.quarantined {
+            // A record whose write was known uncertain but whose quarantine
+            // never landed before the restart is pinned now: the timed-out
+            // command may still complete into the extent. A finalized record
+            // with a stale bit (left by a failed clear) stays finalized.
+            let state = if record.quarantined || (record.uncertain && !record.finalized) {
                 BlockState::Quarantined
             } else if record.finalized {
                 BlockState::Finalized
@@ -141,6 +145,7 @@ impl BlockLayout for BdevLayout {
                 storage_type: dir.storage_type(),
                 actual_len: record.size,
                 bdev_offset: record.offset,
+                uncertain: false,
             });
         }
         dir.state.offset_alloc.restore(&alloc_entries);

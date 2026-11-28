@@ -620,6 +620,18 @@ impl BlockStore {
                 block_id
             );
         }
+        // Also on the record, so a restart pins the extent instead of
+        // discarding it. Best-effort: the in-memory set drives the retries
+        // either way, and the next successful put carries the bit.
+        let persisted =
+            self.with_dataset_write("mark_uncertain", |state| state.mark_uncertain(block_id));
+        if let Err(e) = persisted {
+            log::warn!(
+                "failed to persist the uncertain bit of block {}; a restart before the quarantine lands will free the extent: {}",
+                block_id,
+                e
+            );
+        }
     }
 
     /// Retry the quarantine of one remembered block; a landed quarantine
@@ -2432,6 +2444,23 @@ mod tests {
         assert!(store.get_raw_block_opt(block.id)?.is_none());
         assert!(store.read()?.available() > available_before, "extent freed");
         assert_eq!(store.read()?.num_blocks_to_delete(), 0);
+        Ok(())
+    }
+
+    /// `note_uncertain_unquarantined` sets the in-memory uncertain bit on the
+    /// meta (persisted by the SPDK meta store when one is attached), and the
+    /// quarantine landing clears it.
+    #[test]
+    fn note_uncertain_marks_the_meta_and_quarantine_clears_it() -> CommonResult<()> {
+        let (store, block) = spdk_store_with_remembered_block(4)?;
+        let meta = store.get_raw_block_opt(block.id)?.unwrap();
+        assert!(meta.uncertain, "bit set on the raw meta");
+        assert_eq!(*meta.state(), BlockState::Writing);
+
+        store.retry_uncertain_unquarantined();
+        let meta = store.get_raw_block_opt(block.id)?.unwrap();
+        assert_eq!(*meta.state(), BlockState::Quarantined);
+        assert!(!meta.uncertain, "state carries it now");
         Ok(())
     }
 }

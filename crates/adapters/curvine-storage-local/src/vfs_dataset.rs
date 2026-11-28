@@ -865,9 +865,28 @@ impl Dataset for VfsDataset {
         }
 
         // Keep the extent reserved; only flip state, don't deallocate/release.
+        // The state now carries what the uncertain bit stood for.
         let mut quarantined = meta;
         quarantined.state = BlockState::Quarantined;
+        quarantined.uncertain = false;
         self.meta.put_checked(quarantined)?;
+        Ok(())
+    }
+
+    fn mark_uncertain(&mut self, block_id: i64) -> CommonResult<()> {
+        let Some(meta) = self.meta.get(block_id).cloned() else {
+            return Ok(());
+        };
+        if meta.storage_type() != StorageType::SpdkDisk
+            || meta.uncertain
+            || meta.is_quarantined()
+            || meta.is_final()
+        {
+            return Ok(());
+        }
+        let mut marked = meta;
+        marked.uncertain = true;
+        self.meta.put_checked(marked)?;
         Ok(())
     }
 
@@ -2083,7 +2102,7 @@ mod test {
         let path = "../testing/spdk_capacity_restore";
         let _ = std::fs::remove_dir_all(path);
         let store = Arc::new(SpdkMetaStore::open(path, true)?);
-        store.put(1, 1, 0, 4096, 1, true, false)?;
+        store.put(1, 1, 0, 4096, 1, true, false, false)?;
 
         let dir = spdk_dir(1, spdk_state());
         let available = dir.available();
@@ -2357,6 +2376,92 @@ mod test {
         );
 
         drop(ds2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// A block marked uncertain whose quarantine never landed before the
+    /// restart reloads as Quarantined: the extent stays occupied.
+    #[test]
+    fn restart_repins_remembered_uncertain_extent() -> CommonResult<()> {
+        let path = "../testing/spdk_uncertain_reload";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let available = dir.available();
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.mark_uncertain(block.id)?;
+        assert!(ds.get_block(1).unwrap().uncertain);
+        assert_eq!(ds.get_block(1).unwrap().state(), &BlockState::Writing);
+        assert!(store.get(1)?.unwrap().uncertain, "bit persisted");
+        drop(ds);
+
+        let dir2 = spdk_dir(1, spdk_state());
+        let ds2 = VfsDataset::new("t", DirList::new(vec![dir2])?, Some(store.clone()))?;
+        let meta = ds2
+            .get_block(1)
+            .expect("uncertain block must survive reload");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        assert_eq!(ds2.available(), available - 4096);
+        assert_eq!(ds2.offset_alloc_for_dir(1).unwrap().free_list_size(), 0);
+
+        drop(ds2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// A finalized record with a stale uncertain bit (left by a failed
+    /// clear) stays Finalized on reload: it is another writer's committed copy.
+    #[test]
+    fn reload_of_finalized_record_ignores_stale_uncertain_bit() -> CommonResult<()> {
+        let path = "../testing/spdk_stale_uncertain_bit";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        store.put(1, 1, 0, 4096, 2048, true, false, true)?;
+
+        let ds = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, spdk_state())])?,
+            Some(store.clone()),
+        )?;
+        assert_eq!(ds.get_block(1).unwrap().state(), &BlockState::Finalized);
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// The quarantine landing clears the bit: the state carries it from then on.
+    #[test]
+    fn quarantine_landing_clears_the_uncertain_bit() -> CommonResult<()> {
+        let path = "../testing/spdk_uncertain_cleared";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+        let mut ds = VfsDataset::new(
+            "t",
+            DirList::new(vec![spdk_dir(1, spdk_state())])?,
+            Some(store.clone()),
+        )?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.mark_uncertain(block.id)?;
+        ds.abort_block_uncertain(&block)?;
+
+        let meta = ds.get_block(1).unwrap();
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        assert!(!meta.uncertain);
+        let rec = store.get(1)?.unwrap();
+        assert!(rec.quarantined);
+        assert!(!rec.uncertain);
+
+        // mark_uncertain on a non-SPDK or already terminal block is a no-op.
+        drop(ds);
         drop(store);
         let _ = std::fs::remove_dir_all(path);
         Ok(())
